@@ -1,4 +1,4 @@
-# PRD: supergateway-rs — Rust Rewrite using Asupersync (v4)
+# PRD: supergateway-rs — Rust Rewrite using Asupersync (v5)
 
 ## Overview
 Rewrite supergateway (~2,100 LOC TypeScript MCP transport bridge) in Rust using Asupersync. Drop-in CLI replacement bridging MCP stdio servers with SSE, Streamable HTTP, and WebSocket transports. Implements MCP JSON-RPC handling from scratch using Asupersync's native stacks and structured concurrency.
@@ -202,6 +202,22 @@ Used only in stateless Streamable HTTP mode.
                                         +-----------------------+
 ```
 
+**Auto-init request ID format:** `init_<timestamp_ms>_<random_alphanumeric_9>` (e.g., `init_1709856000000_a3b5c7d9e`). Use a prefix that won't collide with client-generated numeric IDs.
+
+**Auto-init sequence (detailed):**
+1. Check if incoming request is `initialize` — if yes, forward directly, set `isInitialized = true`
+2. If not initialized and not already auto-initializing:
+   a. Store incoming message as `pendingOriginalMessage`
+   b. Set `isAutoInitializing = true`
+   c. Generate auto-init request with `--protocolVersion` and synthetic client info
+   d. Send `initialize` request to child stdin
+   e. Wait for child response with matching init request ID
+   f. **Suppress** the init response from reaching the client
+   g. Send `notifications/initialized` notification to child
+   h. Set `isInitialized = true`, `isAutoInitializing = false`
+   i. Forward the original pending message to child
+3. If already initialized: forward directly
+
 **Race conditions addressed:**
 - Auto-init is **exactly-once per request** (stateless mode = one child per request, no races)
 - In stateful mode, auto-init does NOT apply — client must send explicit `initialize`
@@ -209,6 +225,21 @@ Used only in stateless Streamable HTTP mode.
 - If auto-init times out (5s): kill child, return JSON-RPC `-32603`
 - No concurrent requests per child in stateless mode (one request per child lifecycle)
 - If child emits notifications before init response: buffer and forward after init completes
+- **TS batch edge case**: if a batch request arrives during auto-init, `pendingOriginalMessage` is overwritten (message loss). Rust: use a Vec to buffer multiple pending messages (improvement over TS)
+
+**Stateful vs Stateless mode differences (complete):**
+
+| Aspect | Stateful | Stateless |
+|---|---|---|
+| Child lifecycle | Per-session (long-lived) | Per-request (ephemeral) |
+| Session tracking | UUID in `Mcp-Session-Id` header | None (`sessionIdGenerator: undefined`) |
+| Auto-initialization | No — client sends explicit `initialize` | Yes — auto-init for non-init requests |
+| GET endpoint | SSE stream for server-initiated messages | 405 Method Not Allowed |
+| DELETE endpoint | Session termination | 405 Method Not Allowed |
+| CORS exposedHeaders | Includes `Mcp-Session-Id` | Does not include `Mcp-Session-Id` |
+| Error handling | No outer try/catch (SDK handles) | Outer try/catch returns 500 with `-32603` |
+| Transport per request | Shared transport per session | New transport + server per request |
+| Session counter | Access-counting with timeout | None |
 
 ### Session State Machine (Stateful HTTP)
 
@@ -322,21 +353,116 @@ User-configured response headers (`--header`, `--oauth2Bearer`) SHALL be applied
 
 Exception: hop-by-hop headers controlled by the transport layer.
 
+**Header parsing:**
+- Format: `Key: Value` — split at first `:` only (values may contain colons)
+- Validate non-empty key and non-empty value (after trimming)
+- Later headers with same key overwrite earlier ones (last-wins)
+- `--oauth2Bearer <token>` adds `Authorization: Bearer <token>` header
+
+**TS bug in `--oauth2Bearer`:** `'oauth2Bearer' in argv` is always true with yargs (undefined keys exist), producing `"Bearer undefined"` header when no token is provided. Rust: only add Authorization header if token is actually provided (non-empty string).
+
+**TS bug in header count logging:** `Object(headers).length` always evaluates to undefined, so the log always says "(none)" even when headers are configured. Rust: log actual header count.
+
+### `--outputTransport` Default Behavior
+
+The TS code determines the default `outputTransport` using a **raw `process.argv` scan** rather than the parsed yargs values. It searches for the literal strings `--sse` and `--streamableHttp` in argv:
+- If found: default to `stdio`
+- If not found (i.e., `--stdio` mode): default to `sse`
+
+This means the default depends on which input flag was used, not on the parsed value. Rust: use the clap-parsed input mode to determine the default (cleaner, same result).
+
+### MCP SDK HTTP Semantics (Reimplemented from Scratch)
+
+The TypeScript version delegates HTTP handling to the MCP SDK's transport classes. Since the Rust version implements from scratch, these SDK behaviors MUST be replicated exactly:
+
+#### SSE Transport (stdio->SSE mode)
+
+**SSE Connection (GET `<ssePath>`):**
+- Response: `Content-Type: text/event-stream`, keep-alive, no-cache
+- First event: `event: endpoint\ndata: <baseUrl><messagePath>?sessionId=<uuid>\n\n`
+- Subsequent events: `event: message\ndata: <json>\n\n`
+- The endpoint URL tells the client where to POST messages
+
+**Message POST (POST `<messagePath>`):**
+- SDK always returns **202 Accepted** for valid POSTs (regardless of whether child responds)
+- Body: raw JSON (NOT parsed by express body parser — SDK uses `raw-body` with 4MB limit internally)
+- **Express body parser MUST be skipped** on the message path. In Rust: read raw body directly, parse JSON ourselves
+- sessionId comes from query parameter `?sessionId=<uuid>`
+
+**Body size limit:** SDK's raw-body defaults to 4MB. Rust implementation should match (4MB default, configurable)
+
+#### Streamable HTTP Transport (stdio->StreamableHTTP modes)
+
+**Request Validation (SDK-enforced, must reimplement):**
+1. **Accept header**: MUST include BOTH `application/json` AND `text/event-stream` → 406 Not Acceptable if missing either
+2. **Content-Type**: MUST be `application/json` → 415 Unsupported Media Type if wrong
+3. **Session validation** (stateful only): wrong/missing `Mcp-Session-Id` → **404 Not Found** (not 400)
+4. **Protocol version**: SDK checks `Latest-Protocol-Version` header against `SUPPORTED_PROTOCOL_VERSIONS`
+
+**Supported Protocol Versions:** `["2025-06-18", "2025-03-26", "2024-11-05", "2024-10-07"]`
+
+**POST Response Types (determined by request content):**
+- **Notification-only POST** (no `id` in body): HTTP **202 Accepted**, empty body
+- **Request POST** (has `id`): **SSE stream response** — `Content-Type: text/event-stream`, one `event: message\ndata: <json>\n\n` per response/notification, stream closes when all requests in the batch are answered
+- **Batch POST**: array of messages, some with `id`, some without. Notifications get 202 if ALL are notifications; otherwise SSE stream for the ones with `id`
+
+**GET (Server-Initiated Messages, stateful only):**
+- Client opens GET to receive server-initiated notifications/requests via SSE stream
+- **409 Conflict** if a GET SSE stream is already open for this session (only one allowed)
+- Returns `Content-Type: text/event-stream`
+
+**DELETE (Session Termination, stateful only):**
+- Closes session, kills child
+- Returns **200 OK** (or 204)
+
+**Stateless mode differences:**
+- `sessionIdGenerator: undefined` — no session tracking
+- GET → **405 Method Not Allowed**
+- DELETE → **405 Method Not Allowed**
+- No `Mcp-Session-Id` header in responses
+- No CORS `exposedHeaders` for Mcp-Session-Id
+
+#### Server Instance Usage Pattern (Important for Rust Design)
+
+In the TS code, an `McpServer` instance is created but its callbacks (`onmessage`, `onerror`, etc.) are **overwritten** after `server.connect(transport)`. The server effectively acts as a pass-through facade. In Rust, we do NOT need an McpServer abstraction — the gateway directly manages the transport and child process.
+
 ### Error Mapping Table
 
 | Condition | HTTP Status | JSON-RPC Error | Notes |
 |---|---|---|---|
 | Malformed JSON body | 400 | — | Not valid JSON-RPC, pure HTTP error |
 | Valid JSON, invalid JSON-RPC | 200 | `-32600` Invalid Request | Per JSON-RPC 2.0 spec |
-| No session / invalid session | 400 | `-32000` | Stateful mode |
+| Missing Accept headers (StreamableHTTP) | 406 | — | Must include both `application/json` AND `text/event-stream` |
+| Wrong Content-Type (StreamableHTTP) | 415 | — | Must be `application/json` |
+| No session / invalid session (stateful) | 404 | — | SDK returns 404, not 400 |
 | Session closing/closed | 503 | `-32000` | After DELETE or timeout |
 | Child process dead | 502 | `-32603` Internal Error | EPIPE or child exit |
 | Auto-init timeout | 502 | `-32603` Internal Error | Stateless mode, 5s |
-| Message too large | 413 | `-32600` Invalid Request | >16 MB |
+| Internal error (stateless catch-all) | 500 | `-32603` Internal Error | Outer try/catch in stateless mode |
+| Message too large | 413 | `-32600` Invalid Request | >16 MB (configurable, SDK default 4MB) |
 | Max sessions reached | 503 | — | Pure HTTP error |
 | GET/DELETE on stateless | 405 | `-32000` Method Not Allowed | |
+| GET SSE stream already open | 409 | — | Stateful mode, one GET SSE per session |
 | Not ready (health) | 503 | — | Before readiness |
 | CORS preflight | 204 | — | OPTIONS response |
+| Notification-only POST | 202 | — | No `id` in body, accepted without response |
+
+### WebSocket Transport Details (stdio->WS)
+
+**ID Multiplexing:**
+The TS version uses string concatenation (`clientId + ':' + msg.id`) for routing responses to specific WS clients. This has multiple bugs (see DIVERGENCES.md). The Rust version uses a proper `HashMap<MangledId, (ClientId, OriginalId)>` correlation map.
+
+**Message flow:**
+1. **Client→Child**: Client sends JSON-RPC message over WS. Gateway assigns a mangled ID (auto-increment u64), stores `(original_client_id, original_msg_id)` in correlation map, rewrites `id` in message, forwards to child stdin
+2. **Child→Client (responses)**: Child responds with mangled ID. Gateway looks up correlation map, restores original ID, sends to correct client WS. Removes entry from map
+3. **Child→All (notifications)**: Messages without `id` are broadcast to ALL connected WS clients
+4. **Stale cleanup**: On client disconnect, remove all correlation entries for that client
+
+**Health endpoint:**
+- The TS code has a bug where all 3 health response branches execute (missing `return` statements, causes "headers already sent" errors)
+- Rust: proper if/else with returns. `isReady` flag gates 200 vs 503
+
+**Missing feature in TS:** `--header` CLI flag is NOT passed to WS mode (unlike SSE and HTTP modes). Rust should accept `--header` in WS mode too (document as intentional improvement in DIVERGENCES.md)
 
 ### Client Mode Specifics (SSE->stdio, HTTP->stdio)
 
@@ -345,10 +471,16 @@ Exception: hop-by-hop headers controlled by the transport layer.
 2. First stdin message is NOT `initialize`: create fallback client with default info, connect immediately
 3. Protocol version passthrough: intercept `initialize` request to remote, replace `protocolVersion` with value from original stdin `initialize` message. Use clean interceptor pattern (not monkey-patching)
 
+**Init detection differences between TS modes:**
+- SSE→stdio: uses string comparison `requestMessage.method === 'initialize'` (fragile)
+- HTTP→stdio: uses Zod schema `InitializeRequestSchema.safeParse()` (robust)
+- Rust: use `is_initialize_request()` helper from `jsonrpc.rs` — checks `method == "initialize"` on parsed JSON-RPC
+
 **Error handling:**
 - Extract error `code` and `message` from caught errors
 - Strip SDK-generated prefix of form `MCP error <code>:` before forwarding error message to stdout
 - Wrap response with `jsonrpc` and `id` fields
+- **TS bug**: fallback path (non-init first message) leaves `result` undefined, then `result.hasOwnProperty('error')` throws TypeError. Rust: handle this correctly — always check for undefined/null before property access
 
 **Message forwarding:**
 - Request messages (with `method` and `id`): route through MCP client, await response, write to stdout
@@ -360,6 +492,101 @@ Exception: hop-by-hop headers controlled by the transport layer.
 - Remote transport close -> `process::exit(1)` (triggers pm2/systemd restart)
 - Remote transport error -> log only, do NOT exit
 - Signal handling + stdin EOF/close -> graceful shutdown
+
+**SSE client custom fetch:**
+- SSE→stdio uses a custom `fetch` wrapper to inject headers into the EventSource connection
+- This is needed because EventSource (SSE) doesn't natively support custom headers in browser APIs
+- The `eventSourceInit.fetch` wrapper applies `--header` and `--oauth2Bearer` headers to SSE connection requests
+- HTTP→stdio does NOT use custom fetch for EventSource — only uses `requestInit.headers` for POST requests
+
+**Log direction labels (TS bug):**
+- TS code has reversed log labels: `'SSE → Stdio:'` is used for messages going FROM stdio (wrong direction)
+- Rust: use correct direction labels in all log messages
+
+## Rust Implementation Design
+
+### What We Reimplement vs What We Skip
+
+**Reimplement from scratch (no MCP SDK equivalent in Rust):**
+- All HTTP validation: Accept headers, Content-Type, session management, status codes
+- SSE event framing: `event: <type>\ndata: <json>\n\n` format
+- SSE client (EventSource): event parsing, reconnection with Last-Event-ID
+- WebSocket transport: frame handling, upgrade, per-client routing
+- JSON-RPC 2.0 message parsing and routing (with `RawValue` pass-through)
+- Session state machine with access counting and timeout
+- Auto-initialization state machine for stateless mode
+- CORS middleware
+- Process group management (`setsid`/`killpg`)
+
+**Skip / Do not reimplement:**
+- `McpServer` class — the TS code uses it as a facade (callbacks overwritten). Rust connects transport to child directly
+- `Protocol` class auto-increment IDs — only relevant for client modes where we maintain our own ID counter for correlating requests to the remote server
+- `InitializeRequestSchema` Zod validation — use simple `method == "initialize"` check
+- SDK transport classes — we ARE the transport
+
+### Core Types
+
+```rust
+// jsonrpc.rs — opaque pass-through
+struct RawMessage {
+    jsonrpc: String,         // always "2.0"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<RawValue>,    // number, string, or null — preserved exactly
+    #[serde(skip_serializing_if = "Option::is_none")]
+    method: Option<String>,  // present for requests/notifications
+    #[serde(skip_serializing_if = "Option::is_none")]
+    params: Option<RawValue>,// opaque
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result: Option<RawValue>,// opaque
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<RawValue>, // opaque (contains code, message, data)
+}
+
+// Helpers
+fn is_request(&self) -> bool   // has id + method
+fn is_response(&self) -> bool  // has id + (result or error), no method
+fn is_notification(&self) -> bool // has method, no id
+fn is_initialize_request(&self) -> bool // method == "initialize"
+
+// Batch: Vec<RawMessage> when input is JSON array
+```
+
+### Gateway Architecture Pattern
+
+Each gateway module follows this pattern:
+
+```rust
+// Pseudo-code for gateway lifecycle
+async fn run_gateway(cx: &mut Cx, config: GatewayConfig) -> Outcome<(), Error> {
+    // 1. Bind HTTP/WS listener
+    let listener = bind(cx, config.port).await?;
+
+    // 2. Spawn shared child (SSE/WS modes) or defer (HTTP modes)
+    let child = match config.mode {
+        SharedChild => Some(ChildBridge::spawn(cx, &config.stdio_cmd)?),
+        PerSession | PerRequest => None,
+    };
+
+    // 3. Start relay loop in server Region
+    cx.region(|scope| async {
+        // Spawn child stdout reader (if shared child)
+        // Spawn signal handler
+        // Accept connections in loop
+        // Each connection gets its own spawned task
+    }).await
+}
+```
+
+### Concurrency Model
+
+| Mode | Shared State | Synchronization |
+|---|---|---|
+| stdio→SSE | child stdin, client map | Mutex for stdin writes, RwLock for client map |
+| stdio→WS | child stdin, client map, correlation map | Mutex for stdin, RwLock for maps |
+| stdio→Stateful HTTP | session map | RwLock for session map, Mutex per session's child stdin |
+| stdio→Stateless HTTP | None (per-request) | No shared mutable state |
+| SSE→stdio | singleton client | Arc<Mutex<Option<Client>>> |
+| HTTP→stdio | singleton client | Arc<Mutex<Option<Client>>> |
 
 ## Performance Targets
 
@@ -389,14 +616,23 @@ Exception: hop-by-hop headers controlled by the transport layer.
 - **Intentional divergence:** Rust intentionally differs (documented in `DIVERGENCES.md`) -> passes
 - **Unspecified behavior:** TS behavior is accidental/undefined -> Rust may choose either way
 
-**Approved divergences (initial list):**
-- WebSocket ID multiplexer uses proper HashMap instead of string concatenation (fixes TS bug with string/colon IDs)
-- Graceful child process group kill (TS only kills direct child, not grandchildren)
-- Max message size enforced (16 MB; TS has no limit)
+**Approved divergences (initial list — see DIVERGENCES.md for full details):**
+- WebSocket ID multiplexer uses proper HashMap instead of string concatenation (fixes TS bug with string/colon IDs and parseInt destroying non-numeric IDs)
+- Graceful child process group kill via `setsid`/`killpg` (TS only kills direct child, not grandchildren)
+- Max message size enforced (16 MB; TS has no limit beyond SDK's 4MB raw-body default)
 - Max concurrent sessions enforced (1024; TS has no limit)
 - Health detail endpoint (`?detail=true`) is new
 - Health readiness gating (503 before ready; TS returns "ok" unconditionally in some modes)
+- Health endpoint return statements fixed (TS WS mode has missing returns, causes "headers already sent")
 - Batch JSON-RPC: if TS doesn't support, Rust may support or reject with documented error
+- `--oauth2Bearer` only adds header when token is actually provided (TS adds "Bearer undefined")
+- `--header` works in WS mode (TS only passes headers to SSE and HTTP modes)
+- Client mode fallback path handles undefined result correctly (TS crashes with TypeError)
+- Auto-init buffers multiple pending messages (TS overwrites with last message on batch)
+- Log direction labels are correct (TS has reversed labels in client modes)
+- SSE mode explicitly kills child on signal (TS omits cleanup callback in SSE mode)
+- WebSocket `onclose` callback properly fired on transport close (TS never calls it)
+- No `console.log` for broadcast messages (TS logs notifications via console.log instead of logger)
 
 **Required test coverage:**
 - All 6 transport modes: round-trip message exchange
@@ -560,47 +796,61 @@ Exception: hop-by-hop headers controlled by the transport layer.
 **Acceptance Criteria:**
 - [ ] POST `/mcp` + no session + initialize -> spawn child in session Region, return Mcp-Session-Id
 - [ ] POST + valid session -> forward to child (stdin writes serialized via mutex)
-- [ ] GET + valid session -> SSE notification stream
+- [ ] GET + valid session -> SSE notification stream (one per session, 409 if already open)
 - [ ] DELETE + valid session -> transition to Closing, drain in-flight, kill child (idempotent)
-- [ ] Invalid/missing session -> 400 JSON-RPC error
+- [ ] **Accept header validation**: POST must include both `application/json` AND `text/event-stream` → 406
+- [ ] **Content-Type validation**: POST must be `application/json` → 415
+- [ ] Invalid/missing session -> **404** (not 400 — matches SDK behavior)
 - [ ] Session closing -> 503
 - [ ] Session timeout via US-006, respecting active-request counter
 - [ ] Health, CORS, headers via US-007/008
 - [ ] Backpressure: bounded channel per session
 - [ ] Protocol version passthrough: client's `protocolVersion` in initialize forwarded exactly to child
-- [ ] **Notifications from client**: forward to child, respond HTTP 202
-- [ ] **Server-initiated messages**: forward via SSE GET stream
+- [ ] **Notifications from client**: forward to child, respond HTTP **202 Accepted**
+- [ ] **Request POSTs**: respond with SSE stream (text/event-stream), one `event: message` per response
+- [ ] **Server-initiated messages**: forward via GET SSE stream
 - [ ] **Concurrent POSTs**: serialized stdin writes, response correlation by JSON-RPC `id`
 - [ ] **CORS exposedHeaders**: includes `Mcp-Session-Id`
-- [ ] **Response lifecycle**: session counter dec on HTTP response terminal state
+- [ ] **Response lifecycle**: session counter inc on request accept, dec on `res.finish` or `res.close` event
+- [ ] **Transport onclose/onerror**: clear session counter (runCleanup=false), delete transport, kill child
 - [ ] Compatibility harness passes
 
 ### US-011: Gateway — stdio->Streamable HTTP (Stateless)
 **Acceptance Criteria:**
-- [ ] Per-request Region: spawn child, auto-init if needed (via `mcp_init.rs`), forward, respond, kill
-- [ ] Auto-init state machine per architecture diagram
-- [ ] `--protocolVersion` controls auto-init version string
+- [ ] Per-request Region: new child + transport per POST. spawn child, auto-init if needed (via `mcp_init.rs`), forward, respond, kill
+- [ ] Auto-init state machine per architecture diagram (5 state variables: isInitialized, initializeRequestId, isAutoInitializing, pendingOriginalMessages, buffer)
+- [ ] `--protocolVersion` controls auto-init version string (default: `2024-11-05`)
 - [ ] Auto-init timeout: 5s, then kill + JSON-RPC `-32603`
 - [ ] **Child notifications before init response**: buffer and forward after init completes
-- [ ] GET/DELETE -> 405
-- [ ] **Notifications from client**: forward to child, respond HTTP 202
+- [ ] **Accept header validation**: POST must include both `application/json` AND `text/event-stream` → 406
+- [ ] **Content-Type validation**: POST must be `application/json` → 415
+- [ ] GET/DELETE -> **405 Method Not Allowed** (not 400)
+- [ ] **Notifications from client**: forward to child, respond HTTP **202 Accepted**
+- [ ] **Request POSTs**: respond with SSE stream (text/event-stream)
+- [ ] **Outer try/catch**: unlike stateful mode, stateless wraps entire handler in try/catch, returning 500 + JSON-RPC `-32603` on unexpected errors
+- [ ] **No CORS exposedHeaders** for Mcp-Session-Id (no sessions)
+- [ ] **No sessionIdGenerator** — transport created with `sessionIdGenerator: undefined` equivalent
+- [ ] **Batch pending messages**: if batch request arrives, buffer ALL messages (not just one — fixes TS bug)
 - [ ] Compatibility harness passes
 
 ### US-012: Gateway — stdio->SSE
 **Acceptance Criteria:**
 - [ ] Single child spawned at startup
 - [ ] GET `<ssePath>` -> SSE connection, `endpoint` event with POST URL constructed from `baseUrl + messagePath`
-- [ ] POST `<messagePath>?sessionId=` -> forward to child stdin
-- [ ] **`--baseUrl` support**: POST URL in endpoint event = `${baseUrl}${messagePath}`. Without baseUrl, use listener address
+- [ ] POST `<messagePath>?sessionId=` -> forward to child stdin, respond **202 Accepted** always
+- [ ] **`--baseUrl` support**: POST URL in endpoint event = `${baseUrl}${messagePath}?sessionId=${sessionId}`. Without baseUrl, use listener address
 - [ ] **Configurable paths**: use `--ssePath` and `--messagePath` CLI flags (not hard-coded)
 - [ ] Missing sessionId -> 400
 - [ ] No active session -> 503
 - [ ] Child stdout **broadcast to ALL** SSE clients (intentional — documented in transport matrix)
 - [ ] Sessions tracked, cleaned on disconnect
+- [ ] **Dual disconnect detection**: both request close AND transport close events trigger cleanup
 - [ ] Backpressure: per-client bounded channel. Blocked >30s -> disconnect
 - [ ] **Rapid connect/disconnect**: no leaked tasks, fds, or stale entries after 100+ cycles
 - [ ] **Custom headers on all responses** (SSE stream, POST, health)
+- [ ] **Express body parser skip**: message path must NOT use body-parsing middleware. Read raw body directly, parse JSON manually (SDK uses `raw-body` internally with 4MB limit)
 - [ ] **Child exit -> gateway process exit** with child's exit code (or 1)
+- [ ] **TS note**: cleanup callback NOT passed to onSignals in SSE mode (child not explicitly killed on signal — relying on process exit). Rust: explicitly kill child on signal for correctness
 - [ ] Compatibility harness passes
 
 ### US-013: Gateway — stdio->WebSocket
@@ -749,6 +999,9 @@ Critical path: US-000 -> US-002 -> US-003 -> US-004 -> US-005 -> US-010 -> US-01
 | Over-modeling payloads in Rust (strict typing) | High | High | `RawValue` pass-through mandated. Protocol transparency section enforces opaque forwarding |
 | Container PID 1 zombie accumulation | Medium | Medium | Document tini/dumb-init recommendation, test in US-001 |
 | Singleton client state unsafety in Rust | Medium | Medium | `Arc<Mutex<>>` pattern specified, no raw mutable statics |
+| SDK HTTP validation not replicated correctly | High | High | Detailed validation matrix in MCP SDK HTTP Semantics section. Integration tests against real MCP clients |
+| SSE event framing bugs | Medium | High | Unit tests for exact `event: <type>\ndata: <json>\n\n` format. Test with multiple MCP clients (Claude Desktop, Cursor, etc.) |
+| Body size limit mismatch | Low | Medium | Match SDK's 4MB default. Make configurable. Document in CLI flags |
 
 ## Open Questions (All Resolved)
 1. ~~Vendor vs crates.io~~ -> crates.io, pin exact
