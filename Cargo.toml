@@ -1,0 +1,16 @@
+[package]
+name = "supergateway-rs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+asupersync = "0.2.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+
+[dev-dependencies]
+asupersync = { version = "0.2.7", features = ["test-internals"] }
+
+[[test]]
+name = "validate"
+path = "spike/validate.rs"
