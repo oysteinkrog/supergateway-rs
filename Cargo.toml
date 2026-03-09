@@ -3,6 +3,8 @@ name = "supergateway-rs"
 version = "0.1.0"
 edition = "2021"
 description = "MCP transport bridge — stdio/SSE/WebSocket/Streamable HTTP"
+autobenches = false
+autotests = false
 
 [dependencies]
 asupersync = "=0.2.7"
@@ -20,3 +22,20 @@ asupersync = { version = "=0.2.7", features = ["test-internals"] }
 [[test]]
 name = "validate"
 path = "spike/validate.rs"
+
+[[test]]
+name = "compat_harness"
+path = "tests/compat_harness.rs"
+harness = true
+
+[[bin]]
+name = "mock_stdio_server"
+path = "tests/mock_stdio_server.rs"
+
+[[bin]]
+name = "mock_sse_server"
+path = "tests/mock_sse_server.rs"
+
+[[bin]]
+name = "mock_http_server"
+path = "tests/mock_http_server.rs"
