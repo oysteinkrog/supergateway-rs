@@ -32,6 +32,7 @@ This document catalogs all intentional behavioral differences between `supergate
 ### D-006: Log direction labels reversed in client modes
 **TS behavior:** Uses `'SSE → Stdio:'` label for messages going FROM stdio TO the remote server (direction reversed).
 **Rust behavior:** Correct direction labels in all log messages.
+**⚠ VERIFY:** GPT-5.4 review (QA pass 7) could not confirm this bug in current TS source. Labels appear correct in latest code. May have been fixed in a recent TS commit. Re-verify against the pinned reference commit before implementing. If not reproducible, remove this divergence.
 
 ### D-007: WebSocket `onclose` callback never fired
 **TS behavior:** `WebSocketServerTransport.close()` clears the clients map and closes the WSS, but never calls `this.onclose?.()`. Also doesn't fire `ondisconnection` for each remaining client.
@@ -99,13 +100,25 @@ This document catalogs all intentional behavioral differences between `supergate
 **TS behavior:** Returns 400 with JSON-RPC error `{code: -32000, message: "Bad Request: No valid session ID provided"}` for ALL invalid/missing session ID cases.
 **Rust behavior:** Differentiates: missing session ID on non-init request → 400, session not found → 404, session closing → 503.
 
-### D-017: 30s backpressure timeout in SSE broadcast
-**TS behavior:** On SSE send failure, simply catches the error, logs it, and removes the session from the map. No backpressure timeout — failures are only detected when the send actually throws.
-**Rust behavior:** Per-client bounded channel with 30s backpressure timeout. If a client cannot accept messages for 30s, disconnect the client proactively.
-
 ### D-016: Explicit cleanup on signal in ALL server modes
 **TS behavior:** Only WS mode passes a cleanup callback to `onSignals()`. SSE, stateful HTTP, and stateless HTTP modes pass no cleanup callback — children are only killed implicitly by parent exit (extending D-011 to all modes).
 **Rust behavior:** All server modes explicitly kill process groups on signal via `killpg()`.
+
+### D-017: 30s backpressure timeout in SSE broadcast
+**TS behavior:** On SSE send failure, simply catches the error, logs it, and removes the session from the map. No backpressure timeout — failures are only detected when the send actually throws.
+**Rust behavior:** Per-client bounded channel (capacity 256) with 30s backpressure timeout. If a client cannot accept messages for 30s, disconnect the client proactively.
+
+### D-018: Health endpoint Content-Type
+**TS behavior:** Express `res.send('ok')` returns `Content-Type: text/html; charset=utf-8` (Express default).
+**Rust behavior:** Returns `Content-Type: text/plain`. Minor parity difference unlikely to affect real clients but may affect strict compatibility tests.
+
+### D-019: Custom headers scope consistency
+**TS behavior:** Custom `--header` values are applied inconsistently across modes:
+- SSE mode: applied to health, SSE connect, and POST 202 responses
+- Streamable HTTP modes: applied ONLY to health endpoint (NOT to MCP POST/GET/DELETE responses)
+- WS mode: not applied at all (see D-105)
+- Client modes: applied as outgoing request headers
+**Rust behavior:** TBD — either match TS per-mode scoping exactly, or apply uniformly and document as improvement.
 
 ## Behavioral Notes (Same Behavior, Different Implementation)
 
