@@ -2,14 +2,20 @@
 name = "supergateway-rs"
 version = "0.1.0"
 edition = "2021"
+description = "MCP transport bridge — stdio/SSE/WebSocket/Streamable HTTP"
 
 [dependencies]
-asupersync = "0.2.7"
+asupersync = "=0.2.7"
+clap = { version = "4", features = ["derive"] }
+nix = { version = "0.29", features = ["signal", "process"] }
+regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
+thiserror = "2"
+uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
-asupersync = { version = "0.2.7", features = ["test-internals"] }
+asupersync = { version = "=0.2.7", features = ["test-internals"] }
 
 [[test]]
 name = "validate"
