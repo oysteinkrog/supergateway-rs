@@ -83,6 +83,26 @@ This document catalogs all intentional behavioral differences between `supergate
 **TS behavior:** No limit on stdio line buffer. Malicious or broken child could exhaust gateway memory.
 **Rust behavior:** 64MB max partial buffer. Kill child/session on overflow (protocol violation).
 
+### D-012: Stdin write serialization in shared-child modes
+**TS behavior:** SSE and WS modes write to child stdin from multiple concurrent request handlers without any synchronization. Concurrent writes can interleave partial JSON lines, corrupting the stream.
+**Rust behavior:** All shared-child modes (SSE, WS) use a Mutex around child stdin writes to prevent interleaved JSON lines.
+
+### D-013: SSE client reconnection with message buffering
+**TS behavior:** SSE→stdio client mode relies on the SDK's built-in EventSource behavior (browser-style auto-reconnect). No message buffering during disconnect — outgoing messages are lost.
+**Rust behavior:** Configurable reconnection with exponential backoff (1s, 2s, 4s, max 30s), Last-Event-ID header, and 256-message outgoing buffer during disconnect.
+
+### D-014: Protocol version passthrough via clean interceptor
+**TS behavior:** Client modes monkey-patch `client.request()` method to intercept initialize requests and replace protocolVersion. Original method restored after connect().
+**Rust behavior:** Uses a clean interceptor pattern (middleware or wrapper) instead of monkey-patching.
+
+### D-015: Session not found returns 404 (stateful HTTP)
+**TS behavior:** Returns 400 with JSON-RPC error `{code: -32000, message: "Bad Request: No valid session ID provided"}` for ALL invalid/missing session ID cases.
+**Rust behavior:** Differentiates: missing session ID on non-init request → 400, session not found → 404, session closing → 503.
+
+### D-016: Explicit cleanup on signal in ALL server modes
+**TS behavior:** Only WS mode passes a cleanup callback to `onSignals()`. SSE, stateful HTTP, and stateless HTTP modes pass no cleanup callback — children are only killed implicitly by parent exit (extending D-011 to all modes).
+**Rust behavior:** All server modes explicitly kill process groups on signal via `killpg()`.
+
 ## Behavioral Notes (Same Behavior, Different Implementation)
 
 ### B-001: SSE broadcast-to-all
