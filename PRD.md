@@ -1,4 +1,4 @@
-# PRD: supergateway-rs — Rust Rewrite using Asupersync (v5)
+# PRD: supergateway-rs — Rust Rewrite using Asupersync (v6)
 
 ## Overview
 Rewrite supergateway (~2,100 LOC TypeScript MCP transport bridge) in Rust using Asupersync. Drop-in CLI replacement bridging MCP stdio servers with SSE, Streamable HTTP, and WebSocket transports. Implements MCP JSON-RPC handling from scratch using Asupersync's native stacks and structured concurrency.
@@ -434,7 +434,7 @@ In the TS code, an `McpServer` instance is created but its callbacks (`onmessage
 | Valid JSON, invalid JSON-RPC | 200 | `-32600` Invalid Request | Per JSON-RPC 2.0 spec |
 | Missing Accept headers (StreamableHTTP) | 406 | — | Must include both `application/json` AND `text/event-stream` |
 | Wrong Content-Type (StreamableHTTP) | 415 | — | Must be `application/json` |
-| No session / invalid session (stateful) | 404 | — | SDK returns 404, not 400 |
+| No session / invalid session (stateful POST) | 404 | — | SDK handleRequest returns 404. **Note:** TS gateway wrapper returns 400 on GET/DELETE (app-level check before SDK). Rust: use 404 consistently |
 | Session closing/closed | 503 | `-32000` | After DELETE or timeout |
 | Child process dead | 502 | `-32603` Internal Error | EPIPE or child exit |
 | Auto-init timeout | 502 | `-32603` Internal Error | Stateless mode, 5s |
@@ -528,18 +528,21 @@ The TS version uses string concatenation (`clientId + ':' + msg.id`) for routing
 
 ```rust
 // jsonrpc.rs — opaque pass-through
+//
+// IMPORTANT: serde_json::RawValue is a DST (like str). You MUST use Box<RawValue>
+// for owned values. &RawValue is only for borrowed/zero-copy contexts.
 struct RawMessage {
-    jsonrpc: String,         // always "2.0"
+    jsonrpc: String,                        // always "2.0"
     #[serde(skip_serializing_if = "Option::is_none")]
-    id: Option<RawValue>,    // number, string, or null — preserved exactly
+    id: Option<Box<RawValue>>,              // number, string, or null — preserved exactly
     #[serde(skip_serializing_if = "Option::is_none")]
-    method: Option<String>,  // present for requests/notifications
+    method: Option<String>,                 // present for requests/notifications
     #[serde(skip_serializing_if = "Option::is_none")]
-    params: Option<RawValue>,// opaque
+    params: Option<Box<RawValue>>,          // opaque
     #[serde(skip_serializing_if = "Option::is_none")]
-    result: Option<RawValue>,// opaque
+    result: Option<Box<RawValue>>,          // opaque
     #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<RawValue>, // opaque (contains code, message, data)
+    error: Option<Box<RawValue>>,           // opaque (contains code, message, data)
 }
 
 // Helpers
@@ -587,6 +590,253 @@ async fn run_gateway(cx: &mut Cx, config: GatewayConfig) -> Outcome<(), Error> {
 | stdio→Stateless HTTP | None (per-request) | No shared mutable state |
 | SSE→stdio | singleton client | Arc<Mutex<Option<Client>>> |
 | HTTP→stdio | singleton client | Arc<Mutex<Option<Client>>> |
+
+### Rust-Specific Design Decisions
+
+**Error Type Hierarchy:**
+```rust
+#[derive(Debug, thiserror::Error)]
+enum GatewayError {
+    #[error("JSON-RPC error: {code} {message}")]
+    JsonRpc { code: i32, message: String },
+    #[error("child process error: {0}")]
+    Child(#[from] ChildError),
+    #[error("session error: {0}")]
+    Session(SessionError),
+    #[error("transport error: {0}")]
+    Transport(String),
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+}
+```
+`GatewayError` must implement Asupersync's web framework `IntoResponse` trait to automatically convert to correct HTTP status + JSON-RPC error body per the Error Mapping Table.
+
+**RAII Session Access Guard:**
+Session access counter increment/decrement MUST use a Drop guard, not manual function calls. This ensures the counter is decremented even if the request handler future is cancelled (e.g., client disconnect drops the future mid-execution):
+```rust
+struct SessionAccessGuard { session_id: String, counter: Arc<SessionCounter> }
+impl Drop for SessionAccessGuard {
+    fn drop(&mut self) { self.counter.dec(&self.session_id); }
+}
+```
+
+**Broadcast Without Head-of-Line Blocking:**
+In SSE and WS modes, broadcasting child stdout to all clients MUST NOT hold the client map lock across async sends. Pattern:
+1. Acquire read lock on client map
+2. Clone all client channel senders into a local Vec
+3. Drop the lock
+4. Iterate Vec and send to each (use `try_send` or per-client spawned forwarder task)
+This prevents a slow client from blocking all other clients and from deadlocking the RwLock when new clients connect.
+
+**RwLock Guard Discipline:**
+NEVER hold an `RwLock` guard across an `.await` point. Asupersync Mutex/RwLock guards may not be `Send` and holding across yield points causes deadlocks. Always clone needed data, drop the guard, then await.
+
+**`&mut Cx` Concurrency:**
+Asupersync uses `&mut Cx` (mutable reference) for all async operations. Multiple concurrent request handlers cannot share a single `&mut Cx`. US-000 spike MUST validate how Asupersync's web framework provides Cx to concurrent handlers (likely via internal forking/splitting mechanism). If Cx cannot be shared, each spawned task within a Region gets its own Cx from the scope.
+
+**PID Reuse Safety for killpg:**
+After sending SIGTERM to a process group, check the direct child's wait status before escalating to SIGKILL. The child may have already exited and the PGID may have been reused by an unrelated process. Use `waitpid(child_pid, WNOHANG)` to check before escalating.
+
+**PID 1 Zombie Reaper:**
+When running as PID 1 in a container, install a `SIGCHLD` handler that calls `waitpid(-1, WNOHANG)` in a loop until it returns `ECHILD`. This reaps orphaned grandchildren that reparent to PID 1. Run this as a background task in the server Region.
+
+**Memory Budget:**
+Max partial line buffer is 64MB per child. With 1024 max sessions (stateful mode), worst case is 64GB aggregate. Add a **global memory semaphore** capping total partial buffer allocation to 256MB across all sessions. New sessions are rejected (503) when the budget is exhausted.
+
+**Version String:**
+TypeScript reads version from `package.json`. Rust: use `env!("CARGO_PKG_VERSION")` compiled from `Cargo.toml`. This must match the TS version string format for compatibility testing. Set version in `Cargo.toml` to match the pinned TS supergateway version.
+
+### Normative SDK-Compatibility Behaviors
+
+These wire-level behaviors are implicitly provided by the MCP SDK in the TypeScript version and MUST be reimplemented in Rust for protocol parity.
+
+#### SSE Wire Protocol (stdio->SSE mode)
+
+**Response headers on SSE GET:**
+```
+HTTP/1.1 200 OK
+Content-Type: text/event-stream
+Cache-Control: no-cache
+Connection: keep-alive
+```
+Headers must be flushed immediately (no buffering). Consider adding `X-Accel-Buffering: no` for nginx proxy compatibility.
+
+**Endpoint event (first event, exactly once per connection):**
+```
+event: endpoint
+data: <baseUrl><messagePath>?sessionId=<uuid>
+
+```
+- Event name is literally `endpoint`
+- Payload is plain-text URL (NOT JSON)
+- Session ID is appended as query parameter by the transport
+- URL may be absolute or relative (depends on `--baseUrl`)
+- Exactly one endpoint event per SSE connection
+
+**Message events (server->client JSON-RPC messages):**
+```
+event: message
+data: {"jsonrpc":"2.0",...}
+
+```
+- Event name is `message`
+- Data is compact single-line JSON (no pretty-printing)
+- Each event separated by blank line (`\n\n`)
+
+**handlePostMessage behavior:**
+- Reads raw body as UTF-8 with 4MB limit
+- Parses single JSON document from body
+- On success: calls `onmessage` callback, returns 202 Accepted with empty body
+- On oversized body: 413 Payload Too Large
+- On malformed JSON: 400 Bad Request
+- On aborted/unreadable stream: connection error (no response)
+
+#### Streamable HTTP Wire Protocol
+
+**POST response mode selection:**
+- If body contains ONLY notifications (no `id` fields): return 202 Accepted with empty body
+- If body contains any requests (with `id` fields): return SSE stream response
+- SSE stream: `Content-Type: text/event-stream`, one `event: message\ndata: <json>\n\n` per JSON-RPC response
+- Stream closes when all requests in the POST have been answered
+- Server-initiated notifications MAY be interleaved in the SSE stream
+
+**Mcp-Session-Id lifecycle:**
+1. Client sends POST with `initialize` request (no session header)
+2. Server responds with `Mcp-Session-Id` header in the SSE stream response headers
+3. Client includes `Mcp-Session-Id` on ALL subsequent POST/GET/DELETE requests
+4. Server validates session header on every request; returns 404 for unknown/missing session
+5. DELETE terminates session; subsequent requests with that session ID get 404
+6. **Note:** The TS gateway wrapper returns 400 for invalid session on GET/DELETE (lines 237-239 of stdioToStatefulStreamableHttp.ts). This is an app-level check BEFORE the SDK's handleRequest. The SDK itself would return 404. For Rust: use 404 consistently (matching SDK behavior, not the wrapper).
+
+**Batch request handling:**
+- JSON array body is a batch of messages
+- If all messages are notifications: 202 Accepted
+- If any messages are requests: SSE stream response with one event per response
+- Empty batch array: implementation-defined (reject with 400 or accept as no-op)
+- Mixed valid/invalid entries: per-entry JSON-RPC error responses in the stream
+
+**Error response body format:**
+- Transport-level errors (406, 415, 404, 409): plain text body OR JSON-RPC error object with `id: null`. Check SDK source for exact format per error code.
+- Application-level errors (400 from gateway wrapper, 503): JSON-RPC error object `{jsonrpc:"2.0", error:{code, message}, id:null}`
+
+#### SSE Client Protocol (SSE->stdio mode)
+
+**Connection sequence:**
+1. Client opens GET to SSE URL with custom headers (via eventSourceInit.fetch wrapper)
+2. Waits for `event: endpoint` — extracts POST URL from data field
+3. Subsequent `request()` calls POST JSON-RPC to the discovered endpoint URL
+4. If endpoint event never arrives: transport error after timeout
+5. `requestInit.headers` are applied to POST requests only; `eventSourceInit.fetch` wraps the SSE GET
+
+**Reconnection:**
+- EventSource-based reconnection may be handled by the SDK's polyfill
+- If reconnect occurs, endpoint URL is rediscovered from new endpoint event
+- `Last-Event-ID` and `retry` SSE fields: support if SDK uses them
+
+#### Streamable HTTP Client Protocol (HTTP->stdio mode)
+
+**Session header management:**
+- Client captures `Mcp-Session-Id` from server's response headers after initialization
+- Client includes `Mcp-Session-Id` on all subsequent requests
+- Client detects response type by `Content-Type`: `application/json` (single response) vs `text/event-stream` (streamed responses)
+
+#### Protocol Initialize Flow (Client Modes)
+
+**`client.connect(transport)` lifecycle:**
+1. Calls `transport.start()`
+2. Sends `initialize` request to remote server
+3. Receives initialize response
+4. Automatically sends `notifications/initialized` notification
+5. `connect()` resolves after the full init handshake completes
+6. If initialize fails: `connect()` rejects/errors
+
+This auto-init flow is critical — the TS gateway's client modes rely on it. The Rust client modes must replicate this exact sequence.
+
+#### Stdio Framing Contract
+
+**Wire format:**
+- UTF-8 text stream, one JSON document per line
+- Line separator: `\n` (also accept `\r\n` for compatibility)
+- Compact single-line JSON serialization (no pretty-printing)
+- No Content-Length or other framing headers
+
+**Read behavior:**
+- Buffer incoming data, split on newline
+- Partial chunks buffered until newline received
+- Blank/whitespace-only lines: skip silently
+- Malformed JSON lines: log error, skip, continue reading (not fatal)
+- Valid JSON on partial buffer at EOF: emit as final frame
+
+**Write behavior:**
+- `JSON.stringify(msg) + '\n'` — compact JSON followed by newline
+- Writes must be serialized (mutex) for shared-child modes
+
+### Auto-Init Request Details
+
+The auto-init `initialize` request sent in stateless mode has specific fields:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "init_<timestamp>_<random9>",
+  "method": "initialize",
+  "params": {
+    "protocolVersion": "<--protocolVersion flag value>",
+    "capabilities": {
+      "roots": { "listChanged": true },
+      "sampling": {}
+    },
+    "clientInfo": {
+      "name": "supergateway",
+      "version": "<package version>"
+    }
+  }
+}
+```
+
+The `notifications/initialized` notification:
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "notifications/initialized"
+}
+```
+
+These exact shapes must be replicated in the Rust implementation.
+
+### Logging Behavioral Details
+
+**WS mode child stderr:** TS logs child stderr as `logger.info()` (not `error`). This is a TS quirk — Rust should log stderr as `error` level (document as intentional improvement in DIVERGENCES.md).
+
+**Startup messages (all modes):**
+```
+[supergateway] Starting...
+[supergateway] Supergateway is supported by Supermachine (hosted MCPs) - https://supermachine.ai
+[supergateway]   - outputTransport: <value>
+```
+Followed by mode-specific parameter logging. The Supermachine promo line is specific to the TS version; Rust may omit or replace it.
+
+**Header logging:** TS uses `Object(headers).length` which is always undefined (bug). The correct TS code in sseToStdio.ts uses `Object.keys(headers).length` which works. Inconsistency between files. Rust: use consistent `headers.len()`.
+
+### CORS Ownership
+
+CORS is handled at the **application layer** (express middleware), NOT by the SDK transports. The Rust implementation must:
+- Apply CORS middleware before route handlers
+- The `exposedHeaders: ['Mcp-Session-Id']` is only needed in stateful HTTP mode
+- SDK transports do NOT set CORS headers themselves
+- Preflight (OPTIONS) is handled entirely by CORS middleware
+
+### Express Body Parser Differences by Mode
+
+| Mode | Body Parser | Reason |
+|---|---|---|
+| stdio→SSE | **Skipped** on messagePath | SDK's handlePostMessage reads raw body via `raw-body` (4MB limit) |
+| stdio→SSE | Active on other paths | Health endpoints, etc. |
+| stdio→Stateful HTTP | `express.json()` active | SDK's handleRequest expects pre-parsed `req.body` |
+| stdio→Stateless HTTP | `express.json()` active | SDK's handleRequest expects pre-parsed `req.body` |
+| stdio→WS | Not configured | WebSocket mode doesn't use express body parsing |
+
+**Rust implication:** For SSE mode, read the raw POST body and parse JSON manually. For StreamableHTTP modes, parse JSON before passing to the handler. This is a subtle but critical difference.
 
 ## Performance Targets
 
@@ -672,7 +922,7 @@ async fn run_gateway(cx: &mut Cx, config: GatewayConfig) -> Outcome<(), Error> {
 - [ ] SSE client: connect, receive streamed events
 - [ ] Child process: determine if `asupersync::process::Command` exists. If not, demonstrate `std::process::Command` with async I/O adapter inside a Region
 - [ ] Verify `kill_on_drop` or equivalent — child killed when Region closes
-- [ ] Verify `&mut Cx` vs `&Cx` in handler signatures
+- [ ] Verify `&mut Cx` vs `&Cx` in handler signatures. **Critical:** Determine how concurrent HTTP request handlers each get their own `&mut Cx`. Does the framework fork/split contexts internally? This is a blocking architectural question
 - [ ] Timer: `asupersync::time::timeout` wrapping a future
 - [ ] Region lifecycle: spawn tasks, cancel region, verify cleanup
 - [ ] Sync primitives: `mutex.lock(&cx).await?` works as documented

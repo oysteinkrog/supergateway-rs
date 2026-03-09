@@ -45,8 +45,12 @@ This document catalogs all intentional behavioral differences between `supergate
 **TS behavior:** `Object(headers).length` always evaluates to `undefined`, so the header count log message always says "(none)" even when headers are configured.
 **Rust behavior:** Logs actual count of configured headers.
 
-### D-010: SSE mode doesn't explicitly kill child on signal
-**TS behavior:** `stdioToSse.ts` passes no cleanup callback to `onSignals()`. The child process is only killed implicitly by the parent process exiting (which may not kill grandchildren).
+### D-010: WS mode child stderr logged at correct level
+**TS behavior:** `stdioToWs.ts:90` logs child stderr with `logger.info()` instead of `logger.error()`. All other modes use `logger.error()` for stderr.
+**Rust behavior:** All modes log child stderr at `error` level consistently.
+
+### D-011: SSE mode doesn't explicitly kill child on signal
+**TS behavior:** `stdioToSse.ts:67` passes no cleanup callback to `onSignals()`. The child process is only killed implicitly by the parent process exiting (which may not kill grandchildren).
 **Rust behavior:** Explicitly sends SIGTERM to process group on signal, ensuring all descendants are killed.
 
 ## Improvements (New Behavior)
