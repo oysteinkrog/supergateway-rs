@@ -99,6 +99,10 @@ This document catalogs all intentional behavioral differences between `supergate
 **TS behavior:** Returns 400 with JSON-RPC error `{code: -32000, message: "Bad Request: No valid session ID provided"}` for ALL invalid/missing session ID cases.
 **Rust behavior:** Differentiates: missing session ID on non-init request → 400, session not found → 404, session closing → 503.
 
+### D-017: 30s backpressure timeout in SSE broadcast
+**TS behavior:** On SSE send failure, simply catches the error, logs it, and removes the session from the map. No backpressure timeout — failures are only detected when the send actually throws.
+**Rust behavior:** Per-client bounded channel with 30s backpressure timeout. If a client cannot accept messages for 30s, disconnect the client proactively.
+
 ### D-016: Explicit cleanup on signal in ALL server modes
 **TS behavior:** Only WS mode passes a cleanup callback to `onSignals()`. SSE, stateful HTTP, and stateless HTTP modes pass no cleanup callback — children are only killed implicitly by parent exit (extending D-011 to all modes).
 **Rust behavior:** All server modes explicitly kill process groups on signal via `killpg()`.
