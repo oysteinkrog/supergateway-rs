@@ -20,6 +20,7 @@ uuid = { version = "1", features = ["v4"] }
 [dev-dependencies]
 asupersync = { version = "=0.2.7", features = ["test-internals", "tls-webpki-roots"] }
 criterion = { version = "0.5", features = ["html_reports"] }
+libc = "0.2"
 
 [[test]]
 name = "validate"
@@ -28,6 +29,11 @@ path = "spike/validate.rs"
 [[test]]
 name = "compat_harness"
 path = "tests/compat_harness.rs"
+harness = true
+
+[[test]]
+name = "compat"
+path = "tests/compat/main.rs"
 harness = true
 
 [[bench]]
