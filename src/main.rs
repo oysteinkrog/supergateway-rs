@@ -1,6 +1,7 @@
 mod cli;
 mod health;
 mod observe;
+mod session;
 
 fn main() {
     let config = cli::Config::parse();
