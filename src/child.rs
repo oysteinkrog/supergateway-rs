@@ -74,7 +74,7 @@ pub struct ChildBridge {
     pid: Pid,
     pgid: Pid,
     stdin: Mutex<Option<ChildStdin>>,
-    stdout_rx: Receiver<Result<Parsed, CodecError>>,
+    stdout_rx: Mutex<Receiver<Result<Parsed, CodecError>>>,
     dead: Arc<AtomicBool>,
     exit_code: Arc<Mutex<Option<i32>>>,
     stdout_handle: Option<JoinHandle<()>>,
@@ -170,7 +170,7 @@ impl ChildBridge {
             pid,
             pgid,
             stdin: Mutex::new(child_stdin),
-            stdout_rx,
+            stdout_rx: Mutex::new(stdout_rx),
             dead,
             exit_code,
             stdout_handle: Some(stdout_handle),
@@ -186,7 +186,8 @@ impl ChildBridge {
     /// Returns `Err(StdoutClosed)` on EOF.
     /// Returns `Err(Codec(e))` on fatal codec errors (InvalidUtf8, BufferOverflow).
     pub fn recv_message(&self) -> Result<Parsed, ChildError> {
-        match self.stdout_rx.recv() {
+        let rx = self.stdout_rx.lock().unwrap();
+        match rx.recv() {
             Ok(Ok(parsed)) => Ok(parsed),
             Ok(Err(codec_err)) => Err(ChildError::Codec(codec_err)),
             Err(_) => Err(ChildError::StdoutClosed),
@@ -197,7 +198,8 @@ impl ChildBridge {
     ///
     /// Returns `Ok(None)` if no message is available yet.
     pub fn try_recv_message(&self) -> Result<Option<Parsed>, ChildError> {
-        match self.stdout_rx.try_recv() {
+        let rx = self.stdout_rx.lock().unwrap();
+        match rx.try_recv() {
             Ok(Ok(parsed)) => Ok(Some(parsed)),
             Ok(Err(codec_err)) => Err(ChildError::Codec(codec_err)),
             Err(mpsc::TryRecvError::Empty) => Ok(None),
@@ -376,6 +378,12 @@ impl Drop for ChildBridge {
         }
     }
 }
+
+// SAFETY: ChildBridge fields are thread-safe in practice:
+// - stdin_tx (Mutex<ChildStdin>): Mutex provides synchronization
+// - stdout_rx (Receiver): only ever read from one thread at a time
+// - All other fields are Arc, AtomicBool, Mutex, or Pid (Copy)
+unsafe impl Sync for ChildBridge {}
 
 #[cfg(test)]
 mod tests {
