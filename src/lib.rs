@@ -1,5 +1,6 @@
 pub mod child;
 pub mod cli;
+pub mod client;
 pub mod codec;
 pub mod cors;
 pub mod health;
