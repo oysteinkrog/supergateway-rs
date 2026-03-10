@@ -18,6 +18,7 @@ uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 asupersync = { version = "=0.2.7", features = ["test-internals"] }
+criterion = { version = "0.5", features = ["html_reports"] }
 
 [[test]]
 name = "validate"
@@ -27,6 +28,10 @@ path = "spike/validate.rs"
 name = "compat_harness"
 path = "tests/compat_harness.rs"
 harness = true
+
+[[bench]]
+name = "codec"
+harness = false
 
 [[bin]]
 name = "mock_stdio_server"
