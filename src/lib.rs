@@ -1,3 +1,4 @@
+pub mod child;
 pub mod cli;
 pub mod codec;
 pub mod cors;
