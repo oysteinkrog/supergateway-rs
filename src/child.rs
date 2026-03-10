@@ -379,12 +379,6 @@ impl Drop for ChildBridge {
     }
 }
 
-// SAFETY: ChildBridge fields are thread-safe in practice:
-// - stdin_tx (Mutex<ChildStdin>): Mutex provides synchronization
-// - stdout_rx (Receiver): only ever read from one thread at a time
-// - All other fields are Arc, AtomicBool, Mutex, or Pid (Copy)
-unsafe impl Sync for ChildBridge {}
-
 #[cfg(test)]
 mod tests {
     use super::*;

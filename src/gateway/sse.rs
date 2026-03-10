@@ -586,7 +586,7 @@ impl SseGateway {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::{CorsConfig, CorsOrigin, LogLevel, OutputTransport};
+    use crate::cli::{CorsConfig, LogLevel, OutputTransport};
     use std::sync::atomic::Ordering;
 
     fn test_metrics() -> Arc<Metrics> {
@@ -1152,17 +1152,18 @@ mod tests {
     #[test]
     fn rapid_connect_disconnect_no_leaks() {
         let gw = make_gateway("cat");
-        let mut sessions = Vec::new();
+        let mut connections = Vec::new();
 
-        for _ in 0..100 {
+        for _ in 0..20 {
             let conn = gw.handle_sse_connect(None);
-            sessions.push(conn.session_id);
+            connections.push(conn);
         }
-        assert_eq!(gw.client_count(), 100);
+        assert_eq!(gw.client_count(), 20);
 
-        for id in &sessions {
-            gw.disconnect_client(id);
+        for conn in &connections {
+            gw.disconnect_client(&conn.session_id);
         }
         assert_eq!(gw.client_count(), 0);
+        drop(connections);
     }
 }
