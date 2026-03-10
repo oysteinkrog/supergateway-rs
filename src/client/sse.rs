@@ -66,6 +66,8 @@ pub struct SseParser {
     event_type: String,
     /// Accumulated data lines for the current event.
     data_buf: String,
+    /// Whether any `data` field was seen for the current event.
+    has_data: bool,
     /// Current event ID.
     event_id: String,
     /// Last successfully dispatched event ID.
@@ -82,6 +84,7 @@ impl SseParser {
         Self {
             event_type: String::new(),
             data_buf: String::new(),
+            has_data: false,
             event_id: String::new(),
             last_event_id: String::new(),
             retry_ms: None,
@@ -182,9 +185,10 @@ impl SseParser {
                 self.event_type = value.to_owned();
             }
             "data" => {
-                if !self.data_buf.is_empty() {
+                if self.has_data {
                     self.data_buf.push('\n');
                 }
+                self.has_data = true;
                 self.data_buf.push_str(value);
             }
             "id" => {
@@ -208,8 +212,8 @@ impl SseParser {
 
     /// Dispatch the accumulated event.
     fn dispatch_event(&mut self) -> Option<SseEvent> {
-        // If data buffer is empty, don't dispatch (per spec).
-        if self.data_buf.is_empty() {
+        // If no data field was seen, don't dispatch (per spec).
+        if !self.has_data {
             // Still reset event type.
             self.event_type.clear();
             return None;
@@ -230,6 +234,7 @@ impl SseParser {
         }
 
         // Reset for next event.
+        self.has_data = false;
         self.event_type.clear();
 
         Some(SseEvent {
