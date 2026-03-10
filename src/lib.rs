@@ -6,3 +6,4 @@ pub mod health;
 pub mod jsonrpc;
 pub mod observe;
 pub mod session;
+pub mod signal;

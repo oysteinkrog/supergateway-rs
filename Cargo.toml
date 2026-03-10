@@ -9,6 +9,7 @@ autotests = false
 [dependencies]
 asupersync = "=0.2.7"
 clap = { version = "4", features = ["derive"] }
+libc = "0.2"
 nix = { version = "0.29", features = ["signal", "process"] }
 regex = "1"
 serde = { version = "1", features = ["derive"] }

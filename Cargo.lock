@@ -1088,6 +1088,7 @@ dependencies = [
  "asupersync",
  "clap",
  "criterion",
+ "libc",
  "nix 0.29.0",
  "regex",
  "serde",
