@@ -40,6 +40,10 @@ harness = true
 name = "codec"
 harness = false
 
+[[bench]]
+name = "gateway"
+harness = false
+
 [[bin]]
 name = "mock_stdio_server"
 path = "tests/mock_stdio_server.rs"
