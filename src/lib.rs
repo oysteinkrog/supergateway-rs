@@ -1,5 +1,6 @@
 pub mod cli;
 pub mod codec;
+pub mod cors;
 pub mod health;
 pub mod jsonrpc;
 pub mod observe;

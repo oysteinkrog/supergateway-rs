@@ -1,4 +1,5 @@
 mod cli;
+mod cors;
 mod health;
 mod observe;
 mod session;
