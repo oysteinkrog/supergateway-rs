@@ -38,7 +38,8 @@ use crate::observe::{Logger, Metrics};
 
 // Re-export utilities needed by the calling code.
 pub use crate::gateway::sse_to_stdio::{
-    make_error_response, write_stdout, CLIENT_ERROR_CODE, CLIENT_ERROR_MESSAGE,
+    extract_error_code, make_error_response, write_stdout, CLIENT_ERROR_CODE,
+    CLIENT_ERROR_MESSAGE,
 };
 
 // ─── Init Phase ───────────────────────────────────────────────────
@@ -913,10 +914,18 @@ mod tests {
 
     #[test]
     fn error_response_accessible() {
-        let resp = make_error_response(Some(raw("5")), "MCP error -32600: Invalid");
+        let resp = make_error_response(Some(raw("5")), "MCP error -32600: Invalid", None);
         assert!(resp.is_response());
         let s = serde_json::to_string(&resp).unwrap();
         assert!(s.contains("-32000")); // CLIENT_ERROR_CODE
         assert!(s.contains("Invalid")); // Prefix stripped
+    }
+
+    #[test]
+    fn error_response_preserves_code() {
+        let resp = make_error_response(Some(raw("5")), "Invalid", Some(-32600));
+        let s = serde_json::to_string(&resp).unwrap();
+        assert!(s.contains("-32600")); // Original code preserved
+        assert!(!s.contains("-32000"));
     }
 }
