@@ -501,7 +501,9 @@ impl StatefulHttpGateway {
         };
 
         let cleanup_logger = logger.clone();
-        let cleanup: crate::session::CleanupFn = Box::new(move |id| {
+        let cleanup: crate::session::CleanupFn<SessionData> = Box::new(move |id, data| {
+            cleanup_logger.info(&format!("session {id}: killing child process"));
+            data.child.kill();
             cleanup_logger.info(&format!("session {id} cleaned up"));
         });
 

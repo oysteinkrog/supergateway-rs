@@ -138,7 +138,7 @@ pub struct Session<S> {
 // ─── Cleanup callback ───────────────────────────────────────────────
 
 /// Invoked when a session transitions to Closed and is removed from the map.
-pub type CleanupFn = Box<dyn Fn(&SessionId) + Send + Sync>;
+pub type CleanupFn<S> = Box<dyn Fn(&SessionId, Arc<S>) + Send + Sync>;
 
 // ─── SessionManagerConfig ───────────────────────────────────────────
 
@@ -172,7 +172,7 @@ impl Default for SessionManagerConfig {
 struct Inner<S> {
     sessions: RwLock<HashMap<SessionId, Session<S>>>,
     config: SessionManagerConfig,
-    cleanup: Option<CleanupFn>,
+    cleanup: Option<CleanupFn<S>>,
     metrics: Arc<Metrics>,
 }
 
@@ -200,7 +200,7 @@ impl<S: Send + Sync + 'static> SessionManager<S> {
     pub fn new(
         config: SessionManagerConfig,
         metrics: Arc<Metrics>,
-        cleanup: Option<CleanupFn>,
+        cleanup: Option<CleanupFn<S>>,
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
@@ -411,14 +411,14 @@ impl<S: Send + Sync + 'static> SessionManager<S> {
             sessions.remove(id)
         };
 
-        if removed.is_some() {
+        if let Some(session) = removed {
             self.inner
                 .metrics
                 .active_sessions
                 .fetch_sub(1, Ordering::Relaxed);
 
             if let Some(ref cleanup) = self.inner.cleanup {
-                cleanup(id);
+                cleanup(id, session.inner);
             }
         }
     }
@@ -455,7 +455,7 @@ impl<S: Send + Sync + 'static> SessionManager<S> {
         }
 
         // Re-check under write lock.
-        let should_cleanup = {
+        let removed = {
             let mut sessions = self.inner.sessions.write().unwrap();
             match sessions.get(id) {
                 Some(session) => {
@@ -463,17 +463,16 @@ impl<S: Send + Sync + 'static> SessionManager<S> {
                         || session.timeout_gen.load(Ordering::Acquire) != expected_gen
                         || session.access_count.load(Ordering::Acquire) != 0
                     {
-                        false
+                        None
                     } else {
-                        sessions.remove(id);
-                        true
+                        sessions.remove(id)
                     }
                 }
-                None => false,
+                None => None,
             }
         };
 
-        if should_cleanup {
+        if let Some(session) = removed {
             self.inner
                 .metrics
                 .active_sessions
@@ -484,7 +483,7 @@ impl<S: Send + Sync + 'static> SessionManager<S> {
                 .fetch_add(1, Ordering::Relaxed);
 
             if let Some(ref cleanup) = self.inner.cleanup {
-                cleanup(id);
+                cleanup(id, session.inner);
             }
             return true;
         }
@@ -606,7 +605,7 @@ mod tests {
             max_sessions: max,
             ..Default::default()
         };
-        let cleanup: CleanupFn = Box::new(move |id| {
+        let cleanup: CleanupFn<()> = Box::new(move |id, _data| {
             cleaned.lock().unwrap().push(id.to_string());
         });
         SessionManager::new(config, Metrics::new(), Some(cleanup))
