@@ -709,15 +709,27 @@ impl StatefulHttpGateway {
 
         self.logger.info(&format!("session {} created", session_id));
 
+        // Acquire access guard to prevent idle timeout from firing during init
+        let guard = match self.sessions.acquire(&session_id) {
+            Ok(g) => g,
+            Err(e) => {
+                // Session was just created — this should never fail
+                self.sessions.complete_close(&session_id);
+                return GatewayResponse::from_error(&GatewayError::Internal(
+                    format!("failed to acquire new session: {e:?}"),
+                ));
+            }
+        };
+
         // Spawn relay thread — needs access to session data via the manager
-        // We access the session data through the session manager's internal state.
         // The relay thread gets a weak reference to avoid preventing shutdown.
         spawn_relay_for_session(&self.sessions, &session_id, self.logger.clone());
 
         // Forward messages and collect responses
         let resp = self.forward_and_respond(&session_id, messages);
 
-        // Start idle timer (session starts at access count 0)
+        // Drop guard before spawning idle timer (count must reflect this drop)
+        drop(guard);
         self.spawn_idle_timer_if_needed(&session_id);
 
         // Add Mcp-Session-Id header to response
