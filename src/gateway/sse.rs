@@ -25,6 +25,7 @@
 //! pm2/systemd restarts work correctly.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::Arc;
 
@@ -62,6 +63,10 @@ pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 #[allow(dead_code)]
 const MAX_BODY_SIZE: usize = 4 * 1024 * 1024;
 
+/// Maximum concurrent SSE clients (D-102).
+#[allow(dead_code)]
+const MAX_SSE_CLIENTS: usize = 1024;
+
 // ─── SSE Event ──────────────────────────────────────────────────────
 
 /// An event to send over the SSE stream.
@@ -70,8 +75,9 @@ const MAX_BODY_SIZE: usize = 4 * 1024 * 1024;
 pub enum SseEvent {
     /// First event: `event: endpoint\ndata: <url>\n\n`
     Endpoint(String),
-    /// Message event: `event: message\ndata: <json>\n\n`
-    Message(String),
+    /// Message event with monotonic ID for Last-Event-ID reconnect (D-013).
+    /// `id: <n>\nevent: message\ndata: <json>\n\n`
+    Message(String, u64),
     /// Keepalive comment: `: keepalive\n\n`
     Keepalive,
 }
@@ -83,7 +89,7 @@ impl SseEvent {
     pub fn serialize(&self) -> String {
         match self {
             Self::Endpoint(url) => format!("event: endpoint\ndata: {url}\n\n"),
-            Self::Message(data) => format!("event: message\ndata: {data}\n\n"),
+            Self::Message(data, id) => format!("id: {id}\nevent: message\ndata: {data}\n\n"),
             Self::Keepalive => ": keepalive\n\n".to_string(),
         }
     }
@@ -110,6 +116,7 @@ struct Inner {
 
 /// Framework-agnostic HTTP response.
 #[allow(dead_code)]
+#[derive(Debug)]
 pub struct GatewayResponse {
     pub status: u16,
     pub headers: Vec<(String, String)>,
@@ -170,6 +177,8 @@ pub struct SseGateway {
     logger: Arc<Logger>,
     log_level: LogLevel,
     health_endpoints: Arc<Vec<String>>,
+    /// Monotonically incrementing counter for SSE event IDs (D-013).
+    event_counter: Arc<AtomicU64>,
 }
 
 #[allow(dead_code)]
@@ -187,6 +196,7 @@ impl Clone for SseGateway {
             logger: Arc::clone(&self.logger),
             log_level: self.log_level,
             health_endpoints: Arc::clone(&self.health_endpoints),
+            event_counter: Arc::clone(&self.event_counter),
         }
     }
 }
@@ -223,6 +233,7 @@ impl SseGateway {
             logger,
             log_level,
             health_endpoints: Arc::new(health_endpoints),
+            event_counter: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -269,7 +280,7 @@ impl SseGateway {
                         }
 
                         // Broadcast to all clients
-                        Self::broadcast_locked(&mut state, &json, &self.metrics, &self.logger);
+                        Self::broadcast_locked(&mut state, &json, &self.event_counter, &self.metrics, &self.logger);
                     }
                 }
                 Err(e) => {
@@ -305,10 +316,12 @@ impl SseGateway {
     fn broadcast_locked(
         state: &mut Inner,
         json: &str,
+        event_counter: &AtomicU64,
         metrics: &Metrics,
         logger: &Logger,
     ) {
-        let event = SseEvent::Message(json.to_string());
+        let id = event_counter.fetch_add(1, Ordering::Relaxed) + 1;
+        let event = SseEvent::Message(json.to_string(), id);
         let mut to_remove = Vec::new();
 
         for (id, client) in state.clients.iter_mut() {
@@ -359,8 +372,15 @@ impl SseGateway {
     /// 2. Loop on the receiver, writing events via [`SseEvent::serialize`]
     /// 3. Send [`SseEvent::Keepalive`] every [`KEEPALIVE_INTERVAL`]
     /// 4. Call [`disconnect_client`](Self::disconnect_client) on connection close
+    ///
+    /// Returns `Err(GatewayResponse)` with HTTP 503 if the client limit is reached (D-102).
     #[allow(dead_code)]
-    pub fn handle_sse_connect(&self, origin: Option<&str>) -> SseConnection {
+    pub fn handle_sse_connect(&self, origin: Option<&str>) -> Result<SseConnection, GatewayResponse> {
+        // Enforce max concurrent clients (D-102).
+        if self.inner.lock().clients.len() >= MAX_SSE_CLIENTS {
+            return Err(GatewayResponse::new(503, "Too Many Connections"));
+        }
+
         let cors_headers = match self.cors.process("GET", origin, None) {
             CorsResult::Disabled => vec![],
             CorsResult::ResponseHeaders(h) => h,
@@ -388,7 +408,8 @@ impl SseGateway {
 
             if let Some(buffer) = state.early_buffer.take() {
                 for json in buffer {
-                    let _ = tx.try_send(SseEvent::Message(json));
+                    let id = self.event_counter.fetch_add(1, Ordering::Relaxed) + 1;
+                    let _ = tx.try_send(SseEvent::Message(json, id));
                 }
             }
 
@@ -418,11 +439,11 @@ impl SseGateway {
         headers.extend(cors_headers);
         cors::apply_custom_headers(&mut headers, &self.custom_headers);
 
-        SseConnection {
+        Ok(SseConnection {
             session_id,
             headers,
             receiver: rx,
-        }
+        })
     }
 
     /// Remove a disconnected SSE client from the client map.
@@ -715,10 +736,10 @@ mod tests {
 
     #[test]
     fn event_serialize_message() {
-        let e = SseEvent::Message(r#"{"jsonrpc":"2.0","id":1,"result":"ok"}"#.into());
+        let e = SseEvent::Message(r#"{"jsonrpc":"2.0","id":1,"result":"ok"}"#.into(), 42);
         assert_eq!(
             e.serialize(),
-            "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\"ok\"}\n\n"
+            "id: 42\nevent: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\"ok\"}\n\n"
         );
     }
 
@@ -732,7 +753,7 @@ mod tests {
     #[test]
     fn connect_returns_endpoint_event() {
         let gw = make_gateway("cat");
-        let conn = gw.handle_sse_connect(None);
+        let conn = gw.handle_sse_connect(None).unwrap();
 
         // First event should be endpoint
         let first = conn.receiver.try_recv().unwrap();
@@ -765,7 +786,7 @@ mod tests {
             vec![],
         );
 
-        let conn = gw.handle_sse_connect(None);
+        let conn = gw.handle_sse_connect(None).unwrap();
         let first = conn.receiver.try_recv().unwrap();
         match first {
             SseEvent::Endpoint(url) => {
@@ -778,7 +799,7 @@ mod tests {
     #[test]
     fn connect_sse_response_headers() {
         let gw = make_gateway("cat");
-        let conn = gw.handle_sse_connect(None);
+        let conn = gw.handle_sse_connect(None).unwrap();
 
         let find = |name: &str| -> Option<String> {
             conn.headers
@@ -798,7 +819,7 @@ mod tests {
     #[test]
     fn disconnect_removes_client() {
         let gw = make_gateway("cat");
-        let conn = gw.handle_sse_connect(None);
+        let conn = gw.handle_sse_connect(None).unwrap();
         assert_eq!(gw.client_count(), 1);
 
         gw.disconnect_client(&conn.session_id);
@@ -808,7 +829,7 @@ mod tests {
     #[test]
     fn disconnect_idempotent() {
         let gw = make_gateway("cat");
-        let conn = gw.handle_sse_connect(None);
+        let conn = gw.handle_sse_connect(None).unwrap();
 
         gw.disconnect_client(&conn.session_id);
         gw.disconnect_client(&conn.session_id); // no panic
@@ -845,7 +866,7 @@ mod tests {
     #[test]
     fn message_empty_body() {
         let gw = make_gateway("cat");
-        let conn = gw.handle_sse_connect(None);
+        let conn = gw.handle_sse_connect(None).unwrap();
         let resp = gw.handle_message(Some(conn.session_id.as_str()), b"", None);
         assert_eq!(resp.status, 400);
         assert_eq!(resp.body, "Empty body");
@@ -854,7 +875,7 @@ mod tests {
     #[test]
     fn message_too_large() {
         let gw = make_gateway("cat");
-        let conn = gw.handle_sse_connect(None);
+        let conn = gw.handle_sse_connect(None).unwrap();
         let big_body = vec![b'{'; MAX_BODY_SIZE + 1];
         let resp = gw.handle_message(Some(conn.session_id.as_str()), &big_body, None);
         assert_eq!(resp.status, 413);
@@ -863,7 +884,7 @@ mod tests {
     #[test]
     fn message_malformed_json() {
         let gw = make_gateway("cat");
-        let conn = gw.handle_sse_connect(None);
+        let conn = gw.handle_sse_connect(None).unwrap();
         let resp = gw.handle_message(Some(conn.session_id.as_str()), b"not json!", None);
         assert_eq!(resp.status, 400);
     }
@@ -871,7 +892,7 @@ mod tests {
     #[test]
     fn message_invalid_utf8() {
         let gw = make_gateway("cat");
-        let conn = gw.handle_sse_connect(None);
+        let conn = gw.handle_sse_connect(None).unwrap();
         let resp = gw.handle_message(Some(conn.session_id.as_str()), &[0xFF, 0xFE], None);
         assert_eq!(resp.status, 400);
         assert_eq!(resp.body, "Invalid UTF-8");
@@ -880,7 +901,7 @@ mod tests {
     #[test]
     fn message_valid_returns_202() {
         let gw = make_gateway("cat");
-        let conn = gw.handle_sse_connect(None);
+        let conn = gw.handle_sse_connect(None).unwrap();
         let body = br#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
         let resp = gw.handle_message(Some(conn.session_id.as_str()), body, None);
         assert_eq!(resp.status, 202);
@@ -890,7 +911,7 @@ mod tests {
     #[test]
     fn message_batch_valid() {
         let gw = make_gateway("cat");
-        let conn = gw.handle_sse_connect(None);
+        let conn = gw.handle_sse_connect(None).unwrap();
         let body = br#"[{"jsonrpc":"2.0","id":1,"method":"a"},{"jsonrpc":"2.0","method":"b"}]"#;
         let resp = gw.handle_message(Some(conn.session_id.as_str()), body, None);
         assert_eq!(resp.status, 202);
@@ -901,7 +922,7 @@ mod tests {
     #[test]
     fn relay_roundtrip() {
         let (gw, child) = make_gateway_with_child("cat");
-        let conn = gw.handle_sse_connect(None);
+        let conn = gw.handle_sse_connect(None).unwrap();
 
         // Consume endpoint event
         let _ = conn.receiver.try_recv().unwrap();
@@ -921,7 +942,7 @@ mod tests {
             .recv_timeout(Duration::from_secs(2))
             .expect("should receive broadcast");
         match msg {
-            SseEvent::Message(json) => {
+            SseEvent::Message(json, _) => {
                 let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
                 assert_eq!(parsed["method"], "ping");
             }
@@ -949,7 +970,7 @@ mod tests {
         }
 
         // Connect client — should receive buffered messages
-        let conn = gw.handle_sse_connect(None);
+        let conn = gw.handle_sse_connect(None).unwrap();
 
         // First: endpoint event
         let first = conn.receiver.try_recv().unwrap();
@@ -958,12 +979,12 @@ mod tests {
         // Then: buffered messages
         let msg1 = conn.receiver.try_recv().unwrap();
         match msg1 {
-            SseEvent::Message(json) => assert!(json.contains("notif1")),
+            SseEvent::Message(json, _) => assert!(json.contains("notif1")),
             other => panic!("expected Message, got {other:?}"),
         }
         let msg2 = conn.receiver.try_recv().unwrap();
         match msg2 {
-            SseEvent::Message(json) => assert!(json.contains("notif2")),
+            SseEvent::Message(json, _) => assert!(json.contains("notif2")),
             other => panic!("expected Message, got {other:?}"),
         }
 
@@ -977,8 +998,8 @@ mod tests {
     fn broadcast_to_multiple_clients() {
         let (gw, child) = make_gateway_with_child("cat");
 
-        let conn1 = gw.handle_sse_connect(None);
-        let conn2 = gw.handle_sse_connect(None);
+        let conn1 = gw.handle_sse_connect(None).unwrap();
+        let conn2 = gw.handle_sse_connect(None).unwrap();
         assert_eq!(gw.client_count(), 2);
 
         // Consume endpoint events
@@ -1006,7 +1027,7 @@ mod tests {
 
         for msg in [&msg1, &msg2] {
             match msg {
-                SseEvent::Message(json) => {
+                SseEvent::Message(json, _) => {
                     assert!(json.contains("broadcast_test"));
                 }
                 other => panic!("expected Message, got {other:?}"),
@@ -1032,7 +1053,7 @@ mod tests {
         }
         assert!(child.is_dead());
 
-        let conn = gw.handle_sse_connect(None);
+        let conn = gw.handle_sse_connect(None).unwrap();
         let body = br#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
         let resp = gw.handle_message(Some(conn.session_id.as_str()), body, None);
         assert_eq!(resp.status, 502);
@@ -1084,7 +1105,7 @@ mod tests {
             vec![],
         );
 
-        let conn = gw.handle_sse_connect(Some("https://example.com"));
+        let conn = gw.handle_sse_connect(Some("https://example.com")).unwrap();
         let body = br#"{"jsonrpc":"2.0","id":1,"method":"test"}"#;
         let resp = gw.handle_message(
             Some(conn.session_id.as_str()),
@@ -1155,7 +1176,7 @@ mod tests {
         );
 
         // Check on SSE connect
-        let conn = gw.handle_sse_connect(None);
+        let conn = gw.handle_sse_connect(None).unwrap();
         let has_custom = conn
             .headers
             .iter()
@@ -1192,7 +1213,7 @@ mod tests {
             vec![],
         );
 
-        let conn = gw.handle_sse_connect(None);
+        let conn = gw.handle_sse_connect(None).unwrap();
         assert_eq!(metrics.active_clients.load(Ordering::Relaxed), 1);
 
         gw.disconnect_client(&conn.session_id);
@@ -1218,7 +1239,7 @@ mod tests {
             vec![],
         );
 
-        let conn = gw.handle_sse_connect(None);
+        let conn = gw.handle_sse_connect(None).unwrap();
         let body = br#"{"jsonrpc":"2.0","id":1,"method":"test"}"#;
         gw.handle_message(Some(conn.session_id.as_str()), body, None);
         assert_eq!(metrics.total_requests.load(Ordering::Relaxed), 1);
@@ -1236,7 +1257,7 @@ mod tests {
         let mut connections = Vec::new();
 
         for _ in 0..20 {
-            let conn = gw.handle_sse_connect(None);
+            let conn = gw.handle_sse_connect(None).unwrap();
             connections.push(conn);
         }
         assert_eq!(gw.client_count(), 20);
@@ -1246,5 +1267,22 @@ mod tests {
         }
         assert_eq!(gw.client_count(), 0);
         drop(connections);
+    }
+
+    // ─── Max clients ─────────────────────────────────────────────────
+
+    #[test]
+    fn max_clients_returns_503() {
+        let gw = make_gateway("cat");
+        let mut connections = Vec::new();
+        for _ in 0..MAX_SSE_CLIENTS {
+            connections.push(gw.handle_sse_connect(None).unwrap());
+        }
+        assert_eq!(gw.client_count(), MAX_SSE_CLIENTS);
+
+        match gw.handle_sse_connect(None) {
+            Err(resp) => assert_eq!(resp.status, 503),
+            Ok(_) => panic!("expected 503, but connect succeeded"),
+        }
     }
 }
