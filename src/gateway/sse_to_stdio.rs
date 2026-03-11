@@ -381,15 +381,30 @@ pub fn generate_init_id() -> String {
     format!("init_{ts}_{rand}")
 }
 
-/// Generate a random base-36 string of given length using `/dev/urandom`.
+/// Generate a random base-36 string of given length.
+///
+/// Uses `/dev/urandom` when available. On failure, falls back to a
+/// timestamp-seeded pseudo-random sequence and logs a warning to stderr.
 #[allow(dead_code)]
-fn random_base36(len: usize) -> String {
-    #[allow(dead_code)]
+pub(crate) fn random_base36(len: usize) -> String {
     const CHARS: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
     let mut buf = vec![0u8; len];
-    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-        use std::io::Read;
-        let _ = f.read_exact(&mut buf);
+    let ok = std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| {
+            use std::io::Read;
+            f.read_exact(&mut buf)
+        })
+        .is_ok();
+    if !ok {
+        // Fallback: use timestamp bits (not cryptographically random, but avoids panic)
+        eprintln!("supergateway: /dev/urandom unavailable, using timestamp fallback for random ID");
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos();
+        for (i, b) in buf.iter_mut().enumerate() {
+            *b = ((seed.wrapping_add(i as u32).wrapping_mul(0x9e37_79b9)) >> 8) as u8;
+        }
     }
     buf.iter()
         .map(|b| CHARS[(*b as usize) % CHARS.len()] as char)

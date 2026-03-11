@@ -27,7 +27,7 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use serde_json::value::RawValue;
 
@@ -40,6 +40,7 @@ use crate::jsonrpc::{Parsed, RawMessage};
 use crate::observe::{Logger, Metrics};
 
 use super::stateful_http::GatewayRequest;
+use super::sse_to_stdio::{build_fallback_init, build_initialized_notification, generate_init_id};
 
 // ─── Constants ────────────────────────────────────────────────────────
 
@@ -156,83 +157,6 @@ fn response_internal_error() -> GatewayResponse {
 fn format_sse_event(msg: &RawMessage) -> String {
     let json = serde_json::to_string(msg).expect("JSON-RPC message serialization");
     format!("event: message\ndata: {json}\n\n")
-}
-
-// ─── Auto-init helpers ───────────────────────────────────────────────
-
-/// Generate a random base-36 string of length `n` using `/dev/urandom`.
-#[allow(dead_code)]
-fn random_base36(n: usize) -> String {
-    let mut buf = vec![0u8; n];
-    std::fs::File::open("/dev/urandom")
-        .and_then(|mut f| {
-            use std::io::Read;
-            f.read_exact(&mut buf)
-        })
-        .expect("/dev/urandom");
-    buf.iter()
-        .map(|&b| {
-            let idx = (b as usize) % 36;
-            if idx < 10 {
-                (b'0' + idx as u8) as char
-            } else {
-                (b'a' + (idx - 10) as u8) as char
-            }
-        })
-        .collect()
-}
-
-/// Generate a synthetic initialize request ID.
-///
-/// Format: `init_<timestamp_ms>_<random_base36_9chars>`
-#[allow(dead_code)]
-fn generate_init_id() -> String {
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis();
-    let rand = random_base36(9);
-    format!("init_{ts}_{rand}")
-}
-
-/// Build the synthetic initialize request.
-#[allow(dead_code)]
-fn build_synthetic_init(init_id: &str, protocol_version: &str) -> RawMessage {
-    let params = serde_json::json!({
-        "protocolVersion": protocol_version,
-        "capabilities": {
-            "roots": { "listChanged": true },
-            "sampling": {}
-        },
-        "clientInfo": {
-            "name": "supergateway",
-            "version": env!("CARGO_PKG_VERSION")
-        }
-    });
-
-    RawMessage {
-        jsonrpc: "2.0".into(),
-        id: Some(RawValue::from_string(format!("\"{init_id}\"")).unwrap()),
-        method: Some("initialize".into()),
-        params: Some(serde_json::value::to_raw_value(&params).unwrap()),
-        result: None,
-        error: None,
-        ..Default::default()
-    }
-}
-
-/// Build the `notifications/initialized` notification.
-#[allow(dead_code)]
-fn build_initialized_notification() -> RawMessage {
-    RawMessage {
-        jsonrpc: "2.0".into(),
-        id: None,
-        method: Some("notifications/initialized".into()),
-        params: None,
-        result: None,
-        error: None,
-        ..Default::default()
-    }
 }
 
 /// Wait for the initialize response from child, buffering notifications (D-005).
@@ -600,7 +524,7 @@ impl StatelessHttpGateway {
     ) -> Result<GatewayResponse, GatewayError> {
         // 1. Generate and send synthetic initialize request
         let init_id = generate_init_id();
-        let init_msg = build_synthetic_init(&init_id, &self.protocol_version);
+        let init_msg = build_fallback_init(&init_id, &self.protocol_version);
         child.write_message(&init_msg)?;
 
         // 2. Wait for initialize response (buffer notifications, D-005)
@@ -919,7 +843,7 @@ mod tests {
 
     #[test]
     fn synthetic_init_has_correct_shape() {
-        let msg = build_synthetic_init("init_123_abc", "2024-11-05");
+        let msg = build_fallback_init("init_123_abc", "2024-11-05");
         assert!(msg.is_initialize_request());
         assert_eq!(msg.id.as_ref().unwrap().get(), r#""init_123_abc""#);
         let params_str = msg.params.as_ref().unwrap().get();

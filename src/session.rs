@@ -497,33 +497,33 @@ impl<S: Send + Sync + 'static> SessionManager<S> {
     /// If so, complete the close. Returns true if closed.
     #[allow(dead_code)]
     pub fn try_drain_close(&self, id: &SessionId) -> bool {
-        let should_cleanup = {
+        let removed = {
             let mut sessions = self.inner.sessions.write().unwrap();
             match sessions.get(id) {
                 Some(session) if session.state == SessionState::Closing => {
                     if session.access_count.load(Ordering::Acquire) == 0 {
-                        sessions.remove(id);
-                        true
+                        sessions.remove(id)
                     } else {
-                        false
+                        None
                     }
                 }
-                _ => false,
+                _ => None,
             }
         };
 
-        if should_cleanup {
+        if let Some(session) = removed {
             self.inner
                 .metrics
                 .active_sessions
                 .fetch_sub(1, Ordering::Relaxed);
 
             if let Some(ref cleanup) = self.inner.cleanup {
-                cleanup(id);
+                cleanup(id, session.inner);
             }
+            return true;
         }
 
-        should_cleanup
+        false
     }
 
     // ─── Clear all ──────────────────────────────────────────────────
@@ -531,11 +531,13 @@ impl<S: Send + Sync + 'static> SessionManager<S> {
     /// Remove all sessions (e.g., on shutdown). Calls cleanup for each.
     #[allow(dead_code)]
     pub fn clear(&self) {
-        let removed: Vec<SessionId> = {
+        let removed: Vec<(SessionId, Arc<S>)> = {
             let mut sessions = self.inner.sessions.write().unwrap();
-            let ids: Vec<SessionId> = sessions.keys().cloned().collect();
-            sessions.clear();
-            ids
+            let entries: Vec<(SessionId, Arc<S>)> = sessions
+                .drain()
+                .map(|(id, session)| (id, session.inner))
+                .collect();
+            entries
         };
 
         let count = removed.len() as u64;
@@ -546,8 +548,8 @@ impl<S: Send + Sync + 'static> SessionManager<S> {
                 .fetch_sub(count, Ordering::Relaxed);
 
             if let Some(ref cleanup) = self.inner.cleanup {
-                for id in &removed {
-                    cleanup(id);
+                for (id, data) in &removed {
+                    cleanup(id, Arc::clone(data));
                 }
             }
         }
