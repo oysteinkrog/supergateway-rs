@@ -29,11 +29,6 @@ This document catalogs all intentional behavioral differences between `supergate
 **TS behavior:** In stateless mode, `pendingOriginalMessage` is a single variable. If a batch request arrives during auto-init, it overwrites the previous pending message, losing it.
 **Rust behavior:** Uses a `Vec<RawMessage>` to buffer all pending messages during auto-init.
 
-### D-006: Log direction labels reversed in client modes
-**TS behavior:** Uses `'SSE → Stdio:'` label for messages going FROM stdio TO the remote server (direction reversed).
-**Rust behavior:** Correct direction labels in all log messages.
-**⚠ VERIFY:** GPT-5.4 review (QA pass 7) could not confirm this bug in current TS source. Labels appear correct in latest code. May have been fixed in a recent TS commit. Re-verify against the pinned reference commit before implementing. If not reproducible, remove this divergence.
-
 ### D-007: WebSocket `onclose` callback never fired
 **TS behavior:** `WebSocketServerTransport.close()` clears the clients map and closes the WSS, but never calls `this.onclose?.()`. Also doesn't fire `ondisconnection` for each remaining client.
 **Rust behavior:** Properly fires close callbacks and per-client disconnection events on transport shutdown.
@@ -70,7 +65,7 @@ This document catalogs all intentional behavioral differences between `supergate
 
 ### D-103: Health readiness gating
 **TS behavior:** Some modes return "ok" from health endpoint immediately, before the child process has started or transport is ready.
-**Rust behavior:** Returns 503 until child is started AND transport is accepting connections.
+**Rust behavior:** Returns `503 Service Unavailable` (not 500) until child is started AND transport is accepting connections. Once ready, returns `200 OK` with body `"ok"`.
 
 ### D-104: Health detail endpoint
 **TS behavior:** Health endpoint only returns "ok" string.
@@ -118,7 +113,14 @@ This document catalogs all intentional behavioral differences between `supergate
 - Streamable HTTP modes: applied ONLY to health endpoint (NOT to MCP POST/GET/DELETE responses)
 - WS mode: not applied at all (see D-105)
 - Client modes: applied as outgoing request headers
-**Rust behavior:** TBD — either match TS per-mode scoping exactly, or apply uniformly and document as improvement.
+**Rust behavior:** Per-mode scoping (matches TS where TS is intentional, fixes D-105 for WS):
+| Mode | Applied to |
+|------|-----------|
+| SSE server | SSE stream, POST 202, health, OPTIONS preflight |
+| Stateful HTTP | health endpoint only (matches TS) |
+| Stateless HTTP | health endpoint only (matches TS) |
+| WebSocket server | health, OPTIONS, WS upgrade response (D-105 fix) |
+| Client modes | outgoing request headers |
 
 ## Behavioral Notes (Same Behavior, Different Implementation)
 
