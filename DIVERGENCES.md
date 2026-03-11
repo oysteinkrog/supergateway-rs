@@ -78,7 +78,7 @@ This document catalogs all intentional behavioral differences between `supergate
 
 ### D-105: `--header` works in WebSocket mode
 **TS behavior:** `--header` CLI flag is not passed to the WebSocket gateway function (only SSE and HTTP modes receive it).
-**Rust behavior:** `--header` applies to all server modes including WebSocket.
+**Rust behavior:** `--header` applies to all server modes including WebSocket. Custom headers are injected into health endpoint responses, CORS preflight responses, and the WebSocket upgrade handshake response.
 
 ### D-106: Max partial line buffer enforcement
 **TS behavior:** No limit on stdio line buffer. Malicious or broken child could exhaust gateway memory.

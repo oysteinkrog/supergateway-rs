@@ -36,7 +36,7 @@
 //! - D-008: Broadcast notifications logged at debug level
 //! - D-010: Child stderr at error level
 //! - D-012: Stdin writes mutex-protected via ChildBridge
-//! - D-105: Custom headers NOT applied in WS mode
+//! - D-105: Custom headers applied in WS mode (improvement over TS)
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -47,8 +47,8 @@ use std::time::{Duration, Instant};
 use serde_json::value::RawValue;
 
 use crate::child::ChildBridge;
-use crate::cli::LogLevel;
-use crate::cors::{CorsHandler, CorsResult};
+use crate::cli::{Header, LogLevel};
+use crate::cors::{self, CorsHandler, CorsResult};
 use crate::health;
 use crate::jsonrpc::{Parsed, RawMessage};
 use crate::observe::{Logger, Metrics};
@@ -208,6 +208,7 @@ pub struct WsGateway {
     inner: Arc<Mutex<Inner>>,
     mux: Arc<IdMultiplexer>,
     cors: Arc<CorsHandler>,
+    custom_headers: Arc<Vec<Header>>,
     metrics: Arc<Metrics>,
     logger: Arc<Logger>,
     log_level: LogLevel,
@@ -221,6 +222,7 @@ impl Clone for WsGateway {
             inner: Arc::clone(&self.inner),
             mux: Arc::clone(&self.mux),
             cors: Arc::clone(&self.cors),
+            custom_headers: Arc::clone(&self.custom_headers),
             metrics: Arc::clone(&self.metrics),
             logger: Arc::clone(&self.logger),
             log_level: self.log_level,
@@ -235,10 +237,11 @@ impl WsGateway {
     /// The child must already be spawned. Call [`run_relay`](Self::run_relay)
     /// or [`spawn_relay`](Self::spawn_relay) to start the routing loop.
     ///
-    /// Note: custom headers are NOT accepted (D-105: custom headers not applied in WS mode).
+    /// D-105: `--header` applies to all server modes including WebSocket.
     pub fn new(
         child: Arc<ChildBridge>,
         cors: CorsHandler,
+        custom_headers: Vec<Header>,
         metrics: Arc<Metrics>,
         logger: Arc<Logger>,
         log_level: LogLevel,
@@ -252,6 +255,7 @@ impl WsGateway {
             })),
             mux: Arc::new(IdMultiplexer::new()),
             cors: Arc::new(cors),
+            custom_headers: Arc::new(custom_headers),
             metrics,
             logger,
             log_level,
@@ -662,10 +666,10 @@ impl WsGateway {
             CorsResult::Preflight(_) => vec![],
         };
 
-        // D-105: custom headers NOT applied in WS mode
-        let resp = GatewayResponse::new(health_resp.status_code(), health_resp.body())
+        let mut resp = GatewayResponse::new(health_resp.status_code(), health_resp.body())
             .with_header("Content-Type", health_resp.content_type())
             .with_headers(cors_headers);
+        cors::apply_custom_headers(&mut resp.headers, &self.custom_headers);
         Some(resp)
     }
 
@@ -675,7 +679,9 @@ impl WsGateway {
     pub fn handle_options(&self, origin: Option<&str>) -> Option<GatewayResponse> {
         match self.cors.process("OPTIONS", origin) {
             CorsResult::Preflight(headers) => {
-                Some(GatewayResponse::new(204, "").with_headers(headers))
+                let mut resp = GatewayResponse::new(204, "").with_headers(headers);
+                cors::apply_custom_headers(&mut resp.headers, &self.custom_headers);
+                Some(resp)
             }
             _ => None,
         }
@@ -692,12 +698,20 @@ impl WsGateway {
     pub fn is_child_dead(&self) -> bool {
         self.child.is_dead()
     }
+
+    /// Custom headers to apply to the WebSocket upgrade (101) response.
+    ///
+    /// The caller building the HTTP 101 handshake response should call
+    /// [`cors::apply_custom_headers`] with these headers.
+    pub fn custom_headers(&self) -> &[Header] {
+        &self.custom_headers
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::{CorsConfig, LogLevel, OutputTransport};
+    use crate::cli::{CorsConfig, Header, LogLevel, OutputTransport};
     use std::sync::atomic::Ordering;
 
     fn test_metrics() -> Arc<Metrics> {
@@ -716,6 +730,7 @@ mod tests {
         let gw = WsGateway::new(
             Arc::clone(&child),
             CorsHandler::new(CorsConfig::Disabled, false),
+            vec![],
             metrics,
             logger,
             LogLevel::Debug,
@@ -1081,17 +1096,32 @@ mod tests {
         assert!(gw.handle_health("/not-health", false, None).is_none());
     }
 
-    // ─── D-105: Custom headers NOT applied ────────────────────────
+    // ─── D-105: Custom headers applied in WS mode ─────────────────
 
     #[test]
-    fn no_custom_headers_in_ws_mode() {
-        // WsGateway doesn't accept custom_headers parameter at all (D-105)
-        // This test verifies the health endpoint doesn't apply custom headers.
-        let gw = make_gateway("cat");
+    fn custom_headers_applied_in_ws_mode() {
+        // D-105: --header applies to all server modes including WebSocket.
+        let metrics = test_metrics();
+        let logger = test_logger();
+        let child =
+            Arc::new(ChildBridge::spawn("cat", metrics.clone(), logger.clone()).unwrap());
+        let gw = WsGateway::new(
+            Arc::clone(&child),
+            CorsHandler::new(CorsConfig::Disabled, false),
+            vec![
+                Header { name: "X-Custom".into(), value: "hello".into() },
+                Header { name: "X-Other".into(), value: "world".into() },
+            ],
+            metrics,
+            logger,
+            LogLevel::Debug,
+            vec!["/health".to_string()],
+        );
+
         gw.metrics.set_ready();
         let resp = gw.handle_health("/health", false, None).unwrap();
-        // No custom headers present
-        assert!(!resp.headers.iter().any(|(n, _)| n == "X-Custom"));
+        assert!(resp.headers.iter().any(|(n, v)| n == "X-Custom" && v == "hello"));
+        assert!(resp.headers.iter().any(|(n, v)| n == "X-Other" && v == "world"));
     }
 
     // ─── Metrics ──────────────────────────────────────────────────
@@ -1105,6 +1135,7 @@ mod tests {
         let gw = WsGateway::new(
             child,
             CorsHandler::new(CorsConfig::Disabled, false),
+            vec![],
             metrics.clone(),
             logger,
             LogLevel::Debug,
