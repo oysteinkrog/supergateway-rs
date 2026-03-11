@@ -219,6 +219,21 @@ impl ChildBridge {
         }
     }
 
+    /// Receive the next message from child stdout, blocking up to `timeout`.
+    ///
+    /// Returns `Err(Timeout)` if no message arrives within `timeout`.
+    /// Returns `Err(StdoutClosed)` on EOF.
+    #[allow(dead_code)]
+    pub fn recv_message_timeout(&self, timeout: Duration) -> Result<Parsed, ChildError> {
+        let rx = self.stdout_rx.lock().unwrap();
+        match rx.recv_timeout(timeout) {
+            Ok(Ok(parsed)) => Ok(parsed),
+            Ok(Err(codec_err)) => Err(ChildError::Codec(codec_err)),
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(ChildError::Timeout),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(ChildError::StdoutClosed),
+        }
+    }
+
     /// Write a message to child stdin.
     ///
     /// Thread-safe: the internal Mutex serializes concurrent writes.

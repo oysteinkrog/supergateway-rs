@@ -59,9 +59,6 @@ const AUTO_INIT_TIMEOUT: Duration = Duration::from_secs(5);
 #[allow(dead_code)]
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Polling interval when waiting for child stdout messages.
-#[allow(dead_code)]
-const POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 // ─── Response helpers ────────────────────────────────────────────────
 
@@ -253,12 +250,13 @@ fn wait_for_init_response(
     let deadline = Instant::now() + timeout;
 
     loop {
-        if Instant::now() >= deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
             return Err(GatewayError::AutoInitTimeout);
         }
 
-        match child.try_recv_message() {
-            Ok(Some(parsed)) => {
+        match child.recv_message_timeout(remaining) {
+            Ok(parsed) => {
                 let msgs = match parsed {
                     Parsed::Single(m) => vec![m],
                     Parsed::Batch(ms) => ms,
@@ -278,12 +276,8 @@ fn wait_for_init_response(
                     buffered.push(msg);
                 }
             }
-            Ok(None) => {
-                if child.is_dead() {
-                    return Err(GatewayError::ChildDead);
-                }
-                std::thread::sleep(POLL_INTERVAL);
-            }
+            Err(crate::child::ChildError::Timeout) => return Err(GatewayError::AutoInitTimeout),
+            Err(crate::child::ChildError::StdoutClosed) => return Err(GatewayError::ChildDead),
             Err(e) => return Err(GatewayError::Child(e)),
         }
     }
@@ -304,12 +298,13 @@ fn collect_responses(
     let mut response_count = 0;
 
     while response_count < expected {
-        if Instant::now() >= deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
             break;
         }
 
-        match child.try_recv_message() {
-            Ok(Some(parsed)) => {
+        match child.recv_message_timeout(remaining) {
+            Ok(parsed) => {
                 let msgs = match parsed {
                     Parsed::Single(m) => vec![m],
                     Parsed::Batch(ms) => ms,
@@ -320,12 +315,6 @@ fn collect_responses(
                     }
                     collected.push(msg);
                 }
-            }
-            Ok(None) => {
-                if child.is_dead() {
-                    break;
-                }
-                std::thread::sleep(POLL_INTERVAL);
             }
             Err(_) => break,
         }
