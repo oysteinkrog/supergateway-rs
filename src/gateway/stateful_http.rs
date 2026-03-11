@@ -105,10 +105,6 @@ pub struct SessionData {
     metrics: Arc<Metrics>,
 }
 
-// SAFETY: All fields are either Send+Sync or protected by Mutex/RwLock.
-unsafe impl Send for SessionData {}
-unsafe impl Sync for SessionData {}
-
 #[allow(dead_code)]
 impl SessionData {
     /// Create session data with a spawned child.
