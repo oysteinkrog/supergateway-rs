@@ -37,14 +37,13 @@ pub const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 // ─── Global state (set by signal handler, read by main thread) ──────────
 
-/// Set to true on first SIGINT/SIGTERM/SIGHUP or stdin EOF.
-static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+/// Combined shutdown signal: 0 = not requested, positive = signal number,
+/// -1 = programmatic shutdown (stdin EOF). Using a single atomic eliminates
+/// the TOCTOU window between SHUTDOWN_REQUESTED and SIGNAL_NUM.
+static SHUTDOWN_SIGNAL: AtomicI32 = AtomicI32::new(0);
 
 /// Set to true on second signal — skip drain, exit immediately.
 static FORCE_EXIT: AtomicBool = AtomicBool::new(false);
-
-/// Last signal number received (0 = programmatic shutdown / stdin EOF).
-static SIGNAL_NUM: AtomicI32 = AtomicI32::new(0);
 
 /// Self-pipe read fd. Initialized once by [`install()`].
 static SIGNAL_PIPE_READ: AtomicI32 = AtomicI32::new(-1);
@@ -55,14 +54,17 @@ static SIGNAL_PIPE_WRITE: AtomicI32 = AtomicI32::new(-1);
 
 // ─── Signal handlers (async-signal-safe) ────────────────────────────────
 
-/// Shutdown signal handler. First call sets SHUTDOWN_REQUESTED,
-/// second call sets FORCE_EXIT. Wakes the self-pipe.
+/// Shutdown signal handler. First call CAS 0 → sig; second call sets FORCE_EXIT.
+/// Single atomic eliminates TOCTOU between flag and signal number.
+/// Wakes the self-pipe.
 extern "C" fn shutdown_handler(sig: libc::c_int) {
-    let was_set = SHUTDOWN_REQUESTED.swap(true, Ordering::SeqCst);
-    if was_set {
+    // Single CAS: 0 → sig succeeds on first signal; fails on second → FORCE_EXIT.
+    if SHUTDOWN_SIGNAL
+        .compare_exchange(0, sig, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
         FORCE_EXIT.store(true, Ordering::SeqCst);
     }
-    SIGNAL_NUM.store(sig, Ordering::SeqCst);
     // Wake any thread blocked on the pipe (async-signal-safe write)
     let fd = SIGNAL_PIPE_WRITE.load(Ordering::Relaxed);
     if fd >= 0 {
@@ -104,15 +106,18 @@ impl ShutdownSignal {
     /// or 0 for programmatic shutdown (e.g., stdin EOF).
     #[allow(dead_code)]
     pub fn wait(&self) -> i32 {
-        if is_shutdown_requested() {
-            return SIGNAL_NUM.load(Ordering::SeqCst);
+        // -1 is the sentinel for programmatic shutdown; convert back to 0 for callers.
+        let decode = |v: i32| if v == -1 { 0 } else { v };
+        let sig = SHUTDOWN_SIGNAL.load(Ordering::SeqCst);
+        if sig != 0 {
+            return decode(sig);
         }
         let mut buf = [0u8; 1];
         // Blocking read — wakes when signal handler or request_shutdown() writes
         unsafe {
             libc::read(self.pipe_read, buf.as_mut_ptr().cast(), 1);
         }
-        SIGNAL_NUM.load(Ordering::SeqCst)
+        decode(SHUTDOWN_SIGNAL.load(Ordering::SeqCst))
     }
 }
 
@@ -175,7 +180,7 @@ pub fn install(logger: &Logger) -> io::Result<ShutdownSignal> {
 /// Check if shutdown has been requested (non-blocking).
 #[allow(dead_code)]
 pub fn is_shutdown_requested() -> bool {
-    SHUTDOWN_REQUESTED.load(Ordering::SeqCst)
+    SHUTDOWN_SIGNAL.load(Ordering::SeqCst) != 0
 }
 
 /// Check if force exit was requested (second signal received).
@@ -190,11 +195,13 @@ pub fn is_force_exit() -> bool {
 /// Wakes any thread blocked in [`ShutdownSignal::wait()`].
 #[allow(dead_code)]
 pub fn request_shutdown() {
-    let was_set = SHUTDOWN_REQUESTED.swap(true, Ordering::SeqCst);
-    if was_set {
+    // -1 = programmatic shutdown; wait() converts back to 0 for callers.
+    if SHUTDOWN_SIGNAL
+        .compare_exchange(0, -1, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
         FORCE_EXIT.store(true, Ordering::SeqCst);
     }
-    // SIGNAL_NUM stays 0 for programmatic shutdown
     let fd = SIGNAL_PIPE_WRITE.load(Ordering::Relaxed);
     if fd >= 0 {
         unsafe { libc::write(fd, [1u8].as_ptr().cast(), 1) };
@@ -256,9 +263,8 @@ pub fn signal_name(sig: i32) -> &'static str {
 
 #[cfg(test)]
 fn reset_for_testing() {
-    SHUTDOWN_REQUESTED.store(false, Ordering::SeqCst);
+    SHUTDOWN_SIGNAL.store(0, Ordering::SeqCst);
     FORCE_EXIT.store(false, Ordering::SeqCst);
-    SIGNAL_NUM.store(0, Ordering::SeqCst);
 }
 
 #[cfg(test)]
