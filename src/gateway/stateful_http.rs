@@ -822,25 +822,46 @@ impl StatefulHttpGateway {
             return GatewayResponse::accepted();
         }
 
-        // Register response channels for each request id
-        let (collectors, rx_list) = self.register_response_channels(session_id, &request_ids);
+        // Register a single shared response channel for all pending request IDs.
+        // The relay thread routes responses by ID through SessionData::route_response,
+        // which sends to the matching sender. All senders point to the same channel,
+        // so responses arrive in whatever order the child emits them.
+        let (tx, rx) = mpsc::sync_channel::<RawMessage>(RESPONSE_CHANNEL_CAP);
 
-        // Wait for all responses
-        let mut sse_body = String::new();
-        let mut responses_collected = 0;
-        let expected = rx_list.len();
+        self.with_session(session_id, |data| {
+            for id_str in &request_ids {
+                data.register_pending(id_str, tx.clone());
+            }
+        });
+        // Drop our copy so the channel disconnects when all relay senders are done
+        drop(tx);
 
-        for rx in rx_list {
-            match rx.recv_timeout(RESPONSE_TIMEOUT) {
+        // Collect responses by ID, allowing out-of-order arrival
+        let mut pending: std::collections::HashSet<String> =
+            request_ids.iter().cloned().collect();
+        let mut responses: HashMap<String, RawMessage> = HashMap::new();
+
+        let deadline = std::time::Instant::now() + RESPONSE_TIMEOUT;
+        while !pending.is_empty() {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                self.logger.error(&format!(
+                    "session {session_id}: response timeout after {RESPONSE_TIMEOUT:?}"
+                ));
+                break;
+            }
+            match rx.recv_timeout(remaining) {
                 Ok(msg) => {
-                    sse_body.push_str(&format_sse_event(&msg));
-                    responses_collected += 1;
+                    if let Some(ref id) = msg.id {
+                        let id_str = id.get().to_string();
+                        pending.remove(&id_str);
+                        responses.insert(id_str, msg);
+                    }
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     self.logger.error(&format!(
                         "session {session_id}: response timeout after {RESPONSE_TIMEOUT:?}"
                     ));
-                    // Return what we have + error for remaining
                     break;
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -850,9 +871,12 @@ impl StatefulHttpGateway {
             }
         }
 
-        // Generate error responses for any missing
-        if responses_collected < expected {
-            for id_str in &request_ids[responses_collected..] {
+        // Emit responses in original request order, error for any missing
+        let mut sse_body = String::new();
+        for id_str in &request_ids {
+            if let Some(msg) = responses.remove(id_str) {
+                sse_body.push_str(&format_sse_event(&msg));
+            } else {
                 let id_raw = serde_json::value::RawValue::from_string(id_str.clone())
                     .unwrap_or_else(|_| {
                         serde_json::value::RawValue::from_string("null".into()).unwrap()
@@ -867,29 +891,6 @@ impl StatefulHttpGateway {
         }
 
         GatewayResponse::sse(200, &sse_body)
-    }
-
-    /// Register response channels for pending request ids.
-    /// Returns the list of senders (for cleanup) and receivers (for collecting responses).
-    #[allow(dead_code)]
-    fn register_response_channels(
-        &self,
-        session_id: &SessionId,
-        request_ids: &[String],
-    ) -> (Vec<SyncSender<RawMessage>>, Vec<Receiver<RawMessage>>) {
-        let mut senders = Vec::with_capacity(request_ids.len());
-        let mut receivers = Vec::with_capacity(request_ids.len());
-
-        self.with_session(session_id, |data| {
-            for id_str in request_ids {
-                let (tx, rx) = mpsc::sync_channel(RESPONSE_CHANNEL_CAP);
-                data.register_pending(id_str, tx.clone());
-                senders.push(tx);
-                receivers.push(rx);
-            }
-        });
-
-        (senders, receivers)
     }
 
     // ─── GET handler (SSE stream) ──────────────────────────────────
