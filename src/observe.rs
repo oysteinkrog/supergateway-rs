@@ -1,5 +1,3 @@
-// Public API consumed by downstream gateway beads — suppress dead_code until wired up.
-#![allow(dead_code)]
 
 use crate::cli::{LogLevel, OutputTransport};
 use std::io::Write;
@@ -7,6 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// Observability counters shared across all gateway tasks.
+#[allow(dead_code)]
 pub struct Metrics {
     pub active_sessions: AtomicU64,
     pub active_children: AtomicU64,
@@ -24,7 +23,9 @@ pub struct Metrics {
     pub ready: AtomicBool,
 }
 
+#[allow(dead_code)]
 impl Metrics {
+    #[allow(dead_code)]
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             active_sessions: AtomicU64::new(0),
@@ -44,27 +45,32 @@ impl Metrics {
     }
 
     /// Mark the gateway as ready (child started + transport bound + relay active).
+    #[allow(dead_code)]
     pub fn set_ready(&self) {
         self.ready.store(true, Ordering::Release);
     }
 
     /// Check if the gateway is ready.
+    #[allow(dead_code)]
     pub fn is_ready(&self) -> bool {
         self.ready.load(Ordering::Acquire)
     }
 
     /// Increment a monotonic counter.
+    #[allow(dead_code)]
     pub fn inc(counter: &AtomicU64) {
         counter.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Increment a gauge counter and log the change at info level.
+    #[allow(dead_code)]
     pub fn inc_and_log(counter: &AtomicU64, name: &str, logger: &Logger) {
         let new = counter.fetch_add(1, Ordering::Relaxed) + 1;
         logger.info(&format!("{name}={new} (+1)"));
     }
 
     /// Decrement a gauge counter and log the change at info level.
+    #[allow(dead_code)]
     pub fn dec_and_log(counter: &AtomicU64, name: &str, logger: &Logger) {
         let prev = counter.fetch_sub(1, Ordering::Relaxed);
         let new = prev.saturating_sub(1);
@@ -72,11 +78,13 @@ impl Metrics {
     }
 
     /// Update max queue depth if new value is higher.
+    #[allow(dead_code)]
     pub fn update_max(counter: &AtomicU64, value: u64) {
         counter.fetch_max(value, Ordering::Relaxed);
     }
 
     /// Snapshot all counters as JSON.
+    #[allow(dead_code)]
     pub fn snapshot_json(&self) -> String {
         format!(
             concat!(
@@ -113,7 +121,9 @@ impl Metrics {
     }
 }
 
+#[allow(dead_code)]
 impl Default for Metrics {
+    #[allow(dead_code)]
     fn default() -> Self {
         // Use new() through Arc; this is for testing convenience.
         Self {
@@ -139,6 +149,7 @@ impl Default for Metrics {
 /// When outputTransport is `stdio`, ALL log output goes to stderr
 /// (stdout is the JSON-RPC transport). Otherwise, info goes to stdout
 /// and error goes to stderr.
+#[allow(dead_code)]
 pub struct Logger {
     level: LogLevel,
     /// When true, all output goes to stderr.
@@ -150,6 +161,7 @@ pub struct Logger {
 
 impl Logger {
     /// Create a logger for the given output transport and log level.
+    #[allow(dead_code)]
     pub fn new(output_transport: OutputTransport, level: LogLevel) -> Self {
         Self {
             level,
@@ -178,15 +190,18 @@ impl Logger {
         }
     }
 
+    #[allow(dead_code)]
     pub fn level(&self) -> LogLevel {
         self.level
     }
 
+    #[allow(dead_code)]
     pub fn is_debug(&self) -> bool {
         self.level == LogLevel::Debug
     }
 
     /// Log at info level. Suppressed when level is None.
+    #[allow(dead_code)]
     pub fn info(&self, msg: &str) {
         if self.level == LogLevel::None {
             return;
@@ -195,6 +210,7 @@ impl Logger {
     }
 
     /// Log at debug level. Only emitted when level is Debug.
+    #[allow(dead_code)]
     pub fn debug(&self, msg: &str) {
         if self.level != LogLevel::Debug {
             return;
@@ -203,6 +219,7 @@ impl Logger {
     }
 
     /// Log at error level. Suppressed when level is None.
+    #[allow(dead_code)]
     pub fn error(&self, msg: &str) {
         if self.level == LogLevel::None {
             return;
@@ -211,12 +228,14 @@ impl Logger {
     }
 
     /// Log the startup banner.
+    #[allow(dead_code)]
     pub fn startup(&self, version: &str, input_desc: &str, output_desc: &str, port: u16) {
         self.info(&format!(
             "supergateway v{version} | {input_desc} → {output_desc} | port {port}"
         ));
     }
 
+    #[allow(dead_code)]
     fn write_info(&self, line: &str) {
         #[cfg(test)]
         if let Some(buf) = &self.buffer {
@@ -232,6 +251,7 @@ impl Logger {
         }
     }
 
+    #[allow(dead_code)]
     fn write_err(&self, line: &str) {
         #[cfg(test)]
         if let Some(buf) = &self.buffer {

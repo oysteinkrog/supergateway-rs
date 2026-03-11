@@ -1,5 +1,3 @@
-// Public API — suppress dead_code until wired up in main.rs.
-#![allow(dead_code)]
 
 //! Streamable HTTP → stdio client gateway.
 //!
@@ -46,6 +44,7 @@ pub use crate::gateway::sse_to_stdio::{
 
 /// Tracks the MCP initialization handshake state.
 #[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
 enum InitPhase {
     /// No messages exchanged yet.
     Pending,
@@ -61,6 +60,7 @@ enum InitPhase {
 
 /// Action returned by [`HttpToStdioGateway::handle_stdin_message`].
 #[derive(Debug)]
+#[allow(dead_code)]
 pub enum StdinAction {
     /// POST these messages to the server. Pass each response to
     /// [`handle_response_messages`](HttpToStdioGateway::handle_response_messages).
@@ -76,6 +76,7 @@ pub enum StdinAction {
 // ─── Response Result ──────────────────────────────────────────────
 
 /// Result of processing a POST response.
+#[allow(dead_code)]
 pub struct ResponseResult {
     /// Messages to write to stdout.
     pub stdout: Vec<RawMessage>,
@@ -87,6 +88,7 @@ pub struct ResponseResult {
 
 /// Response type determined from Content-Type header.
 #[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
 pub enum ResponseType {
     /// `application/json` — single JSON response body.
     Json,
@@ -97,6 +99,7 @@ pub enum ResponseType {
 }
 
 /// Classify a Content-Type header value.
+#[allow(dead_code)]
 pub fn classify_content_type(content_type: Option<&str>) -> ResponseType {
     match content_type {
         Some(ct) if ct.contains("application/json") => ResponseType::Json,
@@ -113,6 +116,7 @@ pub fn classify_content_type(content_type: Option<&str>) -> ResponseType {
 /// Manages the MCP initialization handshake and message routing for
 /// Streamable HTTP client mode. The caller is responsible for HTTP
 /// transport (use [`HttpClient`](crate::client::http::HttpClient)).
+#[allow(dead_code)]
 pub struct HttpToStdioGateway {
     /// Remote Streamable HTTP URL for POST.
     url: String,
@@ -130,8 +134,10 @@ pub struct HttpToStdioGateway {
     init_pending: Mutex<Vec<RawMessage>>,
 }
 
+#[allow(dead_code)]
 impl HttpToStdioGateway {
     /// Create a new Streamable HTTP → stdio gateway.
+    #[allow(dead_code)]
     pub fn new(
         url: String,
         protocol_version: String,
@@ -151,11 +157,13 @@ impl HttpToStdioGateway {
     }
 
     /// The remote server URL.
+    #[allow(dead_code)]
     pub fn url(&self) -> &str {
         &self.url
     }
 
     /// Whether initialization is complete.
+    #[allow(dead_code)]
     pub fn is_initialized(&self) -> bool {
         *self.init_phase.lock().unwrap() == InitPhase::Ready
     }
@@ -168,6 +176,7 @@ impl HttpToStdioGateway {
     /// - `Post`: POST these messages to the server
     /// - `PostInit`: POST synthetic init, then handle response
     /// - `Buffered`: message queued during init wait
+    #[allow(dead_code)]
     pub fn handle_stdin_message(&self, msg: RawMessage) -> StdinAction {
         let mut phase = self.init_phase.lock().unwrap();
 
@@ -210,6 +219,7 @@ impl HttpToStdioGateway {
     /// whether from a JSON response or parsed from SSE events.
     ///
     /// Returns messages for stdout and follow-up messages to POST.
+    #[allow(dead_code)]
     pub fn handle_response_messages(
         &self,
         messages: Vec<RawMessage>,
@@ -272,6 +282,7 @@ impl HttpToStdioGateway {
     /// Parse a JSON response body into JSON-RPC messages.
     ///
     /// Handles both single messages and batches.
+    #[allow(dead_code)]
     pub fn parse_json_response(&self, body: &[u8]) -> Vec<RawMessage> {
         let text = match std::str::from_utf8(body) {
             Ok(s) => s,
@@ -296,6 +307,7 @@ impl HttpToStdioGateway {
     /// Parse an SSE event's data field into JSON-RPC messages.
     ///
     /// Only processes "message" events. Returns empty for other types.
+    #[allow(dead_code)]
     pub fn parse_sse_event_data(
         &self,
         event_type: &str,
@@ -326,6 +338,7 @@ impl HttpToStdioGateway {
 /// - Connection closed by remote (HTTP 0, empty response, EOF) → `process::exit(1)`
 ///   for pm2/systemd restart semantics
 /// - Transport/network errors → log at error level, return to allow retry
+#[allow(dead_code)]
 pub fn handle_client_error(err: &crate::client::http::HttpClientError, logger: &Logger) {
     use crate::client::http::HttpClientError;
     match err {
@@ -344,6 +357,7 @@ pub fn handle_client_error(err: &crate::client::http::HttpClientError, logger: &
 // ─── Entry point ────────────────────────────────────────────────────────
 
 /// Run the Streamable HTTP → stdio client gateway.
+#[allow(dead_code)]
 pub async fn run(config: crate::cli::Config) -> anyhow::Result<()> {
     let logger = Arc::new(Logger::new(config.output_transport, config.log_level));
     let metrics = Metrics::new();
@@ -387,14 +401,17 @@ mod tests {
     use crate::cli::{LogLevel, OutputTransport};
     use serde_json::value::RawValue;
 
+    #[allow(dead_code)]
     fn test_logger() -> Arc<Logger> {
         Arc::new(Logger::buffered(OutputTransport::Stdio, LogLevel::Debug))
     }
 
+    #[allow(dead_code)]
     fn test_metrics() -> Arc<Metrics> {
         Metrics::new()
     }
 
+    #[allow(dead_code)]
     fn make_gateway() -> HttpToStdioGateway {
         HttpToStdioGateway::new(
             "http://localhost:8080/mcp".into(),
@@ -405,6 +422,7 @@ mod tests {
         )
     }
 
+    #[allow(dead_code)]
     fn raw(s: &str) -> Box<RawValue> {
         RawValue::from_string(s.into()).unwrap()
     }

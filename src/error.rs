@@ -1,5 +1,3 @@
-// Public API consumed by downstream gateway beads — suppress dead_code until wired up.
-#![allow(dead_code)]
 
 //! Gateway error types with HTTP response mapping.
 //!
@@ -14,10 +12,13 @@ use crate::session::SessionError;
 /// Standard JSON-RPC 2.0 error codes used by the gateway.
 pub mod codes {
     /// Invalid JSON-RPC request structure.
+    #[allow(dead_code)]
     pub const INVALID_REQUEST: i32 = -32600;
     /// Server error: session closing, method not allowed.
+    #[allow(dead_code)]
     pub const SERVER_ERROR: i32 = -32000;
     /// Internal error: child dead, auto-init timeout, I/O error.
+    #[allow(dead_code)]
     pub const INTERNAL_ERROR: i32 = -32603;
 }
 
@@ -30,6 +31,7 @@ pub mod codes {
 /// Exception: [`MethodNotAllowed`](GatewayError::MethodNotAllowed) returns 405
 /// with a JSON-RPC body per the Streamable HTTP spec.
 #[derive(Debug, thiserror::Error)]
+#[allow(dead_code)]
 pub enum GatewayError {
     // ─── Transport-level errors (plain text response body) ──────────
 
@@ -109,7 +111,9 @@ pub enum GatewayError {
 }
 
 /// Maps [`SessionError`] variants to specific [`GatewayError`] variants.
+#[allow(dead_code)]
 impl From<SessionError> for GatewayError {
+    #[allow(dead_code)]
     fn from(err: SessionError) -> Self {
         match err {
             SessionError::NotFound => GatewayError::SessionNotFound,
@@ -123,8 +127,10 @@ impl From<SessionError> for GatewayError {
 
 // ─── HTTP response mapping ──────────────────────────────────────────────
 
+#[allow(dead_code)]
 impl GatewayError {
     /// HTTP status code for this error.
+    #[allow(dead_code)]
     pub fn status_code(&self) -> u16 {
         match self {
             Self::BadRequest(_) => 400,
@@ -143,6 +149,7 @@ impl GatewayError {
     }
 
     /// JSON-RPC error code, or `None` for transport-level errors (plain text).
+    #[allow(dead_code)]
     pub fn json_rpc_code(&self) -> Option<i32> {
         match self {
             Self::InvalidRequest(_) => Some(codes::INVALID_REQUEST),
@@ -157,6 +164,7 @@ impl GatewayError {
     }
 
     /// Content-Type header for the HTTP response.
+    #[allow(dead_code)]
     pub fn content_type(&self) -> &'static str {
         if self.json_rpc_code().is_some() {
             "application/json"
@@ -169,6 +177,7 @@ impl GatewayError {
     ///
     /// For errors with a JSON-RPC code: a JSON-RPC 2.0 error response with `id: null`.
     /// For transport-level errors: the plain text error message.
+    #[allow(dead_code)]
     pub fn body(&self) -> String {
         if let Some(code) = self.json_rpc_code() {
             let msg = RawMessage::error_response(None, code, &self.json_rpc_message());
@@ -179,6 +188,7 @@ impl GatewayError {
     }
 
     /// Message text for the JSON-RPC error object.
+    #[allow(dead_code)]
     fn json_rpc_message(&self) -> String {
         match self {
             Self::InvalidRequest(msg) => format!("Invalid request: {msg}"),
@@ -196,59 +206,74 @@ impl GatewayError {
 
 // ─── Helper constructors ────────────────────────────────────────────────
 
+#[allow(dead_code)]
 impl GatewayError {
+    #[allow(dead_code)]
     pub fn bad_request(detail: &str) -> Self {
         Self::BadRequest(detail.into())
     }
 
+    #[allow(dead_code)]
     pub fn invalid_request(msg: &str) -> Self {
         Self::InvalidRequest(msg.into())
     }
 
+    #[allow(dead_code)]
     pub fn invalid_session() -> Self {
         Self::SessionNotFound
     }
 
+    #[allow(dead_code)]
     pub fn session_closing() -> Self {
         Self::SessionClosing
     }
 
+    #[allow(dead_code)]
     pub fn child_dead() -> Self {
         Self::ChildDead
     }
 
+    #[allow(dead_code)]
     pub fn max_sessions() -> Self {
         Self::ServiceUnavailable("max sessions reached".into())
     }
 
+    #[allow(dead_code)]
     pub fn not_ready() -> Self {
         Self::ServiceUnavailable("not ready".into())
     }
 
+    #[allow(dead_code)]
     pub fn missing_accept() -> Self {
         Self::NotAcceptable("missing required Accept header".into())
     }
 
+    #[allow(dead_code)]
     pub fn wrong_content_type(expected: &str, got: &str) -> Self {
         Self::UnsupportedMediaType(format!("expected {expected}, got {got}"))
     }
 
+    #[allow(dead_code)]
     pub fn payload_too_large() -> Self {
         Self::PayloadTooLarge
     }
 
+    #[allow(dead_code)]
     pub fn header_too_large() -> Self {
         Self::HeaderTooLarge
     }
 
+    #[allow(dead_code)]
     pub fn method_not_allowed() -> Self {
         Self::MethodNotAllowed
     }
 
+    #[allow(dead_code)]
     pub fn sse_stream_conflict() -> Self {
         Self::Conflict("SSE stream already open for this session".into())
     }
 
+    #[allow(dead_code)]
     pub fn auto_init_timeout() -> Self {
         Self::AutoInitTimeout
     }

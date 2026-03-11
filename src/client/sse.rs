@@ -1,5 +1,3 @@
-// Public API consumed by downstream gateway beads — suppress dead_code until wired up.
-#![allow(dead_code)]
 
 //! SSE client (EventSource) for connecting to remote SSE-based MCP servers.
 //!
@@ -16,21 +14,26 @@ use crate::client::http::HttpClientError;
 // ─── Constants ─────────────────────────────────────────────────────
 
 /// Initial reconnection delay.
+#[allow(dead_code)]
 const RECONNECT_INITIAL: Duration = Duration::from_secs(1);
 
 /// Maximum reconnection delay.
+#[allow(dead_code)]
 const RECONNECT_MAX: Duration = Duration::from_secs(30);
 
 /// Backoff multiplier.
+#[allow(dead_code)]
 const RECONNECT_MULTIPLIER: u32 = 2;
 
 /// Maximum outgoing messages buffered during disconnect.
+#[allow(dead_code)]
 const OUTGOING_BUFFER_CAP: usize = 256;
 
 // ─── SSE Event Types ───────────────────────────────────────────────
 
 /// A parsed SSE event.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
 pub struct SseEvent {
     /// Event type (default: "message").
     pub event_type: String,
@@ -40,8 +43,10 @@ pub struct SseEvent {
     pub id: String,
 }
 
+#[allow(dead_code)]
 impl SseEvent {
     /// Whether this is an endpoint discovery event.
+    #[allow(dead_code)]
     pub fn is_endpoint(&self) -> bool {
         self.event_type == "endpoint"
     }
@@ -61,6 +66,7 @@ impl SseEvent {
 /// - `retry:` — sets the reconnection interval (in milliseconds)
 /// - Lines starting with `:` are comments (ignored; used for keepalive)
 /// - Blank line dispatches the event
+#[allow(dead_code)]
 pub struct SseParser {
     /// Accumulated event type for the current event.
     event_type: String,
@@ -78,8 +84,10 @@ pub struct SseParser {
     line_buf: String,
 }
 
+#[allow(dead_code)]
 impl SseParser {
     /// Create a new SSE parser.
+    #[allow(dead_code)]
     pub fn new() -> Self {
         Self {
             event_type: String::new(),
@@ -95,6 +103,7 @@ impl SseParser {
     /// Feed a chunk of bytes from the stream. Returns any complete events.
     ///
     /// Handles partial lines across chunk boundaries.
+    #[allow(dead_code)]
     pub fn feed(&mut self, chunk: &str) -> Vec<SseEvent> {
         let mut events = Vec::new();
         self.line_buf.push_str(chunk);
@@ -145,11 +154,13 @@ impl SseParser {
     }
 
     /// Get the last event ID (for reconnection).
+    #[allow(dead_code)]
     pub fn last_event_id(&self) -> &str {
         &self.last_event_id
     }
 
     /// Get the server-requested retry interval, if any.
+    #[allow(dead_code)]
     pub fn retry_interval(&self) -> Option<Duration> {
         self.retry_ms.map(Duration::from_millis)
     }
@@ -157,6 +168,7 @@ impl SseParser {
     /// Process a single complete line.
     ///
     /// Returns `Some(event)` if a blank line triggers event dispatch.
+    #[allow(dead_code)]
     fn process_line(&mut self, line: &str) -> Option<SseEvent> {
         // Blank line → dispatch event
         if line.is_empty() {
@@ -211,6 +223,7 @@ impl SseParser {
     }
 
     /// Dispatch the accumulated event.
+    #[allow(dead_code)]
     fn dispatch_event(&mut self) -> Option<SseEvent> {
         // If no data field was seen, don't dispatch (per spec).
         if !self.has_data {
@@ -245,7 +258,9 @@ impl SseParser {
     }
 }
 
+#[allow(dead_code)]
 impl Default for SseParser {
+    #[allow(dead_code)]
     fn default() -> Self {
         Self::new()
     }
@@ -255,6 +270,7 @@ impl Default for SseParser {
 
 /// Tracks reconnection backoff state.
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct ReconnectState {
     /// Current delay before next reconnect attempt.
     current_delay: Duration,
@@ -262,8 +278,10 @@ pub struct ReconnectState {
     pub attempts: u32,
 }
 
+#[allow(dead_code)]
 impl ReconnectState {
     /// Create a new reconnect state with initial delay.
+    #[allow(dead_code)]
     pub fn new() -> Self {
         Self {
             current_delay: RECONNECT_INITIAL,
@@ -272,6 +290,7 @@ impl ReconnectState {
     }
 
     /// Get the delay for the next reconnect attempt and advance the backoff.
+    #[allow(dead_code)]
     pub fn next_delay(&mut self) -> Duration {
         let delay = self.current_delay;
         self.attempts += 1;
@@ -280,18 +299,22 @@ impl ReconnectState {
     }
 
     /// Reset backoff after a successful connection.
+    #[allow(dead_code)]
     pub fn reset(&mut self) {
         self.current_delay = RECONNECT_INITIAL;
         self.attempts = 0;
     }
 
     /// Override the delay with a server-provided retry value.
+    #[allow(dead_code)]
     pub fn set_retry(&mut self, interval: Duration) {
         self.current_delay = interval.min(RECONNECT_MAX);
     }
 }
 
+#[allow(dead_code)]
 impl Default for ReconnectState {
+    #[allow(dead_code)]
     fn default() -> Self {
         Self::new()
     }
@@ -301,6 +324,7 @@ impl Default for ReconnectState {
 
 /// Error when the outgoing buffer is full.
 #[derive(Debug, thiserror::Error)]
+#[allow(dead_code)]
 pub enum SseClientError {
     #[error("outgoing buffer full ({cap} messages)")]
     BufferFull { cap: usize },
@@ -324,13 +348,16 @@ pub enum SseClientError {
 /// POSTed to the server) are buffered here. After successful reconnect,
 /// the buffer is flushed.
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct OutgoingBuffer {
     queue: VecDeque<Vec<u8>>,
     capacity: usize,
 }
 
+#[allow(dead_code)]
 impl OutgoingBuffer {
     /// Create a new outgoing buffer with the default capacity (256).
+    #[allow(dead_code)]
     pub fn new() -> Self {
         Self {
             queue: VecDeque::new(),
@@ -339,6 +366,7 @@ impl OutgoingBuffer {
     }
 
     /// Create a new outgoing buffer with a custom capacity.
+    #[allow(dead_code)]
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             queue: VecDeque::new(),
@@ -349,6 +377,7 @@ impl OutgoingBuffer {
     /// Push a message into the buffer.
     ///
     /// Returns `Err(SseClientError::BufferFull)` if the buffer is at capacity.
+    #[allow(dead_code)]
     pub fn push(&mut self, message: Vec<u8>) -> Result<(), SseClientError> {
         if self.queue.len() >= self.capacity {
             return Err(SseClientError::BufferFull { cap: self.capacity });
@@ -358,32 +387,39 @@ impl OutgoingBuffer {
     }
 
     /// Drain all buffered messages.
+    #[allow(dead_code)]
     pub fn drain(&mut self) -> Vec<Vec<u8>> {
         self.queue.drain(..).collect()
     }
 
     /// Number of buffered messages.
+    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.queue.len()
     }
 
     /// Whether the buffer is empty.
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.queue.is_empty()
     }
 
     /// Whether the buffer is full.
+    #[allow(dead_code)]
     pub fn is_full(&self) -> bool {
         self.queue.len() >= self.capacity
     }
 
     /// The buffer capacity.
+    #[allow(dead_code)]
     pub fn capacity(&self) -> usize {
         self.capacity
     }
 }
 
+#[allow(dead_code)]
 impl Default for OutgoingBuffer {
+    #[allow(dead_code)]
     fn default() -> Self {
         Self::new()
     }
@@ -398,6 +434,7 @@ impl Default for OutgoingBuffer {
 /// - Absolute: `http://host/path` — used as-is
 /// - Absolute path: `/message` — resolved against the server's scheme + authority
 /// - Relative path: `message` — resolved against the server's base path
+#[allow(dead_code)]
 pub fn resolve_endpoint_url(sse_url: &str, endpoint: &str) -> String {
     // Absolute URL
     if endpoint.starts_with("http://") || endpoint.starts_with("https://") {

@@ -1,24 +1,27 @@
-// Public API consumed by downstream gateway beads — suppress dead_code until wired up.
-#![allow(dead_code)]
 
 use crate::cli::{CorsConfig, CorsOrigin, Header};
 
 /// Maximum allowed request header size in bytes (8KB).
+#[allow(dead_code)]
 pub const MAX_HEADER_SIZE: usize = 8192;
 
 /// Allowed methods for CORS preflight.
+#[allow(dead_code)]
 const ALLOW_METHODS: &str = "GET, POST, DELETE, OPTIONS";
 
 /// Allowed request headers for CORS preflight.
+#[allow(dead_code)]
 const ALLOW_HEADERS: &str = "Content-Type, Accept, Mcp-Session-Id, Last-Event-ID";
 
 /// Default max-age for CORS preflight cache (24 hours).
+#[allow(dead_code)]
 const MAX_AGE: &str = "86400";
 
 // ─── CorsResult ─────────────────────────────────────────────────────
 
 /// Result of processing a request through CORS.
 #[derive(Debug)]
+#[allow(dead_code)]
 pub enum CorsResult {
     /// CORS disabled — no headers to add, don't handle OPTIONS specially.
     Disabled,
@@ -35,16 +38,19 @@ pub enum CorsResult {
 /// Composable with Asupersync's web framework: gateway handlers call
 /// `process()` and either short-circuit (preflight 204) or inject
 /// the returned headers into the response.
+#[allow(dead_code)]
 pub struct CorsHandler {
     config: CorsConfig,
     expose_session_header: bool,
 }
 
+#[allow(dead_code)]
 impl CorsHandler {
     /// Create a new CORS handler.
     ///
     /// `expose_session_header`: when true, adds `Access-Control-Expose-Headers: Mcp-Session-Id`
     /// to responses (used in stateful Streamable HTTP mode).
+    #[allow(dead_code)]
     pub fn new(config: CorsConfig, expose_session_header: bool) -> Self {
         Self {
             config,
@@ -53,6 +59,7 @@ impl CorsHandler {
     }
 
     /// Whether CORS handling is active.
+    #[allow(dead_code)]
     pub fn is_enabled(&self) -> bool {
         !matches!(self.config, CorsConfig::Disabled)
     }
@@ -61,6 +68,7 @@ impl CorsHandler {
     /// - `Disabled`: do nothing
     /// - `ResponseHeaders`: add headers to the response
     /// - `Preflight`: return 204 with these headers immediately
+    #[allow(dead_code)]
     pub fn process(&self, method: &str, request_origin: Option<&str>) -> CorsResult {
         match &self.config {
             CorsConfig::Disabled => CorsResult::Disabled,
@@ -73,6 +81,7 @@ impl CorsHandler {
 
     // ─── Internal ───────────────────────────────────────────────────
 
+    #[allow(dead_code)]
     fn origin_allowed(&self, origin: &str) -> bool {
         match &self.config {
             CorsConfig::Disabled => false,
@@ -84,6 +93,7 @@ impl CorsHandler {
         }
     }
 
+    #[allow(dead_code)]
     fn build_response(&self, request_origin: Option<&str>) -> Vec<(String, String)> {
         match &self.config {
             CorsConfig::Disabled => vec![],
@@ -118,6 +128,7 @@ impl CorsHandler {
         }
     }
 
+    #[allow(dead_code)]
     fn build_preflight(&self, request_origin: Option<&str>) -> Vec<(String, String)> {
         match &self.config {
             CorsConfig::Disabled => vec![],
@@ -160,6 +171,7 @@ impl CorsHandler {
     }
 }
 
+#[allow(dead_code)]
 fn header(name: &str, value: &str) -> (String, String) {
     (name.to_string(), value.to_string())
 }
@@ -168,6 +180,7 @@ fn header(name: &str, value: &str) -> (String, String) {
 
 /// Check if a single request header exceeds the maximum allowed size (8KB).
 /// Returns `true` if the header is within limits.
+#[allow(dead_code)]
 pub fn header_within_limit(name: &str, value: &str) -> bool {
     // name + ": " + value + "\r\n" = name.len() + value.len() + 4
     name.len() + value.len() + 4 <= MAX_HEADER_SIZE
@@ -176,6 +189,7 @@ pub fn header_within_limit(name: &str, value: &str) -> bool {
 /// Apply custom `--header` values to a response header list.
 ///
 /// Uses last-wins semantics for duplicate header names (case-insensitive).
+#[allow(dead_code)]
 pub fn apply_custom_headers(
     response_headers: &mut Vec<(String, String)>,
     custom: &[Header],
@@ -198,14 +212,17 @@ mod tests {
         CorsHandler::new(CorsConfig::Disabled, false)
     }
 
+    #[allow(dead_code)]
     fn wildcard(expose_session: bool) -> CorsHandler {
         CorsHandler::new(CorsConfig::Wildcard, expose_session)
     }
 
+    #[allow(dead_code)]
     fn allow_list(origins: Vec<CorsOrigin>, expose_session: bool) -> CorsHandler {
         CorsHandler::new(CorsConfig::Origins(origins), expose_session)
     }
 
+    #[allow(dead_code)]
     fn find_header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
         headers
             .iter()

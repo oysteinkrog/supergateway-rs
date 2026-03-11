@@ -1,5 +1,3 @@
-// Public API consumed by downstream gateway beads — suppress dead_code until wired up.
-#![allow(dead_code)]
 
 //! HTTP/1.1 client for connecting to remote MCP servers.
 //!
@@ -22,18 +20,22 @@ use crate::cli::Header;
 // ─── Constants ─────────────────────────────────────────────────────
 
 /// Maximum idle connections per host.
+#[allow(dead_code)]
 const MAX_IDLE_PER_HOST: usize = 4;
 
 /// Idle connection timeout.
+#[allow(dead_code)]
 const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Maximum GET redirects.
+#[allow(dead_code)]
 const MAX_GET_REDIRECTS: u32 = 5;
 
 // ─── Error types ───────────────────────────────────────────────────
 
 /// Errors from the HTTP client.
 #[derive(Debug, thiserror::Error)]
+#[allow(dead_code)]
 pub enum HttpClientError {
     #[error("invalid URL: {0}")]
     InvalidUrl(String),
@@ -57,7 +59,9 @@ pub enum HttpClientError {
     Io(String),
 }
 
+#[allow(dead_code)]
 impl From<ClientError> for HttpClientError {
+    #[allow(dead_code)]
     fn from(e: ClientError) -> Self {
         match e {
             ClientError::InvalidUrl(s) => Self::InvalidUrl(s),
@@ -77,6 +81,7 @@ impl From<ClientError> for HttpClientError {
 
 /// HTTP response with metadata needed by MCP client modes.
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct HttpResponse {
     /// HTTP status code.
     pub status: u16,
@@ -86,19 +91,23 @@ pub struct HttpResponse {
     pub body: Vec<u8>,
 }
 
+#[allow(dead_code)]
 impl HttpResponse {
     /// Get the Content-Type header value (case-insensitive lookup).
+    #[allow(dead_code)]
     pub fn content_type(&self) -> Option<&str> {
         get_header(&self.headers, "Content-Type")
     }
 
     /// Get the Mcp-Session-Id header value.
+    #[allow(dead_code)]
     pub fn mcp_session_id(&self) -> Option<&str> {
         get_header(&self.headers, "Mcp-Session-Id")
     }
 }
 
 /// Streaming HTTP response — the body is read incrementally.
+#[allow(dead_code)]
 pub struct HttpStreamResponse {
     /// HTTP status code.
     pub status: u16,
@@ -108,13 +117,16 @@ pub struct HttpStreamResponse {
     pub body: ClientStreamingResponse<ClientIo>,
 }
 
+#[allow(dead_code)]
 impl HttpStreamResponse {
     /// Get the Content-Type header value.
+    #[allow(dead_code)]
     pub fn content_type(&self) -> Option<&str> {
         get_header(&self.headers, "Content-Type")
     }
 
     /// Get the Mcp-Session-Id header value.
+    #[allow(dead_code)]
     pub fn mcp_session_id(&self) -> Option<&str> {
         get_header(&self.headers, "Mcp-Session-Id")
     }
@@ -132,6 +144,7 @@ impl HttpStreamResponse {
 /// - Content-Type exposed on response for caller branching
 /// - Mcp-Session-Id capture/injection for stateful session management
 /// - Error response body parsing (JSON-RPC extraction on non-2xx)
+#[allow(dead_code)]
 pub struct HttpClient {
     /// Underlying asupersync HTTP client (configured with RedirectPolicy::None
     /// so we handle redirects ourselves per-method).
@@ -142,11 +155,13 @@ pub struct HttpClient {
     session_id: Mutex<Option<String>>,
 }
 
+#[allow(dead_code)]
 impl HttpClient {
     /// Create a new HTTP client.
     ///
     /// `headers` are the CLI `--header` values (including `--oauth2Bearer` if set).
     /// These are applied to every outgoing request.
+    #[allow(dead_code)]
     pub fn new(headers: &[Header]) -> Self {
         let pool_config = PoolConfig::builder()
             .max_connections_per_host(MAX_IDLE_PER_HOST)
@@ -176,6 +191,7 @@ impl HttpClient {
     ///
     /// Does NOT follow redirects (POST is not idempotent).
     /// Does NOT retry on failure.
+    #[allow(dead_code)]
     pub async fn post(
         &self,
         url: &str,
@@ -201,6 +217,7 @@ impl HttpClient {
     ///
     /// If `last_event_id` is `Some(id)` and non-empty, the `Last-Event-ID`
     /// header is added to support SSE reconnection (D-013).
+    #[allow(dead_code)]
     pub async fn get_stream(
         &self,
         url: &str,
@@ -232,6 +249,7 @@ impl HttpClient {
     /// Send a DELETE request.
     ///
     /// Does NOT follow redirects.
+    #[allow(dead_code)]
     pub async fn delete(&self, url: &str) -> Result<HttpResponse, HttpClientError> {
         let headers = self.build_headers();
         let resp = self
@@ -247,6 +265,7 @@ impl HttpClient {
     ///
     /// Does NOT follow redirects. Used by Streamable HTTP mode where
     /// the server may return either `application/json` or `text/event-stream`.
+    #[allow(dead_code)]
     pub async fn post_stream(
         &self,
         url: &str,
@@ -280,11 +299,13 @@ impl HttpClient {
     }
 
     /// Get the currently captured Mcp-Session-Id, if any.
+    #[allow(dead_code)]
     pub fn session_id(&self) -> Option<String> {
         self.session_id.lock().unwrap().clone()
     }
 
     /// Manually set the Mcp-Session-Id (e.g., from a previous session).
+    #[allow(dead_code)]
     pub fn set_session_id(&self, id: Option<String>) {
         *self.session_id.lock().unwrap() = id;
     }
@@ -292,6 +313,7 @@ impl HttpClient {
     // ─── Internal ───────────────────────────────────────────────────
 
     /// Build the outgoing headers list: custom headers + session ID.
+    #[allow(dead_code)]
     fn build_headers(&self) -> Vec<(String, String)> {
         let mut headers = self.custom_headers.clone();
 
@@ -307,6 +329,7 @@ impl HttpClient {
     }
 
     /// Capture Mcp-Session-Id from response headers.
+    #[allow(dead_code)]
     fn capture_session_id(&self, headers: &[(String, String)]) {
         if let Some(id) = get_header(headers, "Mcp-Session-Id") {
             *self.session_id.lock().unwrap() = Some(id.to_owned());
@@ -318,6 +341,7 @@ impl HttpClient {
     /// On non-2xx responses:
     /// - Content-Type application/json: return body as-is (caller parses JSON-RPC error)
     /// - Otherwise: wrap status + body text in HttpClientError
+    #[allow(dead_code)]
     fn check_error_response(&self, resp: Response) -> Result<HttpResponse, HttpClientError> {
         let status = resp.status;
         let headers = resp.headers;
@@ -391,6 +415,7 @@ impl HttpClient {
 // ─── Utilities ─────────────────────────────────────────────────────
 
 /// Case-insensitive header lookup.
+#[allow(dead_code)]
 fn get_header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
     headers
         .iter()
@@ -399,11 +424,13 @@ fn get_header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str
 }
 
 /// Check if status code is a redirect.
+#[allow(dead_code)]
 fn is_redirect(status: u16) -> bool {
     matches!(status, 301 | 302 | 303 | 307 | 308)
 }
 
 /// Resolve a redirect Location relative to the current URL.
+#[allow(dead_code)]
 fn resolve_redirect_url(current_url: &str, location: &str) -> String {
     // Absolute URL
     if location.starts_with("http://") || location.starts_with("https://") {

@@ -42,26 +42,33 @@ use crate::session::{
 // ─── Constants ────────────────────────────────────────────────────────
 
 /// Maximum request body size (16MB).
+#[allow(dead_code)]
 const MAX_BODY_SIZE: usize = 16 * 1024 * 1024;
 
 /// Per-session bounded channel capacity for notifications (GET SSE stream).
+#[allow(dead_code)]
 const NOTIFICATION_CHANNEL_CAP: usize = 256;
 
 /// Per-session bounded channel capacity for pending request responses.
+#[allow(dead_code)]
 const RESPONSE_CHANNEL_CAP: usize = 64;
 
 /// Notification buffer cap during initialization.
+#[allow(dead_code)]
 const INIT_NOTIFICATION_BUFFER_CAP: usize = 256;
 
 /// SSE keepalive interval for GET streams.
+#[allow(dead_code)]
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 
 /// Timeout for waiting on child response (per POST request).
+#[allow(dead_code)]
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
 
 // ─── Per-session state ────────────────────────────────────────────────
 
 /// State stored per session in [`SessionManager<SessionData>`].
+#[allow(dead_code)]
 pub struct SessionData {
     /// Child MCP server process for this session.
     pub child: ChildBridge,
@@ -102,8 +109,10 @@ pub struct SessionData {
 unsafe impl Send for SessionData {}
 unsafe impl Sync for SessionData {}
 
+#[allow(dead_code)]
 impl SessionData {
     /// Create session data with a spawned child.
+    #[allow(dead_code)]
     fn new(
         child: ChildBridge,
         logger: Arc<Logger>,
@@ -126,6 +135,7 @@ impl SessionData {
     }
 
     /// Register a pending request id → response channel.
+    #[allow(dead_code)]
     fn register_pending(&self, id: &str, tx: SyncSender<RawMessage>) {
         self.pending_requests
             .write()
@@ -135,6 +145,7 @@ impl SessionData {
 
     /// Route a response from child to the matching pending POST handler.
     /// Returns true if matched, false if no pending request found.
+    #[allow(dead_code)]
     fn route_response(&self, msg: &RawMessage) -> bool {
         let id_str = match &msg.id {
             Some(id) => id.get().to_string(),
@@ -163,6 +174,7 @@ impl SessionData {
     }
 
     /// Route a notification to the GET SSE stream or buffer during init.
+    #[allow(dead_code)]
     fn route_notification(&self, msg: RawMessage) {
         if !self.init_done.load(Ordering::Acquire) {
             let mut buf = self.notification_buffer.lock().unwrap();
@@ -187,6 +199,7 @@ impl SessionData {
     }
 
     /// Mark initialization as complete and flush buffered notifications.
+    #[allow(dead_code)]
     fn mark_init_done(&self) {
         self.init_done.store(true, Ordering::Release);
 
@@ -207,6 +220,7 @@ impl SessionData {
     }
 
     /// Send error responses to all pending POST handlers.
+    #[allow(dead_code)]
     fn fail_pending_requests(&self, code: i32, message: &str) {
         let pending: HashMap<String, SyncSender<RawMessage>> = {
             let mut map = self.pending_requests.write().unwrap();
@@ -224,6 +238,7 @@ impl SessionData {
     }
 
     /// Take the notification receiver (for GET SSE stream). Returns None if already taken.
+    #[allow(dead_code)]
     fn take_notification_rx(&self) -> Option<Receiver<RawMessage>> {
         self.notification_rx.lock().unwrap().take()
     }
@@ -239,6 +254,7 @@ impl SessionData {
 ///
 /// On child exit/error: marks child_failed, sends error to all pending requests,
 /// then exits.
+#[allow(dead_code)]
 fn spawn_relay_thread(
     session_id: SessionId,
     data: Arc<SessionData>,
@@ -253,6 +269,7 @@ fn spawn_relay_thread(
         .expect("spawn relay thread");
 }
 
+#[allow(dead_code)]
 fn relay_loop(
     session_id: &SessionId,
     data: &SessionData,
@@ -286,6 +303,7 @@ fn relay_loop(
     }
 }
 
+#[allow(dead_code)]
 fn route_single_message(session_id: &SessionId, data: &SessionData, msg: RawMessage) {
     // Check if this is the initialize response
     if msg.is_response() {
@@ -317,6 +335,7 @@ fn route_single_message(session_id: &SessionId, data: &SessionData, msg: RawMess
 // ─── Request types (framework-agnostic) ────────────────────────────────
 
 /// Parsed HTTP request for handler dispatch.
+#[allow(dead_code)]
 pub struct GatewayRequest {
     pub method: String,
     pub path: String,
@@ -325,8 +344,10 @@ pub struct GatewayRequest {
     pub query: HashMap<String, String>,
 }
 
+#[allow(dead_code)]
 impl GatewayRequest {
     /// Get header value (case-insensitive).
+    #[allow(dead_code)]
     pub fn header(&self, name: &str) -> Option<&str> {
         self.headers
             .iter()
@@ -335,11 +356,13 @@ impl GatewayRequest {
     }
 
     /// Get the Mcp-Session-Id header.
+    #[allow(dead_code)]
     pub fn session_id_header(&self) -> Option<&str> {
         self.header("mcp-session-id")
     }
 
     /// Check if Accept header contains a value.
+    #[allow(dead_code)]
     pub fn accepts(&self, media_type: &str) -> bool {
         self.header("accept")
             .map(|v| v.contains(media_type))
@@ -348,13 +371,16 @@ impl GatewayRequest {
 }
 
 /// HTTP response from handler.
+#[allow(dead_code)]
 pub struct GatewayResponse {
     pub status: u16,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
 }
 
+#[allow(dead_code)]
 impl GatewayResponse {
+    #[allow(dead_code)]
     fn new(status: u16) -> Self {
         Self {
             status,
@@ -363,33 +389,39 @@ impl GatewayResponse {
         }
     }
 
+    #[allow(dead_code)]
     fn header(mut self, name: &str, value: &str) -> Self {
         self.headers.push((name.to_string(), value.to_string()));
         self
     }
 
+    #[allow(dead_code)]
     fn body_str(mut self, body: &str) -> Self {
         self.body = body.as_bytes().to_vec();
         self
     }
 
+    #[allow(dead_code)]
     fn body_bytes(mut self, body: Vec<u8>) -> Self {
         self.body = body;
         self
     }
 
+    #[allow(dead_code)]
     fn plain_text(status: u16, body: &str) -> Self {
         Self::new(status)
             .header("content-type", "text/plain")
             .body_str(body)
     }
 
+    #[allow(dead_code)]
     fn json(status: u16, body: &str) -> Self {
         Self::new(status)
             .header("content-type", "application/json")
             .body_str(body)
     }
 
+    #[allow(dead_code)]
     fn sse(status: u16, events: &str) -> Self {
         Self::new(status)
             .header("content-type", "text/event-stream")
@@ -397,14 +429,17 @@ impl GatewayResponse {
             .body_str(events)
     }
 
+    #[allow(dead_code)]
     fn no_content() -> Self {
         Self::new(204)
     }
 
+    #[allow(dead_code)]
     fn accepted() -> Self {
         Self::new(202)
     }
 
+    #[allow(dead_code)]
     fn from_error(err: &GatewayError) -> Self {
         Self::new(err.status_code())
             .header("content-type", err.content_type())
@@ -415,18 +450,21 @@ impl GatewayResponse {
 // ─── SSE event formatting ──────────────────────────────────────────────
 
 /// Format a RawMessage as an SSE event.
+#[allow(dead_code)]
 fn format_sse_event(msg: &RawMessage) -> String {
     let json = serde_json::to_string(msg).expect("JSON-RPC message serialization");
     format!("event: message\ndata: {json}\n\n")
 }
 
 /// Format a batch of RawMessages as a single SSE event.
+#[allow(dead_code)]
 fn format_sse_batch_event(msgs: &[RawMessage]) -> String {
     let json = serde_json::to_string(msgs).expect("JSON-RPC batch serialization");
     format!("event: message\ndata: {json}\n\n")
 }
 
 /// Format SSE keepalive comment.
+#[allow(dead_code)]
 fn format_sse_keepalive() -> &'static str {
     ": keepalive\n\n"
 }
@@ -434,6 +472,7 @@ fn format_sse_keepalive() -> &'static str {
 // ─── Gateway ──────────────────────────────────────────────────────────
 
 /// Shared gateway state.
+#[allow(dead_code)]
 pub struct StatefulHttpGateway {
     sessions: SessionManager<SessionData>,
     cmd: String,
@@ -445,8 +484,10 @@ pub struct StatefulHttpGateway {
     logger: Arc<Logger>,
 }
 
+#[allow(dead_code)]
 impl StatefulHttpGateway {
     /// Create a new stateful HTTP gateway.
+    #[allow(dead_code)]
     pub fn new(
         cmd: String,
         mcp_path: String,
@@ -483,6 +524,7 @@ impl StatefulHttpGateway {
     }
 
     /// Session manager reference (for shutdown/drain).
+    #[allow(dead_code)]
     pub fn sessions(&self) -> &SessionManager<SessionData> {
         &self.sessions
     }
@@ -490,6 +532,7 @@ impl StatefulHttpGateway {
     // ─── Request dispatch ──────────────────────────────────────────
 
     /// Handle an incoming HTTP request. Returns a response.
+    #[allow(dead_code)]
     pub fn handle_request(&self, req: &GatewayRequest) -> GatewayResponse {
         // CORS handling
         let cors_result = self.cors.process(
@@ -541,6 +584,7 @@ impl StatefulHttpGateway {
         )
     }
 
+    #[allow(dead_code)]
     fn apply_cors(&self, mut resp: GatewayResponse, cors_result: &CorsResult) -> GatewayResponse {
         if let CorsResult::ResponseHeaders(headers) = cors_result {
             resp.headers.extend(headers.iter().cloned());
@@ -550,6 +594,7 @@ impl StatefulHttpGateway {
 
     // ─── POST handler ──────────────────────────────────────────────
 
+    #[allow(dead_code)]
     fn handle_post(&self, req: &GatewayRequest) -> GatewayResponse {
         // 1. Validate Content-Type
         let content_type = req.header("content-type").unwrap_or("");
@@ -621,6 +666,7 @@ impl StatefulHttpGateway {
     }
 
     /// Handle POST initialize: create new session.
+    #[allow(dead_code)]
     fn handle_post_initialize(
         &self,
         _req: &GatewayRequest,
@@ -681,6 +727,7 @@ impl StatefulHttpGateway {
     }
 
     /// Handle POST to existing session.
+    #[allow(dead_code)]
     fn handle_post_existing(
         &self,
         _req: &GatewayRequest,
@@ -700,6 +747,7 @@ impl StatefulHttpGateway {
     }
 
     /// Forward messages to child and collect responses.
+    #[allow(dead_code)]
     fn forward_and_respond(
         &self,
         session_id: &SessionId,
@@ -804,6 +852,7 @@ impl StatefulHttpGateway {
 
     /// Register response channels for pending request ids.
     /// Returns the list of senders (for cleanup) and receivers (for collecting responses).
+    #[allow(dead_code)]
     fn register_response_channels(
         &self,
         session_id: &SessionId,
@@ -826,6 +875,7 @@ impl StatefulHttpGateway {
 
     // ─── GET handler (SSE stream) ──────────────────────────────────
 
+    #[allow(dead_code)]
     fn handle_get(&self, req: &GatewayRequest) -> GatewayResponse {
         // 1. Validate Accept
         if !req.accepts("text/event-stream") {
@@ -905,6 +955,7 @@ impl StatefulHttpGateway {
 
     // ─── DELETE handler ──────────────────────────────────────────────
 
+    #[allow(dead_code)]
     fn handle_delete(&self, req: &GatewayRequest) -> GatewayResponse {
         // 1. Require Mcp-Session-Id
         let sid_str = match req.session_id_header() {
@@ -976,6 +1027,7 @@ impl StatefulHttpGateway {
     /// Access session data within the session manager's lock.
     ///
     /// Returns None if session not found.
+    #[allow(dead_code)]
     fn with_session<T, F>(&self, id: &SessionId, f: F) -> Option<T>
     where
         F: FnOnce(&SessionData) -> T,
@@ -984,6 +1036,7 @@ impl StatefulHttpGateway {
     }
 
     /// Shutdown: clear all sessions and kill children.
+    #[allow(dead_code)]
     pub fn shutdown(&self) {
         self.logger.info("shutting down all sessions");
         self.sessions.clear();
@@ -999,6 +1052,7 @@ impl StatefulHttpGateway {
 ///
 /// Gets an `Arc<SessionData>` from the session manager so the relay thread can
 /// hold a long-lived reference independent of the session map's lock.
+#[allow(dead_code)]
 fn spawn_relay_for_session(
     mgr: &SessionManager<SessionData>,
     session_id: &SessionId,
@@ -1021,6 +1075,7 @@ fn spawn_relay_for_session(
 // ─── Entry point ────────────────────────────────────────────────────────
 
 /// Run the stdio → Streamable HTTP (stateful) gateway.
+#[allow(dead_code)]
 pub async fn run(config: Config) -> anyhow::Result<()> {
     let logger = Arc::new(Logger::new(config.output_transport, config.log_level));
     let metrics = Metrics::new();
@@ -1058,14 +1113,17 @@ mod tests {
     use crate::cli::{LogLevel, OutputTransport};
     use serde_json::value::RawValue;
 
+    #[allow(dead_code)]
     fn test_logger() -> Arc<Logger> {
         Arc::new(Logger::buffered(OutputTransport::StreamableHttp, LogLevel::Debug))
     }
 
+    #[allow(dead_code)]
     fn test_metrics() -> Arc<Metrics> {
         Metrics::new()
     }
 
+    #[allow(dead_code)]
     fn make_request(id: &str, method: &str) -> RawMessage {
         RawMessage {
             jsonrpc: "2.0".into(),
@@ -1078,6 +1136,7 @@ mod tests {
         }
     }
 
+    #[allow(dead_code)]
     fn make_notification(method: &str) -> RawMessage {
         RawMessage {
             jsonrpc: "2.0".into(),
@@ -1090,6 +1149,7 @@ mod tests {
         }
     }
 
+    #[allow(dead_code)]
     fn make_response(id: &str) -> RawMessage {
         let result = serde_json::value::to_raw_value(&serde_json::json!({"ok": true})).unwrap();
         RawMessage {
@@ -1103,6 +1163,7 @@ mod tests {
         }
     }
 
+    #[allow(dead_code)]
     fn make_gateway_request(
         method: &str,
         path: &str,
@@ -1737,6 +1798,7 @@ mod tests {
 
     // ─── Test helpers ──────────────────────────────────────────────
 
+    #[allow(dead_code)]
     fn make_test_gateway() -> StatefulHttpGateway {
         StatefulHttpGateway::new(
             "cat".into(),
@@ -1750,6 +1812,7 @@ mod tests {
         )
     }
 
+    #[allow(dead_code)]
     fn make_test_gateway_with_cors() -> StatefulHttpGateway {
         StatefulHttpGateway::new(
             "cat".into(),
@@ -1763,6 +1826,7 @@ mod tests {
         )
     }
 
+    #[allow(dead_code)]
     fn make_test_gateway_max_sessions(max: usize) -> StatefulHttpGateway {
         let metrics = test_metrics();
         let logger = test_logger();
@@ -1787,6 +1851,7 @@ mod tests {
 
     /// Create a test session by directly using the session manager,
     /// bypassing the HTTP POST handler (avoids child response timeout).
+    #[allow(dead_code)]
     fn create_test_session(gw: &StatefulHttpGateway) -> SessionId {
         let child = ChildBridge::spawn("cat", gw.metrics.clone(), gw.logger.clone()).unwrap();
         let data = SessionData::new(child, gw.logger.clone(), gw.metrics.clone());

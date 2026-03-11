@@ -1,5 +1,3 @@
-// Public API consumed by downstream gateway beads — suppress dead_code until wired up.
-#![allow(dead_code)]
 
 use std::process;
 
@@ -8,6 +6,7 @@ use regex::Regex;
 
 /// Output transport choices.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum OutputTransport {
     Stdio,
     Sse,
@@ -15,7 +14,9 @@ pub enum OutputTransport {
     StreamableHttp,
 }
 
+#[allow(dead_code)]
 impl std::fmt::Display for OutputTransport {
+    #[allow(dead_code)]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Stdio => write!(f, "stdio"),
@@ -26,8 +27,10 @@ impl std::fmt::Display for OutputTransport {
     }
 }
 
+#[allow(dead_code)]
 impl std::str::FromStr for OutputTransport {
     type Err = String;
+    #[allow(dead_code)]
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "stdio" => Ok(Self::Stdio),
@@ -43,6 +46,7 @@ impl std::str::FromStr for OutputTransport {
 
 /// Which input source was selected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum InputMode {
     Stdio,
     Sse,
@@ -51,6 +55,7 @@ pub enum InputMode {
 
 /// Log level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[allow(dead_code)]
 pub enum LogLevel {
     Debug,
     #[default]
@@ -58,7 +63,9 @@ pub enum LogLevel {
     None,
 }
 
+#[allow(dead_code)]
 impl std::fmt::Display for LogLevel {
+    #[allow(dead_code)]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Debug => write!(f, "debug"),
@@ -68,8 +75,10 @@ impl std::fmt::Display for LogLevel {
     }
 }
 
+#[allow(dead_code)]
 impl std::str::FromStr for LogLevel {
     type Err = String;
+    #[allow(dead_code)]
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "debug" => Ok(Self::Debug),
@@ -84,6 +93,7 @@ impl std::str::FromStr for LogLevel {
 
 /// A parsed header (name, value).
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct Header {
     pub name: String,
     pub value: String,
@@ -91,6 +101,7 @@ pub struct Header {
 
 /// A CORS origin — either a literal string or a regex pattern.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub enum CorsOrigin {
     Literal(String),
     Regex(Regex),
@@ -98,6 +109,7 @@ pub enum CorsOrigin {
 
 /// Three-state CORS configuration.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub enum CorsConfig {
     /// --cors absent: CORS disabled entirely.
     Disabled,
@@ -115,6 +127,7 @@ pub enum CorsConfig {
     version
 )]
 #[command(rename_all = "camelCase")]
+#[allow(dead_code)]
 struct RawArgs {
     /// Spawn a child process as MCP stdio server (shell command)
     #[arg(long)]
@@ -187,6 +200,7 @@ struct RawArgs {
 
 /// Validated, ready-to-use configuration.
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct Config {
     pub input_mode: InputMode,
     pub input_value: String,
@@ -205,7 +219,9 @@ pub struct Config {
     pub protocol_version: String,
 }
 
+#[allow(dead_code)]
 impl Config {
+    #[allow(dead_code)]
     pub fn parse() -> Self {
         let raw = RawArgs::parse();
         match Self::validate(raw) {
@@ -217,6 +233,7 @@ impl Config {
         }
     }
 
+    #[allow(dead_code)]
     fn validate(raw: RawArgs) -> Result<Self, String> {
         // Determine input mode (exactly one required).
         let input_count = [
@@ -335,6 +352,7 @@ impl Config {
     }
 }
 
+#[allow(dead_code)]
 fn validate_path(flag: &str, path: &str) -> Result<(), String> {
     if !path.starts_with('/') {
         return Err(format!("{flag} must start with '/', got '{path}'"));
@@ -342,6 +360,7 @@ fn validate_path(flag: &str, path: &str) -> Result<(), String> {
     Ok(())
 }
 
+#[allow(dead_code)]
 fn parse_header(raw: &str) -> Result<Header, String> {
     let Some(colon_pos) = raw.find(':') else {
         return Err(format!(
@@ -356,6 +375,7 @@ fn parse_header(raw: &str) -> Result<Header, String> {
     Ok(Header { name, value })
 }
 
+#[allow(dead_code)]
 fn parse_cors(raw: Option<Vec<String>>) -> CorsConfig {
     match raw {
         None => CorsConfig::Disabled,
@@ -463,6 +483,7 @@ mod tests {
 
     // Test validate() directly for transport combinations.
 
+    #[allow(dead_code)]
     fn make_raw(stdio: Option<&str>, sse: Option<&str>, sh: Option<&str>) -> RawArgs {
         RawArgs {
             stdio: stdio.map(String::from),

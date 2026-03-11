@@ -13,6 +13,7 @@ use serde_json::value::RawValue;
 /// Extension fields (e.g. `_meta`) are captured in [`extra`](Self::extra) via
 /// `#[serde(flatten)]` so they survive round-trip serialization (protocol transparency).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct RawMessage {
     pub jsonrpc: String,
 
@@ -43,7 +44,9 @@ pub struct RawMessage {
     pub extra: HashMap<String, serde_json::Value>,
 }
 
+#[allow(dead_code)]
 impl Default for RawMessage {
+    #[allow(dead_code)]
     fn default() -> Self {
         Self {
             jsonrpc: "2.0".into(),
@@ -65,6 +68,7 @@ impl Default for RawMessage {
 //   - "id": null            →  id = Some(RawValue("null"))
 //   - "id": 42              →  id = Some(RawValue("42"))
 
+#[allow(dead_code)]
 fn deserialize_optional_raw<'de, D>(deserializer: D) -> Result<Option<Box<RawValue>>, D::Error>
 where
     D: Deserializer<'de>,
@@ -75,6 +79,7 @@ where
     Ok(Some(val))
 }
 
+#[allow(dead_code)]
 fn serialize_optional_raw<S>(
     val: &Option<Box<RawValue>>,
     serializer: S,
@@ -88,28 +93,34 @@ where
     }
 }
 
+#[allow(dead_code)]
 impl RawMessage {
     /// Request: has id + method.
+    #[allow(dead_code)]
     pub fn is_request(&self) -> bool {
         self.id.is_some() && self.method.is_some()
     }
 
     /// Response: has id + (result or error), no method.
+    #[allow(dead_code)]
     pub fn is_response(&self) -> bool {
         self.id.is_some() && (self.result.is_some() || self.error.is_some()) && self.method.is_none()
     }
 
     /// Notification: has method, id field is absent (not null).
+    #[allow(dead_code)]
     pub fn is_notification(&self) -> bool {
         self.method.is_some() && self.id.is_none()
     }
 
     /// Initialize request: method == "initialize" and is_request().
+    #[allow(dead_code)]
     pub fn is_initialize_request(&self) -> bool {
         self.is_request() && self.method.as_deref() == Some("initialize")
     }
 
     /// Convenience accessor for the method field.
+    #[allow(dead_code)]
     pub fn method_str(&self) -> Option<&str> {
         self.method.as_deref()
     }
@@ -117,6 +128,7 @@ impl RawMessage {
     /// Build a JSON-RPC error response.
     ///
     /// If `id` is None (notification that errored), the response uses `null` for id.
+    #[allow(dead_code)]
     pub fn error_response(id: Option<Box<RawValue>>, code: i32, message: &str) -> Self {
         let error_obj = serde_json::json!({
             "code": code,
@@ -141,6 +153,7 @@ impl RawMessage {
 
 /// Result of parsing a JSON-RPC line.
 #[derive(Debug)]
+#[allow(dead_code)]
 pub enum Parsed {
     Single(RawMessage),
     Batch(Vec<RawMessage>),
@@ -149,6 +162,7 @@ pub enum Parsed {
 /// Parse a JSON line into a single message or a batch.
 ///
 /// Uses first non-whitespace byte to decide: `{` → single, `[` → batch.
+#[allow(dead_code)]
 pub fn parse_line(line: &str) -> Result<Parsed, serde_json::Error> {
     let first = line.as_bytes().iter().find(|b| !b.is_ascii_whitespace());
     match first {

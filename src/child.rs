@@ -1,5 +1,3 @@
-// Public API consumed by downstream gateway beads — suppress dead_code until wired up.
-#![allow(dead_code)]
 
 use std::io::{self, BufReader};
 use std::os::unix::process::CommandExt;
@@ -18,21 +16,27 @@ use crate::jsonrpc::{Parsed, RawMessage};
 use crate::observe::{Logger, Metrics};
 
 /// Channel capacity for stdout messages.
+#[allow(dead_code)]
 const STDOUT_CHANNEL_CAP: usize = 256;
 
 /// Timeout for graceful kill (SIGTERM → wait → SIGKILL).
+#[allow(dead_code)]
 const KILL_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Stderr BufReader capacity.
+#[allow(dead_code)]
 const STDERR_BUF_CAP: usize = 64 * 1024;
 
 /// Drop timeout: brief wait for SIGTERM before SIGKILL.
+#[allow(dead_code)]
 const DROP_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Poll interval for kill loop.
+#[allow(dead_code)]
 const KILL_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Debug, thiserror::Error)]
+#[allow(dead_code)]
 pub enum ChildError {
     #[error("failed to spawn child: {0}")]
     Spawn(io::Error),
@@ -45,6 +49,9 @@ pub enum ChildError {
 
     #[error("child stdout closed")]
     StdoutClosed,
+
+    #[error("recv timeout")]
+    Timeout,
 
     #[error("I/O error: {0}")]
     Io(io::Error),
@@ -70,6 +77,7 @@ pub enum ChildError {
 /// sends signals to the entire group, killing grandchildren (e.g., npm → node)
 /// that `sh -c` may have spawned. This fixes the TypeScript bug where only `sh`
 /// was killed, leaving child processes orphaned.
+#[allow(dead_code)]
 pub struct ChildBridge {
     pid: Pid,
     pgid: Pid,
@@ -84,11 +92,13 @@ pub struct ChildBridge {
     logger: Arc<Logger>,
 }
 
+#[allow(dead_code)]
 impl ChildBridge {
     /// Spawn a child process via `sh -c <cmd>`.
     ///
     /// `cmd` is a shell command string (e.g., `"npx -y @modelcontextprotocol/server-filesystem /"`).
     /// The child runs in its own process group via `setsid`.
+    #[allow(dead_code)]
     pub fn spawn(
         cmd: &str,
         metrics: Arc<Metrics>,
@@ -185,6 +195,7 @@ impl ChildBridge {
     ///
     /// Returns `Err(StdoutClosed)` on EOF.
     /// Returns `Err(Codec(e))` on fatal codec errors (InvalidUtf8, BufferOverflow).
+    #[allow(dead_code)]
     pub fn recv_message(&self) -> Result<Parsed, ChildError> {
         let rx = self.stdout_rx.lock().unwrap();
         match rx.recv() {
@@ -197,6 +208,7 @@ impl ChildBridge {
     /// Try to receive a message without blocking.
     ///
     /// Returns `Ok(None)` if no message is available yet.
+    #[allow(dead_code)]
     pub fn try_recv_message(&self) -> Result<Option<Parsed>, ChildError> {
         let rx = self.stdout_rx.lock().unwrap();
         match rx.try_recv() {
@@ -211,6 +223,7 @@ impl ChildBridge {
     ///
     /// Thread-safe: the internal Mutex serializes concurrent writes.
     /// Returns `Err(BrokenPipe)` if stdin is closed or child is dead.
+    #[allow(dead_code)]
     pub fn write_message(&self, msg: &RawMessage) -> Result<(), ChildError> {
         if self.is_dead() {
             return Err(ChildError::BrokenPipe);
@@ -229,21 +242,25 @@ impl ChildBridge {
     }
 
     /// Check if child is dead (exited, killed, or fatal codec error).
+    #[allow(dead_code)]
     pub fn is_dead(&self) -> bool {
         self.dead.load(Ordering::Acquire)
     }
 
     /// Get exit code (None if still running or killed by signal).
+    #[allow(dead_code)]
     pub fn exit_code(&self) -> Option<i32> {
         *self.exit_code.lock().unwrap()
     }
 
     /// Get the child PID.
+    #[allow(dead_code)]
     pub fn pid(&self) -> Pid {
         self.pid
     }
 
     /// Get the process group ID (same as PID after setsid).
+    #[allow(dead_code)]
     pub fn pgid(&self) -> Pid {
         self.pgid
     }
@@ -254,6 +271,7 @@ impl ChildBridge {
     /// 2. SIGTERM to process group
     /// 3. Wait up to 5s for child exit
     /// 4. SIGKILL if still alive (with forced_kills metric)
+    #[allow(dead_code)]
     pub fn kill(&self) {
         // Close stdin first to signal EOF
         {
@@ -289,6 +307,7 @@ impl ChildBridge {
 
     // ─── Background thread loops ───────────────────────────────────────
 
+    #[allow(dead_code)]
     fn stdout_reader_loop(
         reader: std::process::ChildStdout,
         tx: SyncSender<Result<Parsed, CodecError>>,
@@ -316,6 +335,7 @@ impl ChildBridge {
         }
     }
 
+    #[allow(dead_code)]
     fn stderr_reader_loop(reader: std::process::ChildStderr, logger: Arc<Logger>) {
         let mut buf_reader = BufReader::with_capacity(STDERR_BUF_CAP, reader);
         let mut buf = Vec::new();
@@ -332,6 +352,7 @@ impl ChildBridge {
         }
     }
 
+    #[allow(dead_code)]
     fn wait_loop(
         mut child: Child,
         raw_pid: i32,
@@ -349,7 +370,9 @@ impl ChildBridge {
     }
 }
 
+#[allow(dead_code)]
 impl Drop for ChildBridge {
+    #[allow(dead_code)]
     fn drop(&mut self) {
         if !self.is_dead() {
             // Safety net: SIGTERM to process group
@@ -386,14 +409,17 @@ mod tests {
     use serde_json::value::RawValue;
     use std::sync::atomic::Ordering;
 
+    #[allow(dead_code)]
     fn test_metrics() -> Arc<Metrics> {
         Metrics::new()
     }
 
+    #[allow(dead_code)]
     fn test_logger() -> Arc<Logger> {
         Arc::new(Logger::buffered(OutputTransport::Sse, LogLevel::Debug))
     }
 
+    #[allow(dead_code)]
     fn make_request(id: &str, method: &str) -> RawMessage {
         RawMessage {
             jsonrpc: "2.0".into(),

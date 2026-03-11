@@ -1,5 +1,3 @@
-// Public API — suppress dead_code until wired up in main.rs.
-#![allow(dead_code)]
 
 //! stdio → Streamable HTTP (stateless) gateway.
 //!
@@ -46,18 +44,23 @@ use super::stateful_http::GatewayRequest;
 // ─── Constants ────────────────────────────────────────────────────────
 
 /// Maximum request body size (16MB, D-101).
+#[allow(dead_code)]
 const MAX_BODY_SIZE: usize = 16 * 1024 * 1024;
 
 /// Maximum concurrent requests (D-102). Each spawns a child process.
+#[allow(dead_code)]
 const MAX_CONCURRENT_REQUESTS: usize = 1024;
 
 /// Timeout for auto-init sequence (PRD line 225).
+#[allow(dead_code)]
 const AUTO_INIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Timeout for waiting on child response after forwarding client messages.
+#[allow(dead_code)]
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Polling interval when waiting for child stdout messages.
+#[allow(dead_code)]
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 // ─── Response helpers ────────────────────────────────────────────────
@@ -66,12 +69,14 @@ const POLL_INTERVAL: Duration = Duration::from_millis(5);
 ///
 /// Mirrors [`super::stateful_http::GatewayResponse`] but defined locally to avoid
 /// coupling to stateful_http's private builder methods.
+#[allow(dead_code)]
 pub struct GatewayResponse {
     pub status: u16,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
 }
 
+#[allow(dead_code)]
 fn response_plain_text(status: u16, body: &str) -> GatewayResponse {
     GatewayResponse {
         status,
@@ -80,6 +85,7 @@ fn response_plain_text(status: u16, body: &str) -> GatewayResponse {
     }
 }
 
+#[allow(dead_code)]
 fn response_sse(status: u16, events: &str) -> GatewayResponse {
     GatewayResponse {
         status,
@@ -91,6 +97,7 @@ fn response_sse(status: u16, events: &str) -> GatewayResponse {
     }
 }
 
+#[allow(dead_code)]
 fn response_accepted() -> GatewayResponse {
     GatewayResponse {
         status: 202,
@@ -99,6 +106,7 @@ fn response_accepted() -> GatewayResponse {
     }
 }
 
+#[allow(dead_code)]
 fn response_no_content() -> GatewayResponse {
     GatewayResponse {
         status: 204,
@@ -107,6 +115,7 @@ fn response_no_content() -> GatewayResponse {
     }
 }
 
+#[allow(dead_code)]
 fn response_from_error(err: &GatewayError) -> GatewayResponse {
     GatewayResponse {
         status: err.status_code(),
@@ -118,6 +127,7 @@ fn response_from_error(err: &GatewayError) -> GatewayResponse {
 /// 405 Method Not Allowed — no Content-Type header (matches TS `writeHead(405).end()`).
 ///
 /// Body: JSON-RPC error `{"jsonrpc":"2.0","error":{"code":-32000,"message":"Method not allowed."},"id":null}`.
+#[allow(dead_code)]
 fn response_method_not_allowed() -> GatewayResponse {
     let err_msg =
         RawMessage::error_response(None, error::codes::SERVER_ERROR, "Method not allowed.");
@@ -130,6 +140,7 @@ fn response_method_not_allowed() -> GatewayResponse {
 }
 
 /// 500 Internal Server Error — outer catch-all for panics.
+#[allow(dead_code)]
 fn response_internal_error() -> GatewayResponse {
     let err_msg =
         RawMessage::error_response(None, error::codes::INTERNAL_ERROR, "Internal server error");
@@ -144,6 +155,7 @@ fn response_internal_error() -> GatewayResponse {
 // ─── SSE event formatting ────────────────────────────────────────────
 
 /// Format a RawMessage as an SSE event.
+#[allow(dead_code)]
 fn format_sse_event(msg: &RawMessage) -> String {
     let json = serde_json::to_string(msg).expect("JSON-RPC message serialization");
     format!("event: message\ndata: {json}\n\n")
@@ -152,6 +164,7 @@ fn format_sse_event(msg: &RawMessage) -> String {
 // ─── Auto-init helpers ───────────────────────────────────────────────
 
 /// Generate a random base-36 string of length `n` using `/dev/urandom`.
+#[allow(dead_code)]
 fn random_base36(n: usize) -> String {
     let mut buf = vec![0u8; n];
     std::fs::File::open("/dev/urandom")
@@ -175,6 +188,7 @@ fn random_base36(n: usize) -> String {
 /// Generate a synthetic initialize request ID.
 ///
 /// Format: `init_<timestamp_ms>_<random_base36_9chars>`
+#[allow(dead_code)]
 fn generate_init_id() -> String {
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -185,6 +199,7 @@ fn generate_init_id() -> String {
 }
 
 /// Build the synthetic initialize request.
+#[allow(dead_code)]
 fn build_synthetic_init(init_id: &str, protocol_version: &str) -> RawMessage {
     let params = serde_json::json!({
         "protocolVersion": protocol_version,
@@ -210,6 +225,7 @@ fn build_synthetic_init(init_id: &str, protocol_version: &str) -> RawMessage {
 }
 
 /// Build the `notifications/initialized` notification.
+#[allow(dead_code)]
 fn build_initialized_notification() -> RawMessage {
     RawMessage {
         jsonrpc: "2.0".into(),
@@ -227,6 +243,7 @@ fn build_initialized_notification() -> RawMessage {
 /// Returns `Ok(())` when the init response is received. Buffered notifications
 /// are stored in `buffered` for later forwarding. Returns `Err` on timeout or
 /// child death.
+#[allow(dead_code)]
 fn wait_for_init_response(
     child: &ChildBridge,
     init_id: &str,
@@ -276,6 +293,7 @@ fn wait_for_init_response(
 ///
 /// Returns all collected messages (responses + notifications) and whether
 /// all expected responses were received.
+#[allow(dead_code)]
 fn collect_responses(
     child: &ChildBridge,
     expected: usize,
@@ -320,11 +338,14 @@ fn collect_responses(
 // ─── Request permit guard ────────────────────────────────────────────
 
 /// RAII guard that decrements the active request counter on drop.
+#[allow(dead_code)]
 struct RequestPermit<'a> {
     counter: &'a AtomicUsize,
 }
 
+#[allow(dead_code)]
 impl Drop for RequestPermit<'_> {
+    #[allow(dead_code)]
     fn drop(&mut self) {
         self.counter.fetch_sub(1, Ordering::AcqRel);
     }
@@ -333,6 +354,7 @@ impl Drop for RequestPermit<'_> {
 // ─── Gateway ──────────────────────────────────────────────────────────
 
 /// Shared gateway state for stateless Streamable HTTP mode.
+#[allow(dead_code)]
 pub struct StatelessHttpGateway {
     cmd: String,
     cors: CorsHandler,
@@ -345,8 +367,10 @@ pub struct StatelessHttpGateway {
     logger: Arc<Logger>,
 }
 
+#[allow(dead_code)]
 impl StatelessHttpGateway {
     /// Create a new stateless HTTP gateway.
+    #[allow(dead_code)]
     pub fn new(
         cmd: String,
         mcp_path: String,
@@ -373,6 +397,7 @@ impl StatelessHttpGateway {
     // ─── Request dispatch ──────────────────────────────────────────
 
     /// Handle an incoming HTTP request. Returns a response.
+    #[allow(dead_code)]
     pub fn handle_request(&self, req: &GatewayRequest) -> GatewayResponse {
         // CORS handling
         let cors_result = self.cors.process(&req.method, req.header("origin"));
@@ -426,6 +451,7 @@ impl StatelessHttpGateway {
         self.apply_cors(response_plain_text(404, "Not Found"), &cors_result)
     }
 
+    #[allow(dead_code)]
     fn apply_cors(&self, mut resp: GatewayResponse, cors_result: &CorsResult) -> GatewayResponse {
         if let CorsResult::ResponseHeaders(headers) = cors_result {
             resp.headers.extend(headers.iter().cloned());
@@ -435,6 +461,7 @@ impl StatelessHttpGateway {
 
     // ─── POST handler ──────────────────────────────────────────────
 
+    #[allow(dead_code)]
     fn handle_post(&self, req: &GatewayRequest) -> GatewayResponse {
         // Outer catch-all: panics → 500 + JSON-RPC -32603
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -453,6 +480,7 @@ impl StatelessHttpGateway {
         }
     }
 
+    #[allow(dead_code)]
     fn handle_post_inner(
         &self,
         req: &GatewayRequest,
@@ -519,6 +547,7 @@ impl StatelessHttpGateway {
     }
 
     /// Acquire a request permit. Returns `ServiceUnavailable` if at capacity.
+    #[allow(dead_code)]
     fn acquire_request_permit(&self) -> Result<RequestPermit<'_>, GatewayError> {
         let prev = self.active_requests.fetch_add(1, Ordering::AcqRel);
         if prev >= MAX_CONCURRENT_REQUESTS {
@@ -534,6 +563,7 @@ impl StatelessHttpGateway {
 
     // ─── Case 1: Direct forward (initialize request) ──────────────
 
+    #[allow(dead_code)]
     fn forward_direct(
         &self,
         child: &ChildBridge,
@@ -573,6 +603,7 @@ impl StatelessHttpGateway {
 
     // ─── Case 2: Auto-init + forward ──────────────────────────────
 
+    #[allow(dead_code)]
     fn auto_init_and_forward(
         &self,
         child: &ChildBridge,
@@ -636,6 +667,7 @@ impl StatelessHttpGateway {
 // ─── Entry point ────────────────────────────────────────────────────────
 
 /// Run the stdio → Streamable HTTP (stateless) gateway.
+#[allow(dead_code)]
 pub async fn run(config: crate::cli::Config) -> anyhow::Result<()> {
     let logger = Arc::new(crate::observe::Logger::new(
         config.output_transport,
@@ -675,6 +707,7 @@ mod tests {
     use std::collections::HashMap;
     use crate::cli::{LogLevel, OutputTransport};
 
+    #[allow(dead_code)]
     fn test_logger() -> Arc<Logger> {
         Arc::new(Logger::buffered(
             OutputTransport::StreamableHttp,
@@ -682,10 +715,12 @@ mod tests {
         ))
     }
 
+    #[allow(dead_code)]
     fn test_metrics() -> Arc<Metrics> {
         Metrics::new()
     }
 
+    #[allow(dead_code)]
     fn make_gateway_request(
         method: &str,
         path: &str,
@@ -705,6 +740,7 @@ mod tests {
         }
     }
 
+    #[allow(dead_code)]
     fn make_test_gateway() -> StatelessHttpGateway {
         StatelessHttpGateway::new(
             "cat".into(),
@@ -718,6 +754,7 @@ mod tests {
         )
     }
 
+    #[allow(dead_code)]
     fn make_test_gateway_with_cors() -> StatelessHttpGateway {
         StatelessHttpGateway::new(
             "cat".into(),
@@ -733,6 +770,7 @@ mod tests {
 
     /// Mock MCP server: responds to initialize with init result,
     /// to requests with a tool result. Notifications are consumed silently.
+    #[allow(dead_code)]
     const MOCK_MCP_SERVER: &str = concat!(
         "python3 -c \"import sys, json\n",
         "while True:\n",
@@ -750,6 +788,7 @@ mod tests {
         "\"",
     );
 
+    #[allow(dead_code)]
     fn post_headers() -> Vec<(&'static str, &'static str)> {
         vec![
             ("content-type", "application/json"),

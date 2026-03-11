@@ -1,5 +1,3 @@
-// Public API consumed by downstream gateway beads — suppress dead_code until wired up.
-#![allow(dead_code)]
 
 //! Signal handling and graceful shutdown for supergateway.
 //!
@@ -34,6 +32,7 @@ use nix::unistd::Pid;
 use crate::observe::Logger;
 
 /// Drain budget: maximum time for graceful shutdown before force exit.
+#[allow(dead_code)]
 pub const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 // ─── Global state (set by signal handler, read by main thread) ──────────
@@ -88,6 +87,7 @@ extern "C" fn sigchld_handler(_sig: libc::c_int) {
 ///
 /// Returned by [`install()`]. Use [`wait()`](ShutdownSignal::wait) to block
 /// until a shutdown signal is received or [`request_shutdown()`] is called.
+#[allow(dead_code)]
 pub struct ShutdownSignal {
     pipe_read: libc::c_int,
 }
@@ -96,11 +96,13 @@ pub struct ShutdownSignal {
 unsafe impl Send for ShutdownSignal {}
 unsafe impl Sync for ShutdownSignal {}
 
+#[allow(dead_code)]
 impl ShutdownSignal {
     /// Block until shutdown is requested.
     ///
     /// Returns the signal number: 2 (SIGINT), 15 (SIGTERM), 1 (SIGHUP),
     /// or 0 for programmatic shutdown (e.g., stdin EOF).
+    #[allow(dead_code)]
     pub fn wait(&self) -> i32 {
         if is_shutdown_requested() {
             return SIGNAL_NUM.load(Ordering::SeqCst);
@@ -123,6 +125,7 @@ impl ShutdownSignal {
 /// also installs SIGCHLD handler for zombie reaping.
 ///
 /// Must be called once at startup, before spawning worker threads.
+#[allow(dead_code)]
 pub fn install(logger: &Logger) -> io::Result<ShutdownSignal> {
     // Create self-pipe
     let mut fds = [0 as libc::c_int; 2];
@@ -170,11 +173,13 @@ pub fn install(logger: &Logger) -> io::Result<ShutdownSignal> {
 }
 
 /// Check if shutdown has been requested (non-blocking).
+#[allow(dead_code)]
 pub fn is_shutdown_requested() -> bool {
     SHUTDOWN_REQUESTED.load(Ordering::SeqCst)
 }
 
 /// Check if force exit was requested (second signal received).
+#[allow(dead_code)]
 pub fn is_force_exit() -> bool {
     FORCE_EXIT.load(Ordering::SeqCst)
 }
@@ -183,6 +188,7 @@ pub fn is_force_exit() -> bool {
 ///
 /// First call triggers graceful shutdown. Second call sets force-exit.
 /// Wakes any thread blocked in [`ShutdownSignal::wait()`].
+#[allow(dead_code)]
 pub fn request_shutdown() {
     let was_set = SHUTDOWN_REQUESTED.swap(true, Ordering::SeqCst);
     if was_set {
@@ -199,6 +205,7 @@ pub fn request_shutdown() {
 ///
 /// Used in server modes where stdin is not the JSON-RPC transport.
 /// Handles the case where the parent process (e.g., IDE) closes stdin.
+#[allow(dead_code)]
 pub fn spawn_stdin_eof_watcher(logger: Arc<Logger>) {
     std::thread::Builder::new()
         .name("stdin-eof".into())
@@ -223,6 +230,7 @@ pub fn spawn_stdin_eof_watcher(logger: Arc<Logger>) {
 ///
 /// Call when shutdown begins. If the process hasn't exited within the
 /// drain budget, the watchdog logs an error and calls `process::exit(1)`.
+#[allow(dead_code)]
 pub fn spawn_shutdown_watchdog(logger: Arc<Logger>) {
     std::thread::Builder::new()
         .name("shutdown-watchdog".into())
@@ -235,6 +243,7 @@ pub fn spawn_shutdown_watchdog(logger: Arc<Logger>) {
 }
 
 /// Human-readable name for a signal number.
+#[allow(dead_code)]
 pub fn signal_name(sig: i32) -> &'static str {
     match sig {
         0 => "stdin EOF",
@@ -261,6 +270,7 @@ mod tests {
     /// Serializes tests that share global signal state.
     static TEST_LOCK: Mutex<()> = Mutex::new(());
 
+    #[allow(dead_code)]
     fn test_logger() -> Arc<Logger> {
         Arc::new(Logger::buffered(OutputTransport::Sse, LogLevel::Debug))
     }

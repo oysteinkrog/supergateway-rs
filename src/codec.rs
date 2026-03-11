@@ -1,5 +1,3 @@
-// Public API consumed by downstream beads — suppress dead_code until wired up.
-#![allow(dead_code)]
 
 use std::io::{self, BufRead, BufReader, Read, Write};
 
@@ -7,20 +5,25 @@ use crate::jsonrpc::{self, Parsed, RawMessage};
 use crate::observe::{Logger, Metrics};
 
 /// Maximum size of a single complete JSON-RPC message (D-101).
+#[allow(dead_code)]
 pub const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 
 /// Default partial-line buffer limit per child (D-106).
+#[allow(dead_code)]
 pub const DEFAULT_PARTIAL_BUFFER: usize = 64 * 1024 * 1024;
 
 /// Stderr line truncation limit (US-005 spec).
+#[allow(dead_code)]
 pub const STDERR_MAX_LINE: usize = 4 * 1024;
 
 /// Preview length for error logging.
+#[allow(dead_code)]
 const ERROR_PREVIEW_LEN: usize = 200;
 
 /// Codec errors. `InvalidUtf8` and `BufferOverflow` are fatal — caller must
 /// kill the child/session and return JSON-RPC -32603 to in-flight requests.
 #[derive(Debug, thiserror::Error)]
+#[allow(dead_code)]
 pub enum CodecError {
     #[error("invalid UTF-8 on stdout (protocol violation)")]
     InvalidUtf8,
@@ -36,6 +39,7 @@ pub enum CodecError {
 ///
 /// Reads newline-delimited lines, validates UTF-8, enforces size limits,
 /// and parses each line as a JSON-RPC message or batch.
+#[allow(dead_code)]
 pub struct StdoutCodec<R> {
     reader: BufReader<R>,
     max_buffer: usize,
@@ -47,6 +51,7 @@ impl<R: Read> StdoutCodec<R> {
     ///
     /// `max_buffer` is the per-child partial-line buffer limit (typically
     /// [`DEFAULT_PARTIAL_BUFFER`] = 64MB).
+    #[allow(dead_code)]
     pub fn new(reader: R, max_buffer: usize) -> Self {
         Self {
             reader: BufReader::new(reader),
@@ -57,6 +62,7 @@ impl<R: Read> StdoutCodec<R> {
 
     /// Read raw bytes until `\n` or EOF. Returns `Ok(None)` on clean EOF
     /// (no trailing bytes). Returns the line bytes *without* the `\n` delimiter.
+    #[allow(dead_code)]
     fn read_line_raw(&mut self) -> Result<Option<Vec<u8>>, CodecError> {
         self.buf.clear();
         loop {
@@ -92,6 +98,7 @@ impl<R: Read> StdoutCodec<R> {
     /// Returns `Ok(None)` on EOF. Fatal errors (`InvalidUtf8`, `BufferOverflow`)
     /// require the caller to kill the child/session. Parse errors and oversized
     /// messages (>16MB) are logged, counted in `decode_errors`, and skipped.
+    #[allow(dead_code)]
     pub fn read_message(
         &mut self,
         metrics: &Metrics,
@@ -154,6 +161,7 @@ impl<R: Read> StdoutCodec<R> {
 ///
 /// Caller must hold a mutex for shared-child modes (SSE, WS, stateful HTTP).
 /// See bead notes on D-012 for mutex ownership details.
+#[allow(dead_code)]
 pub fn write_message<W: Write>(writer: &mut W, msg: &RawMessage) -> io::Result<()> {
     let json =
         serde_json::to_string(msg).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -170,6 +178,7 @@ pub fn write_message<W: Write>(writer: &mut W, msg: &RawMessage) -> io::Result<(
 ///
 /// The caller should create the `BufReader` with an appropriate capacity
 /// (typically 64KB for stderr).
+#[allow(dead_code)]
 pub fn read_stderr_line<R: BufRead>(
     reader: &mut R,
     buf: &mut Vec<u8>,
@@ -200,10 +209,12 @@ mod tests {
     use std::io::Cursor;
     use std::sync::atomic::Ordering;
 
+    #[allow(dead_code)]
     fn test_metrics() -> std::sync::Arc<Metrics> {
         Metrics::new()
     }
 
+    #[allow(dead_code)]
     fn test_logger() -> Logger {
         Logger::buffered(OutputTransport::Sse, LogLevel::Debug)
     }

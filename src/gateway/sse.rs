@@ -1,5 +1,3 @@
-// Public API — suppress dead_code until wired up in main.rs.
-#![allow(dead_code)]
 
 //! stdio → SSE gateway.
 //!
@@ -43,24 +41,30 @@ use crate::session::SessionId;
 // ─── Constants ──────────────────────────────────────────────────────
 
 /// Per-client channel capacity (D-017).
+#[allow(dead_code)]
 const CLIENT_CHANNEL_CAP: usize = 256;
 
 /// Maximum early buffer size (messages before first client).
+#[allow(dead_code)]
 const EARLY_BUFFER_CAP: usize = 256;
 
 /// Backpressure timeout: disconnect client if channel full for this long (D-017).
+#[allow(dead_code)]
 const BACKPRESSURE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// SSE keepalive interval.
+#[allow(dead_code)]
 pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 
 /// Maximum POST body size (4MB — TS SDK raw-body default for SSE mode).
+#[allow(dead_code)]
 const MAX_BODY_SIZE: usize = 4 * 1024 * 1024;
 
 // ─── SSE Event ──────────────────────────────────────────────────────
 
 /// An event to send over the SSE stream.
 #[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
 pub enum SseEvent {
     /// First event: `event: endpoint\ndata: <url>\n\n`
     Endpoint(String),
@@ -70,8 +74,10 @@ pub enum SseEvent {
     Keepalive,
 }
 
+#[allow(dead_code)]
 impl SseEvent {
     /// Serialize to SSE wire format.
+    #[allow(dead_code)]
     pub fn serialize(&self) -> String {
         match self {
             Self::Endpoint(url) => format!("event: endpoint\ndata: {url}\n\n"),
@@ -83,6 +89,7 @@ impl SseEvent {
 
 // ─── Internal client state ──────────────────────────────────────────
 
+#[allow(dead_code)]
 struct ClientState {
     tx: SyncSender<SseEvent>,
     /// When backpressure started (channel full). None = healthy.
@@ -90,6 +97,7 @@ struct ClientState {
 }
 
 /// Shared interior state behind Mutex.
+#[allow(dead_code)]
 struct Inner {
     clients: HashMap<SessionId, ClientState>,
     /// Messages buffered before first client connects. `None` after first client.
@@ -99,13 +107,16 @@ struct Inner {
 // ─── GatewayResponse ────────────────────────────────────────────────
 
 /// Framework-agnostic HTTP response.
+#[allow(dead_code)]
 pub struct GatewayResponse {
     pub status: u16,
     pub headers: Vec<(String, String)>,
     pub body: String,
 }
 
+#[allow(dead_code)]
 impl GatewayResponse {
+    #[allow(dead_code)]
     fn new(status: u16, body: impl Into<String>) -> Self {
         Self {
             status,
@@ -114,11 +125,13 @@ impl GatewayResponse {
         }
     }
 
+    #[allow(dead_code)]
     fn with_header(mut self, name: &str, value: &str) -> Self {
         self.headers.push((name.to_string(), value.to_string()));
         self
     }
 
+    #[allow(dead_code)]
     fn with_headers(mut self, headers: Vec<(String, String)>) -> Self {
         self.headers.extend(headers);
         self
@@ -128,6 +141,7 @@ impl GatewayResponse {
 // ─── SseConnection ──────────────────────────────────────────────────
 
 /// Returned by [`SseGateway::handle_sse_connect`] for the caller to stream.
+#[allow(dead_code)]
 pub struct SseConnection {
     /// Session ID for this client.
     pub session_id: SessionId,
@@ -142,6 +156,7 @@ pub struct SseConnection {
 /// stdio → SSE gateway.
 ///
 /// All state is behind `Arc` — cloning is cheap.
+#[allow(dead_code)]
 pub struct SseGateway {
     child: Arc<ChildBridge>,
     inner: Arc<Mutex<Inner>>,
@@ -155,7 +170,9 @@ pub struct SseGateway {
     health_endpoints: Arc<Vec<String>>,
 }
 
+#[allow(dead_code)]
 impl Clone for SseGateway {
+    #[allow(dead_code)]
     fn clone(&self) -> Self {
         Self {
             child: Arc::clone(&self.child),
@@ -172,11 +189,13 @@ impl Clone for SseGateway {
     }
 }
 
+#[allow(dead_code)]
 impl SseGateway {
     /// Create a new SSE gateway.
     ///
     /// The child must already be spawned. Call [`run_relay`](Self::run_relay)
     /// or [`spawn_relay`](Self::spawn_relay) to start the broadcast loop.
+    #[allow(dead_code)]
     pub fn new(
         child: Arc<ChildBridge>,
         base_url: String,
@@ -214,6 +233,7 @@ impl SseGateway {
     ///
     /// Returns when the child exits. The caller MUST exit the process with
     /// the returned code (or 1 if None) so pm2/systemd can restart.
+    #[allow(dead_code)]
     pub fn run_relay(&self) -> Option<i32> {
         loop {
             match self.child.recv_message() {
@@ -266,6 +286,7 @@ impl SseGateway {
     ///
     /// When the child exits the thread returns the exit code. The caller
     /// should join and call `process::exit(code.unwrap_or(1))`.
+    #[allow(dead_code)]
     pub fn spawn_relay(&self) -> std::thread::JoinHandle<Option<i32>> {
         let gw = self.clone();
         std::thread::Builder::new()
@@ -278,6 +299,7 @@ impl SseGateway {
     ///
     /// Handles backpressure: if a client's channel is full for >30s,
     /// the client is disconnected (D-017).
+    #[allow(dead_code)]
     fn broadcast_locked(
         state: &mut Inner,
         json: &str,
@@ -335,6 +357,7 @@ impl SseGateway {
     /// 2. Loop on the receiver, writing events via [`SseEvent::serialize`]
     /// 3. Send [`SseEvent::Keepalive`] every [`KEEPALIVE_INTERVAL`]
     /// 4. Call [`disconnect_client`](Self::disconnect_client) on connection close
+    #[allow(dead_code)]
     pub fn handle_sse_connect(&self, origin: Option<&str>) -> SseConnection {
         let cors_headers = match self.cors.process("GET", origin) {
             CorsResult::Disabled => vec![],
@@ -403,6 +426,7 @@ impl SseGateway {
     /// Remove a disconnected SSE client from the client map.
     ///
     /// Must be called when the SSE connection closes.
+    #[allow(dead_code)]
     pub fn disconnect_client(&self, id: &SessionId) {
         let removed = {
             let mut state = self.inner.lock().unwrap();
@@ -424,6 +448,7 @@ impl SseGateway {
     /// `session_id_param`: value of `?sessionId=` query parameter (`None` if absent).
     /// `body`: raw request body bytes (NOT parsed by framework body parser).
     /// `origin`: Origin header for CORS.
+    #[allow(dead_code)]
     pub fn handle_message(
         &self,
         session_id_param: Option<&str>,
@@ -507,6 +532,7 @@ impl SseGateway {
     // ─── OPTIONS handler ────────────────────────────────────────────
 
     /// Handle a CORS preflight request. Returns `None` if CORS is disabled.
+    #[allow(dead_code)]
     pub fn handle_options(&self, origin: Option<&str>) -> Option<GatewayResponse> {
         match self.cors.process("OPTIONS", origin) {
             CorsResult::Preflight(headers) => {
@@ -521,6 +547,7 @@ impl SseGateway {
     // ─── Health handler ─────────────────────────────────────────────
 
     /// Handle a health endpoint request. Returns `None` if path is not a health endpoint.
+    #[allow(dead_code)]
     pub fn handle_health(
         &self,
         path: &str,
@@ -547,6 +574,7 @@ impl SseGateway {
 
     // ─── Helpers ────────────────────────────────────────────────────
 
+    #[allow(dead_code)]
     fn plain_response(
         &self,
         status: u16,
@@ -560,6 +588,7 @@ impl SseGateway {
         resp
     }
 
+    #[allow(dead_code)]
     fn error_response(
         &self,
         err: GatewayError,
@@ -573,11 +602,13 @@ impl SseGateway {
     }
 
     /// Number of connected SSE clients.
+    #[allow(dead_code)]
     pub fn client_count(&self) -> usize {
         self.inner.lock().unwrap().clients.len()
     }
 
     /// Check if the child process is dead.
+    #[allow(dead_code)]
     pub fn is_child_dead(&self) -> bool {
         self.child.is_dead()
     }
@@ -586,6 +617,7 @@ impl SseGateway {
 // ─── Entry point ────────────────────────────────────────────────────────
 
 /// Run the stdio → SSE gateway.
+#[allow(dead_code)]
 pub async fn run(config: crate::cli::Config) -> anyhow::Result<()> {
     let logger = Arc::new(Logger::new(config.output_transport, config.log_level));
     let metrics = Metrics::new();
@@ -628,15 +660,18 @@ mod tests {
     use crate::cli::{CorsConfig, LogLevel, OutputTransport};
     use std::sync::atomic::Ordering;
 
+    #[allow(dead_code)]
     fn test_metrics() -> Arc<Metrics> {
         Metrics::new()
     }
 
+    #[allow(dead_code)]
     fn test_logger() -> Arc<Logger> {
         Arc::new(Logger::buffered(OutputTransport::Sse, LogLevel::Debug))
     }
 
     /// Create a gateway with a `cat` child (echoes stdin to stdout).
+    #[allow(dead_code)]
     fn make_gateway_with_child(cmd: &str) -> (SseGateway, Arc<ChildBridge>) {
         let metrics = test_metrics();
         let logger = test_logger();
@@ -656,6 +691,7 @@ mod tests {
         (gw, child)
     }
 
+    #[allow(dead_code)]
     fn make_gateway(cmd: &str) -> SseGateway {
         make_gateway_with_child(cmd).0
     }

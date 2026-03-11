@@ -1,5 +1,3 @@
-// Public API — suppress dead_code until wired up in main.rs.
-#![allow(dead_code)]
 
 //! SSE → stdio client gateway.
 //!
@@ -42,18 +40,22 @@ use crate::observe::{Logger, Metrics};
 // ─── Constants ─────────────────────────────────────────────────────
 
 /// Fallback client name for synthetic init (D-004).
+#[allow(dead_code)]
 const FALLBACK_CLIENT_NAME: &str = "supergateway";
 
 /// Error fallback code for client-mode errors.
+#[allow(dead_code)]
 pub const CLIENT_ERROR_CODE: i32 = -32000;
 
 /// Error fallback message.
+#[allow(dead_code)]
 pub const CLIENT_ERROR_MESSAGE: &str = "Internal error";
 
 // ─── Init Phase ───────────────────────────────────────────────────
 
 /// Tracks the MCP initialization handshake state.
 #[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
 enum InitPhase {
     /// No messages exchanged yet.
     Pending,
@@ -68,6 +70,7 @@ enum InitPhase {
 // ─── SSE Event Result ─────────────────────────────────────────────
 
 /// Result of processing an SSE event.
+#[allow(dead_code)]
 pub struct SseEventResult {
     /// Messages to write to stdout.
     pub stdout: Vec<RawMessage>,
@@ -80,6 +83,7 @@ pub struct SseEventResult {
 
 /// Action returned by [`SseToStdioGateway::handle_stdin_message`].
 #[derive(Debug)]
+#[allow(dead_code)]
 pub enum StdinAction {
     /// POST these messages to the endpoint.
     Post(Vec<RawMessage>),
@@ -96,6 +100,7 @@ pub enum StdinAction {
 /// SSE→stdio client gateway.
 ///
 /// Connects to a remote MCP server via SSE, bridging stdin/stdout.
+#[allow(dead_code)]
 pub struct SseToStdioGateway {
     /// Remote SSE server URL (for GET connection).
     sse_url: String,
@@ -115,8 +120,10 @@ pub struct SseToStdioGateway {
     init_pending: Mutex<Vec<RawMessage>>,
 }
 
+#[allow(dead_code)]
 impl SseToStdioGateway {
     /// Create a new SSE→stdio gateway.
+    #[allow(dead_code)]
     pub fn new(
         sse_url: String,
         protocol_version: String,
@@ -137,11 +144,13 @@ impl SseToStdioGateway {
     }
 
     /// Get the discovered endpoint URL.
+    #[allow(dead_code)]
     pub fn endpoint_url(&self) -> Option<String> {
         self.endpoint_url.lock().unwrap().clone()
     }
 
     /// Whether initialization is complete.
+    #[allow(dead_code)]
     pub fn is_initialized(&self) -> bool {
         *self.init_phase.lock().unwrap() == InitPhase::Ready
     }
@@ -149,6 +158,7 @@ impl SseToStdioGateway {
     /// Process an SSE event from the remote server.
     ///
     /// Returns messages for stdout and messages to POST to the endpoint.
+    #[allow(dead_code)]
     pub fn handle_sse_event(&self, event: &SseEvent) -> SseEventResult {
         // Handle endpoint discovery.
         if event.is_endpoint() {
@@ -243,6 +253,7 @@ impl SseToStdioGateway {
     /// Process a stdin message.
     ///
     /// Returns an action indicating what to do with the message.
+    #[allow(dead_code)]
     pub fn handle_stdin_message(&self, msg: RawMessage) -> StdinAction {
         let mut phase = self.init_phase.lock().unwrap();
 
@@ -285,6 +296,7 @@ impl SseToStdioGateway {
 /// Pattern: `/^MCP error -?\d+: /`
 ///
 /// Example: `"MCP error -32600: Invalid request"` → `"Invalid request"`
+#[allow(dead_code)]
 pub fn strip_error_prefix(message: &str) -> &str {
     let rest = match message.strip_prefix("MCP error ") {
         Some(r) => r,
@@ -315,6 +327,7 @@ pub fn strip_error_prefix(message: &str) -> &str {
 /// Used when the first stdin message is NOT an `initialize` request.
 /// Default identity: `name="supergateway"`, `version=<crate version>`.
 /// Default capabilities: `{ "roots": { "listChanged": true }, "sampling": {} }`.
+#[allow(dead_code)]
 pub fn build_fallback_init(id: &str, protocol_version: &str) -> RawMessage {
     let params = serde_json::json!({
         "protocolVersion": protocol_version,
@@ -343,6 +356,7 @@ pub fn build_fallback_init(id: &str, protocol_version: &str) -> RawMessage {
 }
 
 /// Build a `notifications/initialized` notification.
+#[allow(dead_code)]
 pub fn build_initialized_notification() -> RawMessage {
     RawMessage {
         jsonrpc: "2.0".into(),
@@ -356,6 +370,7 @@ pub fn build_initialized_notification() -> RawMessage {
 }
 
 /// Generate a unique init ID: `init_<timestamp_ms>_<random_base36_9chars>`.
+#[allow(dead_code)]
 pub fn generate_init_id() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let ts = SystemTime::now()
@@ -367,7 +382,9 @@ pub fn generate_init_id() -> String {
 }
 
 /// Generate a random base-36 string of given length using `/dev/urandom`.
+#[allow(dead_code)]
 fn random_base36(len: usize) -> String {
+    #[allow(dead_code)]
     const CHARS: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
     let mut buf = vec![0u8; len];
     if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
@@ -382,6 +399,7 @@ fn random_base36(len: usize) -> String {
 /// Intercept and modify the protocol version in an initialize request (D-014).
 ///
 /// Replaces `params.protocolVersion` with the configured version.
+#[allow(dead_code)]
 pub fn intercept_protocol_version(msg: RawMessage, version: &str) -> RawMessage {
     if !msg.is_initialize_request() {
         return msg;
@@ -411,6 +429,7 @@ pub fn intercept_protocol_version(msg: RawMessage, version: &str) -> RawMessage 
 ///
 /// Parses the opaque `error` RawValue looking for `{"code": <number>}`.
 /// Returns `None` if the message has no error field or code can't be parsed.
+#[allow(dead_code)]
 pub fn extract_error_code(msg: &RawMessage) -> Option<i32> {
     let error_raw = msg.error.as_ref()?;
     let error_val: serde_json::Value = serde_json::from_str(error_raw.get()).ok()?;
@@ -422,6 +441,7 @@ pub fn extract_error_code(msg: &RawMessage) -> Option<i32> {
 /// When `code` is `Some`, uses that error code (preserving the original).
 /// When `None`, defaults to -32000 (NOT -32603). Strips "MCP error <code>:"
 /// prefix from the message. Falls back to "Internal error" if message is empty.
+#[allow(dead_code)]
 pub fn make_error_response(
     id: Option<Box<RawValue>>,
     message: &str,
@@ -437,6 +457,7 @@ pub fn make_error_response(
 }
 
 /// Write a JSON-RPC message to stdout as a newline-delimited JSON line.
+#[allow(dead_code)]
 pub fn write_stdout(msg: &RawMessage) -> std::io::Result<()> {
     use std::io::Write;
     let json = serde_json::to_string(msg)
@@ -453,6 +474,7 @@ pub fn write_stdout(msg: &RawMessage) -> std::io::Result<()> {
 ///
 /// - `StreamEnded` (remote closed cleanly) → `process::exit(1)` for pm2/systemd restart
 /// - Transport/network errors → log at error level, return `Ok(())` to allow reconnection
+#[allow(dead_code)]
 pub fn handle_client_error(err: &crate::client::sse::SseClientError, logger: &Logger) {
     use crate::client::sse::SseClientError;
     match err {
@@ -470,6 +492,7 @@ pub fn handle_client_error(err: &crate::client::sse::SseClientError, logger: &Lo
 // ─── Entry point ────────────────────────────────────────────────────────
 
 /// Run the SSE → stdio client gateway.
+#[allow(dead_code)]
 pub async fn run(config: crate::cli::Config) -> anyhow::Result<()> {
     let logger = Arc::new(Logger::new(config.output_transport, config.log_level));
     let metrics = Metrics::new();
@@ -519,10 +542,12 @@ mod tests {
         Arc::new(Logger::buffered(OutputTransport::Stdio, LogLevel::Debug))
     }
 
+    #[allow(dead_code)]
     fn test_metrics() -> Arc<Metrics> {
         Metrics::new()
     }
 
+    #[allow(dead_code)]
     fn make_gateway() -> SseToStdioGateway {
         SseToStdioGateway::new(
             "http://localhost:8080/sse".into(),
@@ -533,6 +558,7 @@ mod tests {
         )
     }
 
+    #[allow(dead_code)]
     fn raw(s: &str) -> Box<RawValue> {
         RawValue::from_string(s.into()).unwrap()
     }

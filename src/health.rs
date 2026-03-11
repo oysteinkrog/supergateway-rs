@@ -1,11 +1,10 @@
-// Public API consumed by downstream gateway beads — suppress dead_code until wired up.
-#![allow(dead_code)]
 
 use crate::cli::LogLevel;
 use crate::observe::Metrics;
 use std::sync::Arc;
 
 /// Health check response.
+#[allow(dead_code)]
 pub enum HealthResponse {
     /// 200 OK with plain text "ok".
     Ok,
@@ -15,7 +14,9 @@ pub enum HealthResponse {
     NotReady,
 }
 
+#[allow(dead_code)]
 impl HealthResponse {
+    #[allow(dead_code)]
     pub fn status_code(&self) -> u16 {
         match self {
             Self::Ok | Self::OkDetail(_) => 200,
@@ -23,6 +24,7 @@ impl HealthResponse {
         }
     }
 
+    #[allow(dead_code)]
     pub fn content_type(&self) -> &'static str {
         match self {
             Self::Ok | Self::NotReady => "text/plain",
@@ -30,6 +32,7 @@ impl HealthResponse {
         }
     }
 
+    #[allow(dead_code)]
     pub fn body(&self) -> &str {
         match self {
             Self::Ok => "ok",
@@ -44,6 +47,7 @@ impl HealthResponse {
 /// - Returns 503 until `metrics.set_ready()` has been called.
 /// - Returns JSON detail when `detail=true` AND log level is Debug.
 /// - Otherwise returns plain text "ok".
+#[allow(dead_code)]
 pub fn check_health(
     metrics: &Arc<Metrics>,
     detail: bool,

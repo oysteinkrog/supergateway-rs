@@ -1,5 +1,3 @@
-// Public API consumed by downstream gateway beads — suppress dead_code until wired up.
-#![allow(dead_code)]
 
 use std::collections::HashMap;
 use std::fmt;
@@ -15,31 +13,40 @@ use crate::observe::Metrics;
 
 /// Newtype for session identifiers. Wraps a UUID v4 string.
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
+#[allow(dead_code)]
 pub struct SessionId(String);
 
+#[allow(dead_code)]
 impl Default for SessionId {
+    #[allow(dead_code)]
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[allow(dead_code)]
 impl SessionId {
     /// Generate a new cryptographically random session ID.
+    #[allow(dead_code)]
     pub fn new() -> Self {
         Self(Uuid::new_v4().to_string())
     }
 
+    #[allow(dead_code)]
     pub fn as_str(&self) -> &str {
         &self.0
     }
 
     /// Construct from a raw string (e.g., from an HTTP header value).
+    #[allow(dead_code)]
     pub fn from_value(s: &str) -> Self {
         Self(s.to_string())
     }
 }
 
+#[allow(dead_code)]
 impl fmt::Display for SessionId {
+    #[allow(dead_code)]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
     }
@@ -49,6 +56,7 @@ impl fmt::Display for SessionId {
 
 /// Session lifecycle: Active → Closing → Closed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum SessionState {
     /// Child alive, accepting requests.
     Active,
@@ -63,6 +71,7 @@ pub enum SessionState {
 
 /// Errors returned by session operations.
 #[derive(Debug, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum SessionError {
     /// Session not found (maps to HTTP 404).
     NotFound,
@@ -79,24 +88,31 @@ pub enum SessionError {
 /// Increments access count on creation, decrements on drop.
 /// Cancellation-safe: Drop always runs, even on task cancel.
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct SessionAccessGuard {
     counter: Arc<AtomicU64>,
 }
 
+#[allow(dead_code)]
 impl PartialEq for SessionAccessGuard {
+    #[allow(dead_code)]
     fn eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.counter, &other.counter)
     }
 }
 
+#[allow(dead_code)]
 impl SessionAccessGuard {
     /// Access count at the time of guard creation (after increment).
+    #[allow(dead_code)]
     pub fn access_count(&self) -> u64 {
         self.counter.load(Ordering::Acquire)
     }
 }
 
+#[allow(dead_code)]
 impl Drop for SessionAccessGuard {
+    #[allow(dead_code)]
     fn drop(&mut self) {
         self.counter.fetch_sub(1, Ordering::AcqRel);
     }
@@ -105,6 +121,7 @@ impl Drop for SessionAccessGuard {
 // ─── Session ────────────────────────────────────────────────────────
 
 /// Per-session state stored in the session map.
+#[allow(dead_code)]
 pub struct Session<S> {
     pub id: SessionId,
     pub state: SessionState,
@@ -126,6 +143,7 @@ pub type CleanupFn = Box<dyn Fn(&SessionId) + Send + Sync>;
 // ─── SessionManagerConfig ───────────────────────────────────────────
 
 /// Configuration for the session manager.
+#[allow(dead_code)]
 pub struct SessionManagerConfig {
     /// Maximum concurrent sessions (default: 1024).
     pub max_sessions: usize,
@@ -135,7 +153,9 @@ pub struct SessionManagerConfig {
     pub session_timeout: Option<Duration>,
 }
 
+#[allow(dead_code)]
 impl Default for SessionManagerConfig {
+    #[allow(dead_code)]
     fn default() -> Self {
         Self {
             max_sessions: 1024,
@@ -148,6 +168,7 @@ impl Default for SessionManagerConfig {
 // ─── SessionManager ─────────────────────────────────────────────────
 
 /// Shared interior state behind Arc.
+#[allow(dead_code)]
 struct Inner<S> {
     sessions: RwLock<HashMap<SessionId, Session<S>>>,
     config: SessionManagerConfig,
@@ -160,11 +181,13 @@ struct Inner<S> {
 /// Generic over `S`, the per-session state (e.g., Region handle + ChildBridge).
 /// All state-machine methods are synchronous (use `std::sync::RwLock`).
 /// Async drain/timeout futures are provided for the gateway to spawn.
+#[allow(dead_code)]
 pub struct SessionManager<S: Send + Sync + 'static> {
     inner: Arc<Inner<S>>,
 }
 
 impl<S: Send + Sync + 'static> Clone for SessionManager<S> {
+    #[allow(dead_code)]
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
@@ -173,6 +196,7 @@ impl<S: Send + Sync + 'static> Clone for SessionManager<S> {
 }
 
 impl<S: Send + Sync + 'static> SessionManager<S> {
+    #[allow(dead_code)]
     pub fn new(
         config: SessionManagerConfig,
         metrics: Arc<Metrics>,
@@ -189,6 +213,7 @@ impl<S: Send + Sync + 'static> SessionManager<S> {
     }
 
     /// Downgrade to a weak reference (for timeout timers).
+    #[allow(dead_code)]
     pub fn downgrade(&self) -> WeakSessionManager<S> {
         WeakSessionManager {
             inner: Arc::downgrade(&self.inner),
@@ -196,16 +221,19 @@ impl<S: Send + Sync + 'static> SessionManager<S> {
     }
 
     /// Number of active sessions.
+    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.inner.sessions.read().unwrap().len()
     }
 
     /// Whether the session map is empty.
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
     /// Configuration reference.
+    #[allow(dead_code)]
     pub fn config(&self) -> &SessionManagerConfig {
         &self.inner.config
     }
@@ -213,6 +241,7 @@ impl<S: Send + Sync + 'static> SessionManager<S> {
     /// Run a closure against a session's inner data (read lock).
     ///
     /// Returns `None` if the session doesn't exist.
+    #[allow(dead_code)]
     pub fn with_session<T, F>(&self, id: &SessionId, f: F) -> Option<T>
     where
         F: FnOnce(&S) -> T,
@@ -229,6 +258,7 @@ impl<S: Send + Sync + 'static> SessionManager<S> {
     ///
     /// Returns `None` if the session doesn't exist.
     /// Use this when you need a long-lived reference (e.g., for relay threads).
+    #[allow(dead_code)]
     pub fn get_inner_arc(&self, id: &SessionId) -> Option<Arc<S>> {
         self.inner
             .sessions
@@ -239,6 +269,7 @@ impl<S: Send + Sync + 'static> SessionManager<S> {
     }
 
     /// Get the state of a session.
+    #[allow(dead_code)]
     pub fn state(&self, id: &SessionId) -> Option<SessionState> {
         self.inner
             .sessions
@@ -249,6 +280,7 @@ impl<S: Send + Sync + 'static> SessionManager<S> {
     }
 
     /// Get the current access count for a session.
+    #[allow(dead_code)]
     pub fn access_count(&self, id: &SessionId) -> Option<u64> {
         self.inner
             .sessions
@@ -259,6 +291,7 @@ impl<S: Send + Sync + 'static> SessionManager<S> {
     }
 
     /// Get the current timeout generation for a session.
+    #[allow(dead_code)]
     pub fn timeout_gen(&self, id: &SessionId) -> Option<u64> {
         self.inner
             .sessions
@@ -273,12 +306,14 @@ impl<S: Send + Sync + 'static> SessionManager<S> {
     /// Create a new session in Active state. Returns the session ID.
     ///
     /// Fails with `MaxSessionsReached` if the limit is hit.
+    #[allow(dead_code)]
     pub fn create(&self, session_state: S) -> Result<SessionId, SessionError> {
         let id = SessionId::new();
         self.create_with_id(id, session_state)
     }
 
     /// Create a session with a specific ID (useful for testing).
+    #[allow(dead_code)]
     pub fn create_with_id(
         &self,
         id: SessionId,
@@ -317,6 +352,7 @@ impl<S: Send + Sync + 'static> SessionManager<S> {
     ///
     /// When transitioning from count 0→1, bumps timeout generation to
     /// invalidate any pending idle timeout timer.
+    #[allow(dead_code)]
     pub fn acquire(&self, id: &SessionId) -> Result<SessionAccessGuard, SessionError> {
         let sessions = self.inner.sessions.read().unwrap();
         let session = sessions.get(id).ok_or(SessionError::NotFound)?;
@@ -345,6 +381,7 @@ impl<S: Send + Sync + 'static> SessionManager<S> {
     /// Returns `Ok(true)` if the transition happened (Active → Closing).
     /// Returns `Ok(false)` for idempotent success (already Closing or removed).
     /// The caller should return HTTP 200 and spawn an async drain task.
+    #[allow(dead_code)]
     pub fn begin_delete(&self, id: &SessionId) -> Result<bool, SessionError> {
         let mut sessions = self.inner.sessions.write().unwrap();
 
@@ -367,6 +404,7 @@ impl<S: Send + Sync + 'static> SessionManager<S> {
     ///
     /// Called after drain timeout expires or when idle timeout fires.
     /// Transitions to Closed, removes from map, calls cleanup.
+    #[allow(dead_code)]
     pub fn complete_close(&self, id: &SessionId) {
         let removed = {
             let mut sessions = self.inner.sessions.write().unwrap();
@@ -395,6 +433,7 @@ impl<S: Send + Sync + 'static> SessionManager<S> {
     /// 3. Access count is still 0
     ///
     /// Returns true if the session was closed.
+    #[allow(dead_code)]
     pub fn try_idle_close(&self, id: &SessionId, expected_gen: u64) -> bool {
         // Read-check first to avoid write-lock contention.
         {
@@ -457,6 +496,7 @@ impl<S: Send + Sync + 'static> SessionManager<S> {
 
     /// Check if a Closing session has drained (access count == 0).
     /// If so, complete the close. Returns true if closed.
+    #[allow(dead_code)]
     pub fn try_drain_close(&self, id: &SessionId) -> bool {
         let should_cleanup = {
             let mut sessions = self.inner.sessions.write().unwrap();
@@ -490,6 +530,7 @@ impl<S: Send + Sync + 'static> SessionManager<S> {
     // ─── Clear all ──────────────────────────────────────────────────
 
     /// Remove all sessions (e.g., on shutdown). Calls cleanup for each.
+    #[allow(dead_code)]
     pub fn clear(&self) {
         let removed: Vec<SessionId> = {
             let mut sessions = self.inner.sessions.write().unwrap();
@@ -519,11 +560,13 @@ impl<S: Send + Sync + 'static> SessionManager<S> {
 /// Weak reference to a SessionManager, used by timeout timers.
 ///
 /// Prevents the timer from keeping the session manager alive.
+#[allow(dead_code)]
 pub struct WeakSessionManager<S: Send + Sync + 'static> {
     inner: Weak<Inner<S>>,
 }
 
 impl<S: Send + Sync + 'static> Clone for WeakSessionManager<S> {
+    #[allow(dead_code)]
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
@@ -533,6 +576,7 @@ impl<S: Send + Sync + 'static> Clone for WeakSessionManager<S> {
 
 impl<S: Send + Sync + 'static> WeakSessionManager<S> {
     /// Try to upgrade to a strong reference. Returns None if the manager was dropped.
+    #[allow(dead_code)]
     pub fn upgrade(&self) -> Option<SessionManager<S>> {
         self.inner.upgrade().map(|inner| SessionManager { inner })
     }
@@ -553,6 +597,7 @@ mod tests {
         SessionManager::new(config, Metrics::new(), None)
     }
 
+    #[allow(dead_code)]
     fn make_mgr_with_cleanup(
         max: usize,
         cleaned: Arc<std::sync::Mutex<Vec<String>>>,

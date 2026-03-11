@@ -1,5 +1,3 @@
-// Public API — suppress dead_code until wired up in main.rs.
-#![allow(dead_code)]
 
 //! stdio → WebSocket gateway.
 //!
@@ -57,35 +55,44 @@ use crate::session::SessionId;
 // ─── Constants ──────────────────────────────────────────────────────
 
 /// Per-client channel capacity.
+#[allow(dead_code)]
 const CLIENT_CHANNEL_CAP: usize = 256;
 
 /// Maximum early buffer size (messages before first client).
+#[allow(dead_code)]
 const EARLY_BUFFER_CAP: usize = 256;
 
 /// Backpressure timeout: disconnect client if channel full for this long.
+#[allow(dead_code)]
 const BACKPRESSURE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Maximum incoming WS text frame size (16MB — D-101).
+#[allow(dead_code)]
 const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
 
 // ─── WS close codes ────────────────────────────────────────────────
 
 /// Normal closure.
+#[allow(dead_code)]
 pub const WS_CLOSE_NORMAL: u16 = 1000;
 
 /// Policy violation (e.g., invalid session).
+#[allow(dead_code)]
 pub const WS_CLOSE_POLICY: u16 = 1008;
 
 /// Message too large.
+#[allow(dead_code)]
 pub const WS_CLOSE_TOO_LARGE: u16 = 1009;
 
 /// Internal server error (e.g., child dead).
+#[allow(dead_code)]
 pub const WS_CLOSE_INTERNAL: u16 = 1011;
 
 // ─── WS Event ──────────────────────────────────────────────────────
 
 /// An event to send over a WebSocket connection.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub enum WsEvent {
     /// JSON-RPC message (text frame).
     Message(String),
@@ -95,6 +102,7 @@ pub enum WsEvent {
 
 // ─── Internal client state ─────────────────────────────────────────
 
+#[allow(dead_code)]
 struct ClientState {
     tx: SyncSender<WsEvent>,
     /// When backpressure started (channel full). None = healthy.
@@ -114,13 +122,16 @@ struct ClientState {
 /// 1. Look up the mangled ID → (client_id, original_id)
 /// 2. Restore the original ID in the response
 /// 3. Route to the specific client
+#[allow(dead_code)]
 struct IdMultiplexer {
     next_id: AtomicU64,
     /// mangled_id → (client_id, original_id)
     pending: Mutex<HashMap<u64, (SessionId, Box<RawValue>)>>,
 }
 
+#[allow(dead_code)]
 impl IdMultiplexer {
+    #[allow(dead_code)]
     fn new() -> Self {
         Self {
             next_id: AtomicU64::new(1),
@@ -129,6 +140,7 @@ impl IdMultiplexer {
     }
 
     /// Allocate a mangled ID and register the mapping.
+    #[allow(dead_code)]
     fn mangle(&self, client_id: &SessionId, original_id: &RawValue) -> u64 {
         let mangled = self.next_id.fetch_add(1, Ordering::Relaxed);
         self.pending.lock().unwrap().insert(
@@ -139,11 +151,13 @@ impl IdMultiplexer {
     }
 
     /// Look up and remove a mangled ID. Returns (client_id, original_id).
+    #[allow(dead_code)]
     fn unmangle(&self, mangled: u64) -> Option<(SessionId, Box<RawValue>)> {
         self.pending.lock().unwrap().remove(&mangled)
     }
 
     /// Remove all pending entries for a specific client (on disconnect).
+    #[allow(dead_code)]
     fn remove_client(&self, client_id: &SessionId) {
         self.pending
             .lock()
@@ -153,6 +167,7 @@ impl IdMultiplexer {
 }
 
 /// Shared interior state behind Mutex.
+#[allow(dead_code)]
 struct Inner {
     clients: HashMap<SessionId, ClientState>,
     /// Messages buffered before first client connects. `None` after first client.
@@ -162,13 +177,16 @@ struct Inner {
 // ─── GatewayResponse ───────────────────────────────────────────────
 
 /// Framework-agnostic HTTP response (for health endpoints).
+#[allow(dead_code)]
 pub struct GatewayResponse {
     pub status: u16,
     pub headers: Vec<(String, String)>,
     pub body: String,
 }
 
+#[allow(dead_code)]
 impl GatewayResponse {
+    #[allow(dead_code)]
     fn new(status: u16, body: impl Into<String>) -> Self {
         Self {
             status,
@@ -177,11 +195,13 @@ impl GatewayResponse {
         }
     }
 
+    #[allow(dead_code)]
     fn with_header(mut self, name: &str, value: &str) -> Self {
         self.headers.push((name.to_string(), value.to_string()));
         self
     }
 
+    #[allow(dead_code)]
     fn with_headers(mut self, headers: Vec<(String, String)>) -> Self {
         self.headers.extend(headers);
         self
@@ -191,6 +211,7 @@ impl GatewayResponse {
 // ─── WsConnection ──────────────────────────────────────────────────
 
 /// Returned by [`WsGateway::handle_ws_connect`] for the caller to stream.
+#[allow(dead_code)]
 pub struct WsConnection {
     /// Client ID for this connection.
     pub client_id: SessionId,
@@ -203,6 +224,7 @@ pub struct WsConnection {
 /// stdio → WebSocket gateway.
 ///
 /// All state is behind `Arc` — cloning is cheap.
+#[allow(dead_code)]
 pub struct WsGateway {
     child: Arc<ChildBridge>,
     inner: Arc<Mutex<Inner>>,
@@ -215,7 +237,9 @@ pub struct WsGateway {
     health_endpoints: Arc<Vec<String>>,
 }
 
+#[allow(dead_code)]
 impl Clone for WsGateway {
+    #[allow(dead_code)]
     fn clone(&self) -> Self {
         Self {
             child: Arc::clone(&self.child),
@@ -231,6 +255,7 @@ impl Clone for WsGateway {
     }
 }
 
+#[allow(dead_code)]
 impl WsGateway {
     /// Create a new WebSocket gateway.
     ///
@@ -238,6 +263,7 @@ impl WsGateway {
     /// or [`spawn_relay`](Self::spawn_relay) to start the routing loop.
     ///
     /// D-105: `--header` applies to all server modes including WebSocket.
+    #[allow(dead_code)]
     pub fn new(
         child: Arc<ChildBridge>,
         cors: CorsHandler,
@@ -273,6 +299,7 @@ impl WsGateway {
     ///
     /// Returns when the child exits. The caller MUST exit the process with
     /// the returned code (or 1 if None) so pm2/systemd can restart.
+    #[allow(dead_code)]
     pub fn run_relay(&self) -> Option<i32> {
         loop {
             match self.child.recv_message() {
@@ -302,6 +329,7 @@ impl WsGateway {
     }
 
     /// Convenience: spawn the relay in a background thread.
+    #[allow(dead_code)]
     pub fn spawn_relay(&self) -> std::thread::JoinHandle<Option<i32>> {
         let gw = self.clone();
         std::thread::Builder::new()
@@ -311,6 +339,7 @@ impl WsGateway {
     }
 
     /// Route a single child stdout message to the appropriate client(s).
+    #[allow(dead_code)]
     fn route_message(&self, msg: RawMessage) {
         if msg.is_response() {
             // Response: route to specific client via mangled ID lookup
@@ -326,6 +355,7 @@ impl WsGateway {
     }
 
     /// Route a response to the specific client that sent the original request.
+    #[allow(dead_code)]
     fn route_response(&self, mut msg: RawMessage) {
         // Extract the mangled ID from the response
         let mangled_id_raw = match &msg.id {
@@ -393,6 +423,7 @@ impl WsGateway {
     }
 
     /// Broadcast a message to all connected clients.
+    #[allow(dead_code)]
     fn broadcast_message(&self, msg: RawMessage) {
         let json = match serde_json::to_string(&msg) {
             Ok(j) => j,
@@ -464,6 +495,7 @@ impl WsGateway {
     }
 
     /// Handle backpressure for a specific client (called from route_response).
+    #[allow(dead_code)]
     fn handle_backpressure(&self, state: &mut Inner, client_id: &SessionId) {
         if let Some(client) = state.clients.get_mut(client_id) {
             let now = Instant::now();
@@ -487,6 +519,7 @@ impl WsGateway {
     }
 
     /// Remove a client while holding the inner lock.
+    #[allow(dead_code)]
     fn remove_client_locked(&self, state: &mut Inner, client_id: &SessionId) {
         if state.clients.remove(client_id).is_some() {
             self.mux.remove_client(client_id);
@@ -499,6 +532,7 @@ impl WsGateway {
     }
 
     /// Close all connected clients with a close frame (D-007).
+    #[allow(dead_code)]
     fn close_all_clients(&self, code: u16, reason: &str) {
         let mut state = self.inner.lock().unwrap();
         let client_ids: Vec<SessionId> = state.clients.keys().cloned().collect();
@@ -531,6 +565,7 @@ impl WsGateway {
     /// 1. Loop on the receiver, sending events as WS text frames or close frames
     /// 2. Forward incoming WS text frames to [`handle_ws_message`](Self::handle_ws_message)
     /// 3. Call [`disconnect_client`](Self::disconnect_client) on WS close
+    #[allow(dead_code)]
     pub fn handle_ws_connect(&self) -> WsConnection {
         let client_id = SessionId::new();
         let (tx, rx) = mpsc::sync_channel(CLIENT_CHANNEL_CAP);
@@ -575,6 +610,7 @@ impl WsGateway {
     ///
     /// Parses the JSON-RPC message, mangles the ID (if present), and writes
     /// to child stdin. Returns `Err` with a close code and reason on failure.
+    #[allow(dead_code)]
     pub fn handle_ws_message(
         &self,
         client_id: &SessionId,
@@ -629,6 +665,7 @@ impl WsGateway {
     ///
     /// Must be called when the WS connection closes. Fires per-client
     /// disconnect callback (D-007).
+    #[allow(dead_code)]
     pub fn disconnect_client(&self, client_id: &SessionId) {
         let removed = {
             let mut state = self.inner.lock().unwrap();
@@ -649,6 +686,7 @@ impl WsGateway {
     /// Handle a health endpoint request. Returns `None` if path is not a health endpoint.
     ///
     /// D-002: proper if/else with early returns — only one response per request.
+    #[allow(dead_code)]
     pub fn handle_health(
         &self,
         path: &str,
@@ -676,6 +714,7 @@ impl WsGateway {
     // ─── OPTIONS handler ───────────────────────────────────────────
 
     /// Handle a CORS preflight request. Returns `None` if CORS is disabled.
+    #[allow(dead_code)]
     pub fn handle_options(&self, origin: Option<&str>) -> Option<GatewayResponse> {
         match self.cors.process("OPTIONS", origin) {
             CorsResult::Preflight(headers) => {
@@ -690,11 +729,13 @@ impl WsGateway {
     // ─── Accessors ─────────────────────────────────────────────────
 
     /// Number of connected WebSocket clients.
+    #[allow(dead_code)]
     pub fn client_count(&self) -> usize {
         self.inner.lock().unwrap().clients.len()
     }
 
     /// Check if the child process is dead.
+    #[allow(dead_code)]
     pub fn is_child_dead(&self) -> bool {
         self.child.is_dead()
     }
@@ -703,6 +744,7 @@ impl WsGateway {
     ///
     /// The caller building the HTTP 101 handshake response should call
     /// [`cors::apply_custom_headers`] with these headers.
+    #[allow(dead_code)]
     pub fn custom_headers(&self) -> &[Header] {
         &self.custom_headers
     }
@@ -711,6 +753,7 @@ impl WsGateway {
 // ─── Entry point ────────────────────────────────────────────────────────
 
 /// Run the stdio → WebSocket gateway.
+#[allow(dead_code)]
 pub async fn run(config: crate::cli::Config) -> anyhow::Result<()> {
     let logger = Arc::new(Logger::new(config.output_transport, config.log_level));
     let metrics = Metrics::new();
@@ -751,14 +794,17 @@ mod tests {
     use crate::cli::{CorsConfig, Header, LogLevel, OutputTransport};
     use std::sync::atomic::Ordering;
 
+    #[allow(dead_code)]
     fn test_metrics() -> Arc<Metrics> {
         Metrics::new()
     }
 
+    #[allow(dead_code)]
     fn test_logger() -> Arc<Logger> {
         Arc::new(Logger::buffered(OutputTransport::Ws, LogLevel::Debug))
     }
 
+    #[allow(dead_code)]
     fn make_gateway_with_child(cmd: &str) -> (WsGateway, Arc<ChildBridge>) {
         let metrics = test_metrics();
         let logger = test_logger();
@@ -776,6 +822,7 @@ mod tests {
         (gw, child)
     }
 
+    #[allow(dead_code)]
     fn make_gateway(cmd: &str) -> WsGateway {
         make_gateway_with_child(cmd).0
     }
