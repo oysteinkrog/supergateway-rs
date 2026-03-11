@@ -561,10 +561,12 @@ impl StatefulHttpGateway {
             );
         }
 
-        // 2. Validate Accept header
+        // 2. Validate Accept header — stateful Streamable HTTP requires BOTH types.
         let accept = req.header("accept").unwrap_or("");
-        if !accept.contains("application/json") && !accept.contains("text/event-stream") {
-            return GatewayResponse::from_error(&GatewayError::missing_accept());
+        if !accept.contains("application/json") || !accept.contains("text/event-stream") {
+            if !accept.contains("*/*") && accept != "*" {
+                return GatewayResponse::from_error(&GatewayError::missing_accept());
+            }
         }
 
         // 3. Body size check

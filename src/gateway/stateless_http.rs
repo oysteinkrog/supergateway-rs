@@ -471,7 +471,11 @@ impl StatelessHttpGateway {
 
         // 3. Validate Accept header
         let accept = req.header("accept").unwrap_or("");
-        if !accept.contains("application/json") && !accept.contains("text/event-stream") {
+        if !accept.contains("application/json")
+            && !accept.contains("text/event-stream")
+            && !accept.contains("*/*")
+            && accept != "*"
+        {
             return Err(GatewayError::missing_accept());
         }
 
