@@ -104,8 +104,10 @@ impl ChildBridge {
         metrics: Arc<Metrics>,
         logger: Arc<Logger>,
     ) -> Result<Self, ChildError> {
-        // SAFETY: pre_exec runs between fork and exec. setsid() is async-signal-safe
-        // per POSIX. No other operations are performed in the closure.
+        // SAFETY: pre_exec runs between fork() and exec(). The closure calls only
+        // libc::setsid(), which is async-signal-safe per POSIX. No heap allocation
+        // occurs — a static error string is used instead of format!() to avoid
+        // potential allocator deadlock if the parent held a heap lock at fork time.
         let mut child = unsafe {
             Command::new("sh")
                 .args(["-c", cmd])
@@ -113,9 +115,9 @@ impl ChildBridge {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .pre_exec(|| {
-                    nix::unistd::setsid().map_err(|e| {
-                        io::Error::other(format!("setsid: {e}"))
-                    })?;
+                    if libc::setsid() == -1 {
+                        return Err(io::Error::new(io::ErrorKind::Other, "setsid failed"));
+                    }
                     Ok(())
                 })
                 .spawn()
