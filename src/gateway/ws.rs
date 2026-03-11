@@ -37,9 +37,10 @@
 //! - D-105: Custom headers applied in WS mode (improvement over TS)
 
 use std::collections::HashMap;
+use parking_lot::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde_json::value::RawValue;
@@ -147,7 +148,7 @@ impl IdMultiplexer {
     #[allow(dead_code)]
     fn mangle(&self, client_id: &SessionId, original_id: &RawValue) -> u64 {
         let mangled = self.next_id.fetch_add(1, Ordering::Relaxed);
-        self.pending.lock().unwrap().insert(
+        self.pending.lock().insert(
             mangled,
             (client_id.clone(), original_id.to_owned()),
         );
@@ -157,7 +158,7 @@ impl IdMultiplexer {
     /// Look up and remove a mangled ID. Returns (client_id, original_id).
     #[allow(dead_code)]
     fn unmangle(&self, mangled: u64) -> Option<(SessionId, Box<RawValue>)> {
-        self.pending.lock().unwrap().remove(&mangled)
+        self.pending.lock().remove(&mangled)
     }
 
     /// Remove all pending entries for a specific client (on disconnect).
@@ -165,7 +166,6 @@ impl IdMultiplexer {
     fn remove_client(&self, client_id: &SessionId) {
         self.pending
             .lock()
-            .unwrap()
             .retain(|_, (cid, _)| cid != client_id);
     }
 }
@@ -182,6 +182,7 @@ struct Inner {
 
 /// Framework-agnostic HTTP response (for health endpoints).
 #[allow(dead_code)]
+#[derive(Debug)]
 pub struct GatewayResponse {
     pub status: u16,
     pub headers: Vec<(String, String)>,
@@ -406,7 +407,7 @@ impl WsGateway {
             }
         };
 
-        let mut state = self.inner.lock().unwrap();
+        let mut state = self.inner.lock();
         if let Some(client) = state.clients.get_mut(&client_id) {
             match client.tx.try_send(WsEvent::Message(json)) {
                 Ok(()) => {
@@ -438,7 +439,7 @@ impl WsGateway {
             }
         };
 
-        let mut state = self.inner.lock().unwrap();
+        let mut state = self.inner.lock();
 
         if state.early_buffer.is_some() && state.clients.is_empty() {
             // No clients yet — buffer the message
@@ -538,7 +539,7 @@ impl WsGateway {
     /// Close all connected clients with a close frame (D-007).
     #[allow(dead_code)]
     fn close_all_clients(&self, code: u16, reason: &str) {
-        let mut state = self.inner.lock().unwrap();
+        let mut state = self.inner.lock();
         let client_ids: Vec<SessionId> = state.clients.keys().cloned().collect();
 
         for id in &client_ids {
@@ -569,14 +570,21 @@ impl WsGateway {
     /// 1. Loop on the receiver, sending events as WS text frames or close frames
     /// 2. Forward incoming WS text frames to [`handle_ws_message`](Self::handle_ws_message)
     /// 3. Call [`disconnect_client`](Self::disconnect_client) on WS close
+    ///
+    /// Returns `Err(GatewayResponse)` with HTTP 503 if the client limit is reached (D-102).
     #[allow(dead_code)]
-    pub fn handle_ws_connect(&self) -> WsConnection {
+    pub fn handle_ws_connect(&self) -> Result<WsConnection, GatewayResponse> {
+        // Enforce max concurrent clients (D-102).
+        if self.inner.lock().clients.len() >= MAX_WS_CLIENTS {
+            return Err(GatewayResponse::new(503, "Too Many Connections"));
+        }
+
         let client_id = SessionId::new();
         let (tx, rx) = mpsc::sync_channel(CLIENT_CHANNEL_CAP);
 
         // Register client and drain early buffer
         {
-            let mut state = self.inner.lock().unwrap();
+            let mut state = self.inner.lock();
 
             if let Some(buffer) = state.early_buffer.take() {
                 // Send buffered messages to this first client
@@ -602,10 +610,10 @@ impl WsGateway {
         self.logger
             .info(&format!("WS client connected: client={client_id}"));
 
-        WsConnection {
+        Ok(WsConnection {
             client_id,
             receiver: rx,
-        }
+        })
     }
 
     // ─── WS message handler ────────────────────────────────────────
@@ -672,7 +680,7 @@ impl WsGateway {
     #[allow(dead_code)]
     pub fn disconnect_client(&self, client_id: &SessionId) {
         let removed = {
-            let mut state = self.inner.lock().unwrap();
+            let mut state = self.inner.lock();
             state.clients.remove(client_id).is_some()
         };
 
@@ -739,7 +747,7 @@ impl WsGateway {
     /// Number of connected WebSocket clients.
     #[allow(dead_code)]
     pub fn client_count(&self) -> usize {
-        self.inner.lock().unwrap().clients.len()
+        self.inner.lock().clients.len()
     }
 
     /// Check if the child process is dead.
@@ -840,8 +848,8 @@ mod tests {
     #[test]
     fn connect_assigns_unique_client_ids() {
         let gw = make_gateway("cat");
-        let conn1 = gw.handle_ws_connect();
-        let conn2 = gw.handle_ws_connect();
+        let conn1 = gw.handle_ws_connect().unwrap();
+        let conn2 = gw.handle_ws_connect().unwrap();
         assert_ne!(conn1.client_id, conn2.client_id);
         assert_eq!(gw.client_count(), 2);
     }
@@ -849,7 +857,7 @@ mod tests {
     #[test]
     fn connect_increments_metrics() {
         let gw = make_gateway("cat");
-        let _conn = gw.handle_ws_connect();
+        let _conn = gw.handle_ws_connect().unwrap();
         assert_eq!(gw.metrics.active_clients.load(Ordering::Relaxed), 1);
     }
 
@@ -858,7 +866,7 @@ mod tests {
     #[test]
     fn disconnect_removes_client() {
         let gw = make_gateway("cat");
-        let conn = gw.handle_ws_connect();
+        let conn = gw.handle_ws_connect().unwrap();
         assert_eq!(gw.client_count(), 1);
 
         gw.disconnect_client(&conn.client_id);
@@ -868,7 +876,7 @@ mod tests {
     #[test]
     fn disconnect_idempotent() {
         let gw = make_gateway("cat");
-        let conn = gw.handle_ws_connect();
+        let conn = gw.handle_ws_connect().unwrap();
 
         gw.disconnect_client(&conn.client_id);
         gw.disconnect_client(&conn.client_id); // no panic
@@ -878,15 +886,15 @@ mod tests {
     #[test]
     fn disconnect_cleans_up_mux_entries() {
         let gw = make_gateway("cat");
-        let conn = gw.handle_ws_connect();
+        let conn = gw.handle_ws_connect().unwrap();
 
         // Simulate a request being mangled
         let raw_id = RawValue::from_string("42".into()).unwrap();
         let mangled = gw.mux.mangle(&conn.client_id, &raw_id);
-        assert!(gw.mux.pending.lock().unwrap().contains_key(&mangled));
+        assert!(gw.mux.pending.lock().contains_key(&mangled));
 
         gw.disconnect_client(&conn.client_id);
-        assert!(gw.mux.pending.lock().unwrap().is_empty());
+        assert!(gw.mux.pending.lock().is_empty());
     }
 
     // ─── ID Multiplexer (D-001) ───────────────────────────────────
@@ -961,7 +969,7 @@ mod tests {
 
         mux.remove_client(&client_a);
         // client_a's entries removed, client_b's remain
-        assert_eq!(mux.pending.lock().unwrap().len(), 1);
+        assert_eq!(mux.pending.lock().len(), 1);
         assert!(mux.unmangle(mb).is_some());
     }
 
@@ -970,7 +978,7 @@ mod tests {
     #[test]
     fn handle_message_valid_request() {
         let gw = make_gateway("cat");
-        let conn = gw.handle_ws_connect();
+        let conn = gw.handle_ws_connect().unwrap();
 
         let result = gw.handle_ws_message(
             &conn.client_id,
@@ -982,7 +990,7 @@ mod tests {
     #[test]
     fn handle_message_notification() {
         let gw = make_gateway("cat");
-        let conn = gw.handle_ws_connect();
+        let conn = gw.handle_ws_connect().unwrap();
 
         let result = gw.handle_ws_message(
             &conn.client_id,
@@ -994,7 +1002,7 @@ mod tests {
     #[test]
     fn handle_message_invalid_json_keeps_connection() {
         let gw = make_gateway("cat");
-        let conn = gw.handle_ws_connect();
+        let conn = gw.handle_ws_connect().unwrap();
 
         // Invalid JSON should NOT close the connection (match TS behavior)
         let result = gw.handle_ws_message(&conn.client_id, "not json!");
@@ -1005,7 +1013,7 @@ mod tests {
     #[test]
     fn handle_message_too_large() {
         let gw = make_gateway("cat");
-        let conn = gw.handle_ws_connect();
+        let conn = gw.handle_ws_connect().unwrap();
 
         let big = "x".repeat(MAX_FRAME_SIZE + 1);
         let result = gw.handle_ws_message(&conn.client_id, &big);
@@ -1017,7 +1025,7 @@ mod tests {
     #[test]
     fn handle_message_batch() {
         let gw = make_gateway("cat");
-        let conn = gw.handle_ws_connect();
+        let conn = gw.handle_ws_connect().unwrap();
 
         let result = gw.handle_ws_message(
             &conn.client_id,
@@ -1038,7 +1046,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         }
 
-        let conn = gw.handle_ws_connect();
+        let conn = gw.handle_ws_connect().unwrap();
         let result = gw.handle_ws_message(
             &conn.client_id,
             r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#,
@@ -1053,7 +1061,7 @@ mod tests {
     #[test]
     fn relay_roundtrip_routes_response_to_correct_client() {
         let (gw, child) = make_gateway_with_child("cat");
-        let conn = gw.handle_ws_connect();
+        let conn = gw.handle_ws_connect().unwrap();
 
         // Start relay
         let relay_gw = gw.clone();
@@ -1092,7 +1100,7 @@ mod tests {
 
         // Manually insert buffered messages
         {
-            let mut state = gw.inner.lock().unwrap();
+            let mut state = gw.inner.lock();
             let buf = state.early_buffer.as_mut().unwrap();
             let msg1: RawMessage =
                 serde_json::from_str(r#"{"jsonrpc":"2.0","method":"notif1"}"#).unwrap();
@@ -1102,7 +1110,7 @@ mod tests {
             buf.push(msg2);
         }
 
-        let conn = gw.handle_ws_connect();
+        let conn = gw.handle_ws_connect().unwrap();
 
         let msg1 = conn.receiver.try_recv().unwrap();
         match msg1 {
@@ -1116,7 +1124,7 @@ mod tests {
         }
 
         // Early buffer should be None now
-        assert!(gw.inner.lock().unwrap().early_buffer.is_none());
+        assert!(gw.inner.lock().early_buffer.is_none());
     }
 
     // ─── Broadcast to multiple clients ────────────────────────────
@@ -1125,8 +1133,8 @@ mod tests {
     fn broadcast_to_multiple_clients() {
         let (gw, child) = make_gateway_with_child("cat");
 
-        let conn1 = gw.handle_ws_connect();
-        let conn2 = gw.handle_ws_connect();
+        let conn1 = gw.handle_ws_connect().unwrap();
+        let conn2 = gw.handle_ws_connect().unwrap();
         assert_eq!(gw.client_count(), 2);
 
         // Start relay
@@ -1234,7 +1242,7 @@ mod tests {
             vec![],
         );
 
-        let conn = gw.handle_ws_connect();
+        let conn = gw.handle_ws_connect().unwrap();
         assert_eq!(metrics.active_clients.load(Ordering::Relaxed), 1);
 
         gw.disconnect_client(&conn.client_id);
@@ -1245,7 +1253,7 @@ mod tests {
     #[test]
     fn metrics_total_requests_on_message() {
         let gw = make_gateway("cat");
-        let conn = gw.handle_ws_connect();
+        let conn = gw.handle_ws_connect().unwrap();
 
         let _ = gw.handle_ws_message(
             &conn.client_id,
@@ -1262,7 +1270,7 @@ mod tests {
         let mut connections = Vec::new();
 
         for _ in 0..20 {
-            let conn = gw.handle_ws_connect();
+            let conn = gw.handle_ws_connect().unwrap();
             connections.push(conn);
         }
         assert_eq!(gw.client_count(), 20);
@@ -1278,8 +1286,8 @@ mod tests {
     #[test]
     fn close_all_sends_close_frames() {
         let gw = make_gateway("cat");
-        let conn1 = gw.handle_ws_connect();
-        let conn2 = gw.handle_ws_connect();
+        let conn1 = gw.handle_ws_connect().unwrap();
+        let conn2 = gw.handle_ws_connect().unwrap();
         assert_eq!(gw.client_count(), 2);
 
         gw.close_all_clients(WS_CLOSE_INTERNAL, "test");
@@ -1297,5 +1305,22 @@ mod tests {
         assert!(matches!(evt2, WsEvent::Close(WS_CLOSE_INTERNAL, _)));
 
         assert_eq!(gw.client_count(), 0);
+    }
+
+    // ─── Max clients ─────────────────────────────────────────────────
+
+    #[test]
+    fn max_clients_returns_503() {
+        let gw = make_gateway("cat");
+        let mut connections = Vec::new();
+        for _ in 0..MAX_WS_CLIENTS {
+            connections.push(gw.handle_ws_connect().unwrap());
+        }
+        assert_eq!(gw.client_count(), MAX_WS_CLIENTS);
+
+        match gw.handle_ws_connect() {
+            Err(resp) => assert_eq!(resp.status, 503),
+            Ok(_) => panic!("expected 503, but connect succeeded"),
+        }
     }
 }

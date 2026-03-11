@@ -26,7 +26,9 @@
 
 use std::collections::HashMap;
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+
+use parking_lot::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::child::ChildBridge;
@@ -253,7 +255,7 @@ impl SseGateway {
                             }
                         };
 
-                        let mut state = self.inner.lock().unwrap();
+                        let mut state = self.inner.lock();
 
                         if state.early_buffer.is_some() && state.clients.is_empty() {
                             // No clients yet — buffer the message
@@ -382,7 +384,7 @@ impl SseGateway {
 
         // Register client and drain early buffer
         {
-            let mut state = self.inner.lock().unwrap();
+            let mut state = self.inner.lock();
 
             if let Some(buffer) = state.early_buffer.take() {
                 for json in buffer {
@@ -429,7 +431,7 @@ impl SseGateway {
     #[allow(dead_code)]
     pub fn disconnect_client(&self, id: &SessionId) {
         let removed = {
-            let mut state = self.inner.lock().unwrap();
+            let mut state = self.inner.lock();
             state.clients.remove(id).is_some()
         };
 
@@ -473,7 +475,7 @@ impl SseGateway {
 
         // Validate session exists
         {
-            let state = self.inner.lock().unwrap();
+            let state = self.inner.lock();
             if !state
                 .clients
                 .contains_key(&SessionId::from_value(session_id_str))
@@ -608,7 +610,7 @@ impl SseGateway {
     /// Number of connected SSE clients.
     #[allow(dead_code)]
     pub fn client_count(&self) -> usize {
-        self.inner.lock().unwrap().clients.len()
+        self.inner.lock().clients.len()
     }
 
     /// Check if the child process is dead.
@@ -940,7 +942,7 @@ mod tests {
 
         // Simulate buffered messages by manually inserting into early_buffer
         {
-            let mut state = gw.inner.lock().unwrap();
+            let mut state = gw.inner.lock();
             let buf = state.early_buffer.as_mut().unwrap();
             buf.push(r#"{"jsonrpc":"2.0","method":"notif1"}"#.to_string());
             buf.push(r#"{"jsonrpc":"2.0","method":"notif2"}"#.to_string());
@@ -966,7 +968,7 @@ mod tests {
         }
 
         // Early buffer should be None now
-        assert!(gw.inner.lock().unwrap().early_buffer.is_none());
+        assert!(gw.inner.lock().early_buffer.is_none());
     }
 
     // ─── Broadcast to multiple clients ──────────────────────────────
