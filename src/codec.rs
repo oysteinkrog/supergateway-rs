@@ -75,21 +75,29 @@ impl<R: Read> StdoutCodec<R> {
             }
 
             if let Some(pos) = available.iter().position(|&b| b == b'\n') {
+                if self.buf.len() + pos >= self.max_buffer {
+                    return Err(CodecError::BufferOverflow {
+                        size: self.buf.len() + pos,
+                        limit: self.max_buffer,
+                    });
+                }
                 self.buf.extend_from_slice(&available[..pos]);
                 self.reader.consume(pos + 1);
                 return Ok(Some(std::mem::take(&mut self.buf)));
             }
 
             let len = available.len();
-            self.buf.extend_from_slice(available);
-            self.reader.consume(len);
 
-            if self.buf.len() > self.max_buffer {
+            // Pre-check before allocation to avoid Vec realloc doubling peak usage.
+            if self.buf.len() + len >= self.max_buffer {
                 return Err(CodecError::BufferOverflow {
-                    size: self.buf.len(),
+                    size: self.buf.len() + len,
                     limit: self.max_buffer,
                 });
             }
+
+            self.buf.extend_from_slice(available);
+            self.reader.consume(len);
         }
     }
 
