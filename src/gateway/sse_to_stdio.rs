@@ -493,10 +493,13 @@ pub async fn run(config: crate::cli::Config) -> anyhow::Result<()> {
 
     // TODO: Wire up SSE client connection + stdin/stdout bridge (upcoming bead)
     // The event loop should:
-    //   1. Connect to SSE URL, read events, dispatch via handle_sse_event
-    //   2. On SseClientError::StreamEnded → handle_client_error (exits with code 1)
-    //   3. On transport errors → handle_client_error (logs, allows reconnect)
-    //   4. On signal → falls through to clean exit(0) below
+    //   1. Connect via http_client.get_stream(url, "text/event-stream",
+    //      Some(parser.last_event_id()).filter(|id| !id.is_empty()))
+    //      — pass Last-Event-ID on reconnect so the server can resume the stream (D-013)
+    //   2. Feed chunks to SseParser::feed(), dispatch events via handle_sse_event
+    //   3. On SseClientError::StreamEnded → handle_client_error (exits with code 1)
+    //   4. On transport errors → handle_client_error (logs), backoff via ReconnectState, reconnect
+    //   5. On signal → falls through to clean exit(0) below
 
     // Block until signal (SIGINT/SIGTERM/SIGHUP)
     let sig = shutdown.wait();

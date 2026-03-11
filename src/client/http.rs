@@ -198,13 +198,20 @@ impl HttpClient {
     ///
     /// Follows up to 5 redirects. Used for SSE endpoints where the body
     /// is read incrementally as events arrive.
+    ///
+    /// If `last_event_id` is `Some(id)` and non-empty, the `Last-Event-ID`
+    /// header is added to support SSE reconnection (D-013).
     pub async fn get_stream(
         &self,
         url: &str,
         accept: &str,
+        last_event_id: Option<&str>,
     ) -> Result<HttpStreamResponse, HttpClientError> {
         let mut headers = self.build_headers();
         headers.push(("Accept".to_owned(), accept.to_owned()));
+        if let Some(id) = last_event_id.filter(|id| !id.is_empty()) {
+            headers.push(("Last-Event-ID".to_owned(), id.to_owned()));
+        }
 
         let resp = self
             .get_with_redirects_streaming(url, headers, 0)
