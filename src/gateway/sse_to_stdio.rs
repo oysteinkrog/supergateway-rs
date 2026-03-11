@@ -407,18 +407,33 @@ pub fn intercept_protocol_version(msg: RawMessage, version: &str) -> RawMessage 
     msg
 }
 
+/// Extract the error code from a JSON-RPC error response's `error` field.
+///
+/// Parses the opaque `error` RawValue looking for `{"code": <number>}`.
+/// Returns `None` if the message has no error field or code can't be parsed.
+pub fn extract_error_code(msg: &RawMessage) -> Option<i32> {
+    let error_raw = msg.error.as_ref()?;
+    let error_val: serde_json::Value = serde_json::from_str(error_raw.get()).ok()?;
+    error_val.get("code")?.as_i64().map(|c| c as i32)
+}
+
 /// Build a client-mode error response.
 ///
-/// Uses error code -32000 (NOT -32603). Strips "MCP error <code>:" prefix
-/// from the message. Falls back to "Internal error" if message is empty.
-pub fn make_error_response(id: Option<Box<RawValue>>, message: &str) -> RawMessage {
+/// When `code` is `Some`, uses that error code (preserving the original).
+/// When `None`, defaults to -32000 (NOT -32603). Strips "MCP error <code>:"
+/// prefix from the message. Falls back to "Internal error" if message is empty.
+pub fn make_error_response(
+    id: Option<Box<RawValue>>,
+    message: &str,
+    code: Option<i32>,
+) -> RawMessage {
     let stripped = strip_error_prefix(message);
     let msg = if stripped.is_empty() {
         CLIENT_ERROR_MESSAGE
     } else {
         stripped
     };
-    RawMessage::error_response(id, CLIENT_ERROR_CODE, msg)
+    RawMessage::error_response(id, code.unwrap_or(CLIENT_ERROR_CODE), msg)
 }
 
 /// Write a JSON-RPC message to stdout as a newline-delimited JSON line.
@@ -662,6 +677,7 @@ mod tests {
         let resp = make_error_response(
             Some(raw("5")),
             "MCP error -32600: Invalid request",
+            None,
         );
         assert!(resp.is_response());
         assert_eq!(resp.id.as_ref().unwrap().get(), "5");
@@ -673,14 +689,14 @@ mod tests {
 
     #[test]
     fn error_response_fallback_message() {
-        let resp = make_error_response(Some(raw("1")), "");
+        let resp = make_error_response(Some(raw("1")), "", None);
         let s = serde_json::to_string(&resp).unwrap();
         assert!(s.contains(CLIENT_ERROR_MESSAGE));
     }
 
     #[test]
     fn error_response_no_prefix() {
-        let resp = make_error_response(Some(raw("1")), "custom error");
+        let resp = make_error_response(Some(raw("1")), "custom error", None);
         let s = serde_json::to_string(&resp).unwrap();
         assert!(s.contains("custom error"));
         assert!(s.contains("-32000"));
@@ -688,8 +704,50 @@ mod tests {
 
     #[test]
     fn error_response_null_id() {
-        let resp = make_error_response(None, "fail");
+        let resp = make_error_response(None, "fail", None);
         assert_eq!(resp.id.as_ref().unwrap().get(), "null");
+    }
+
+    #[test]
+    fn error_response_preserves_original_code() {
+        let resp = make_error_response(
+            Some(raw("5")),
+            "Method not found",
+            Some(-32601),
+        );
+        let s = serde_json::to_string(&resp).unwrap();
+        assert!(s.contains("-32601"));
+        assert!(s.contains("Method not found"));
+        assert!(!s.contains("-32000"));
+    }
+
+    // ─── extract_error_code ──────────────────────────────────────
+
+    #[test]
+    fn extract_code_from_error_response() {
+        let msg: RawMessage = serde_json::from_str(
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"Method not found"}}"#,
+        )
+        .unwrap();
+        assert_eq!(extract_error_code(&msg), Some(-32601));
+    }
+
+    #[test]
+    fn extract_code_no_error_field() {
+        let msg: RawMessage = serde_json::from_str(
+            r#"{"jsonrpc":"2.0","id":1,"result":{}}"#,
+        )
+        .unwrap();
+        assert_eq!(extract_error_code(&msg), None);
+    }
+
+    #[test]
+    fn extract_code_malformed_error() {
+        let msg: RawMessage = serde_json::from_str(
+            r#"{"jsonrpc":"2.0","id":1,"error":{"message":"no code"}}"#,
+        )
+        .unwrap();
+        assert_eq!(extract_error_code(&msg), None);
     }
 
     // ─── handle_sse_event: endpoint discovery ─────────────────────
