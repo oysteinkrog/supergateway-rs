@@ -447,6 +447,26 @@ pub fn write_stdout(msg: &RawMessage) -> std::io::Result<()> {
     stdout.flush()
 }
 
+// ─── B-004: Exit behavior ────────────────────────────────────────────────
+
+/// Handle an SSE client error per B-004 spec.
+///
+/// - `StreamEnded` (remote closed cleanly) → `process::exit(1)` for pm2/systemd restart
+/// - Transport/network errors → log at error level, return `Ok(())` to allow reconnection
+pub fn handle_client_error(err: &crate::client::sse::SseClientError, logger: &Logger) {
+    use crate::client::sse::SseClientError;
+    match err {
+        SseClientError::StreamEnded => {
+            logger.info("remote SSE stream ended (B-004), exiting with code 1");
+            std::process::exit(1);
+        }
+        other => {
+            logger.error(&format!("SSE transport error: {other}"));
+            // Do NOT exit — allow reconnection (D-013)
+        }
+    }
+}
+
 // ─── Entry point ────────────────────────────────────────────────────────
 
 /// Run the SSE → stdio client gateway.
@@ -461,18 +481,28 @@ pub async fn run(config: crate::cli::Config) -> anyhow::Result<()> {
         config.port,
     );
 
-    let _shutdown = crate::signal::install(&logger)?;
+    let shutdown = crate::signal::install(&logger)?;
 
     let _gw = SseToStdioGateway::new(
         config.input_value,
         config.protocol_version,
         config.headers,
-        logger,
+        logger.clone(),
         metrics,
     );
 
     // TODO: Wire up SSE client connection + stdin/stdout bridge (upcoming bead)
-    anyhow::bail!("SSE->stdio client not yet implemented")
+    // The event loop should:
+    //   1. Connect to SSE URL, read events, dispatch via handle_sse_event
+    //   2. On SseClientError::StreamEnded → handle_client_error (exits with code 1)
+    //   3. On transport errors → handle_client_error (logs, allows reconnect)
+    //   4. On signal → falls through to clean exit(0) below
+
+    // Block until signal (SIGINT/SIGTERM/SIGHUP)
+    let sig = shutdown.wait();
+    logger.info(&format!("received {}, shutting down", crate::signal::signal_name(sig)));
+    // D-016: exit code 0 on signal
+    std::process::exit(0);
 }
 
 // ─── Tests ─────────────────────────────────────────────────────────

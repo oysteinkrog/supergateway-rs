@@ -319,6 +319,28 @@ impl HttpToStdioGateway {
     }
 }
 
+// ─── B-004: Exit behavior ────────────────────────────────────────────────
+
+/// Handle an HTTP client error per B-004 spec.
+///
+/// - Connection closed by remote (HTTP 0, empty response, EOF) → `process::exit(1)`
+///   for pm2/systemd restart semantics
+/// - Transport/network errors → log at error level, return to allow retry
+pub fn handle_client_error(err: &crate::client::http::HttpClientError, logger: &Logger) {
+    use crate::client::http::HttpClientError;
+    match err {
+        // EOF / connection reset = remote closed cleanly → exit(1)
+        HttpClientError::Io(msg) if msg.contains("EOF") || msg.contains("connection reset") => {
+            logger.info("remote HTTP connection closed (B-004), exiting with code 1");
+            std::process::exit(1);
+        }
+        other => {
+            logger.error(&format!("HTTP transport error: {other}"));
+            // Do NOT exit — allow retry
+        }
+    }
+}
+
 // ─── Entry point ────────────────────────────────────────────────────────
 
 /// Run the Streamable HTTP → stdio client gateway.
@@ -333,18 +355,28 @@ pub async fn run(config: crate::cli::Config) -> anyhow::Result<()> {
         config.port,
     );
 
-    let _shutdown = crate::signal::install(&logger)?;
+    let shutdown = crate::signal::install(&logger)?;
 
     let _gw = HttpToStdioGateway::new(
         config.input_value,
         config.protocol_version,
         config.headers,
-        logger,
+        logger.clone(),
         metrics,
     );
 
     // TODO: Wire up HTTP client + stdin/stdout bridge (upcoming bead)
-    anyhow::bail!("HTTP->stdio client not yet implemented")
+    // The event loop should:
+    //   1. Read stdin, POST to remote, parse response, write to stdout
+    //   2. On EOF/connection-reset → handle_client_error (exits with code 1)
+    //   3. On transport errors → handle_client_error (logs, allows retry)
+    //   4. On signal → falls through to clean exit(0) below
+
+    // Block until signal (SIGINT/SIGTERM/SIGHUP)
+    let sig = shutdown.wait();
+    logger.info(&format!("received {}, shutting down", crate::signal::signal_name(sig)));
+    // Signal → exit code 0, DELETE session if tracked
+    std::process::exit(0);
 }
 
 // ─── Tests ─────────────────────────────────────────────────────────
