@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::value::RawValue;
 
@@ -40,6 +41,9 @@ pub struct RawMessage {
 
     /// Extension fields not part of the core JSON-RPC spec (e.g. `_meta`).
     /// Captured via flatten to preserve protocol transparency on round-trip.
+    ///
+    /// Uses `serde_json::Value` intentionally — `#[serde(flatten)]` requires buffered
+    /// deserialization which is incompatible with `Box<RawValue>`.
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
 }
@@ -168,6 +172,9 @@ pub fn parse_line(line: &str) -> Result<Parsed, serde_json::Error> {
     match first {
         Some(b'[') => {
             let batch: Vec<RawMessage> = serde_json::from_str(line)?;
+            if batch.is_empty() {
+                return Err(serde_json::Error::custom("empty batch not allowed"));
+            }
             Ok(Parsed::Batch(batch))
         }
         _ => {
@@ -396,6 +403,11 @@ mod tests {
     fn parse_malformed_returns_error() {
         assert!(parse_line("not json at all").is_err());
         assert!(parse_line("").is_err());
+    }
+
+    #[test]
+    fn parse_empty_batch_returns_error() {
+        assert!(parse_line("[]").is_err());
     }
 
     #[test]
