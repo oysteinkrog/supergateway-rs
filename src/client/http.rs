@@ -172,7 +172,7 @@ impl HttpClient {
             pool_config,
             // We handle redirects per-method, so disable automatic redirects.
             redirect_policy: RedirectPolicy::None,
-            user_agent: Some("supergateway-rs/0.1".into()),
+            user_agent: Some(format!("supergateway-rs/{}", env!("CARGO_PKG_VERSION"))),
         };
 
         let custom_headers: Vec<(String, String)> = headers
@@ -200,6 +200,7 @@ impl HttpClient {
     ) -> Result<HttpResponse, HttpClientError> {
         let mut headers = self.build_headers();
         headers.push(("Content-Type".to_owned(), content_type.to_owned()));
+        headers.push(("Accept".to_owned(), "application/json, text/event-stream".to_owned()));
 
         let resp = self
             .inner
@@ -274,6 +275,7 @@ impl HttpClient {
     ) -> Result<HttpStreamResponse, HttpClientError> {
         let mut headers = self.build_headers();
         headers.push(("Content-Type".to_owned(), content_type.to_owned()));
+        headers.push(("Accept".to_owned(), "application/json, text/event-stream".to_owned()));
 
         let resp = self
             .inner
