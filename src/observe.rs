@@ -70,9 +70,16 @@ impl Metrics {
     }
 
     /// Decrement a gauge counter and log the change at info level.
+    ///
+    /// Uses `fetch_update` with saturating subtraction to prevent u64 underflow
+    /// if the counter is already zero.
     #[allow(dead_code)]
     pub fn dec_and_log(counter: &AtomicU64, name: &str, logger: &Logger) {
-        let prev = counter.fetch_sub(1, Ordering::Relaxed);
+        let prev = counter
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
+                Some(v.saturating_sub(1))
+            })
+            .unwrap_or(0);
         let new = prev.saturating_sub(1);
         logger.info(&format!("{name}={new} (-1)"));
     }
@@ -116,7 +123,7 @@ impl Metrics {
             self.backpressure_events.load(Ordering::Relaxed),
             self.queue_depth_max.load(Ordering::Relaxed),
             self.decode_errors.load(Ordering::Relaxed),
-            self.ready.load(Ordering::Relaxed),
+            self.ready.load(Ordering::Acquire),
         )
     }
 }
