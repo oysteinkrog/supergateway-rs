@@ -361,6 +361,10 @@ fn parse_cors(raw: Option<Vec<String>>) -> CorsConfig {
         None => CorsConfig::Disabled,
         Some(origins) if origins.is_empty() => CorsConfig::Wildcard,
         Some(origins) => {
+            // TS parity: --cors "*" means wildcard, same as --cors with no values.
+            if origins.iter().any(|o| o == "*") {
+                return CorsConfig::Wildcard;
+            }
             let parsed = origins
                 .into_iter()
                 .map(|o| {

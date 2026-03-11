@@ -40,7 +40,7 @@ pub struct RawMessage {
     /// Extension fields not part of the core JSON-RPC spec (e.g. `_meta`).
     /// Captured via flatten to preserve protocol transparency on round-trip.
     #[serde(flatten)]
-    pub extra: HashMap<String, Box<RawValue>>,
+    pub extra: HashMap<String, serde_json::Value>,
 }
 
 impl Default for RawMessage {
@@ -335,7 +335,7 @@ mod tests {
         assert!(msg.is_request());
         // Extension field must be captured in extra
         assert!(msg.extra.contains_key("_meta"));
-        assert_eq!(msg.extra["_meta"].get(), r#"{"token":"x"}"#);
+        let meta = &msg.extra["_meta"]; assert_eq!(meta["token"], serde_json::json!("x"));
         // Roundtrip: extension fields survive serialization
         let reserialized = serde_json::to_string(&msg).unwrap();
         assert!(reserialized.contains(r#""_meta":{"token":"x"}"#));
