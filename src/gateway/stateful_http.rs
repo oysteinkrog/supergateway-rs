@@ -1,5 +1,3 @@
-// Public API — suppress dead_code until wired up in main.rs.
-#![allow(dead_code)]
 
 //! stdio → Streamable HTTP (stateful) gateway.
 //!
@@ -22,7 +20,7 @@
 //! then return an SSE batch response. The GET SSE stream requires lower-level
 //! streaming beyond asupersync's batch-only `Sse` type — see [`SseWriter`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, RwLock};
@@ -85,7 +83,7 @@ pub struct SessionData {
 
     /// Notification buffer: stores notifications received before init response.
     /// Flushed to the GET SSE stream once init completes.
-    notification_buffer: Mutex<Vec<RawMessage>>,
+    notification_buffer: Mutex<VecDeque<RawMessage>>,
 
     /// Whether a GET SSE stream is connected (only one allowed per session).
     has_sse_stream: AtomicBool,
@@ -119,7 +117,7 @@ impl SessionData {
             notification_tx,
             notification_rx: Mutex::new(Some(notification_rx)),
             init_done: AtomicBool::new(false),
-            notification_buffer: Mutex::new(Vec::new()),
+            notification_buffer: Mutex::new(VecDeque::new()),
             has_sse_stream: AtomicBool::new(false),
             child_failed: AtomicBool::new(false),
             logger,
@@ -170,9 +168,9 @@ impl SessionData {
             let mut buf = self.notification_buffer.lock().unwrap();
             if buf.len() >= INIT_NOTIFICATION_BUFFER_CAP {
                 self.logger.info("notification buffer full during init, discarding oldest");
-                buf.remove(0);
+                buf.pop_front();
             }
-            buf.push(msg);
+            buf.push_back(msg);
             return;
         }
 
@@ -192,7 +190,7 @@ impl SessionData {
     fn mark_init_done(&self) {
         self.init_done.store(true, Ordering::Release);
 
-        let buffered: Vec<RawMessage> = {
+        let buffered: VecDeque<RawMessage> = {
             let mut buf = self.notification_buffer.lock().unwrap();
             std::mem::take(&mut *buf)
         };
