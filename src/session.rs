@@ -32,6 +32,11 @@ impl SessionId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Construct from a raw string (e.g., from an HTTP header value).
+    pub fn from_value(s: &str) -> Self {
+        Self(s.to_string())
+    }
 }
 
 impl fmt::Display for SessionId {
@@ -109,7 +114,8 @@ pub struct Session<S> {
     /// Bumped on every 0→non-zero transition to invalidate pending timers.
     pub timeout_gen: Arc<AtomicU64>,
     /// Session-specific state (e.g., Region handle, ChildBridge).
-    pub inner: S,
+    /// Wrapped in Arc so relay threads can hold long-lived references.
+    pub inner: Arc<S>,
 }
 
 // ─── Cleanup callback ───────────────────────────────────────────────
@@ -204,6 +210,34 @@ impl<S: Send + Sync + 'static> SessionManager<S> {
         &self.inner.config
     }
 
+    /// Run a closure against a session's inner data (read lock).
+    ///
+    /// Returns `None` if the session doesn't exist.
+    pub fn with_session<T, F>(&self, id: &SessionId, f: F) -> Option<T>
+    where
+        F: FnOnce(&S) -> T,
+    {
+        self.inner
+            .sessions
+            .read()
+            .unwrap()
+            .get(id)
+            .map(|s| f(&*s.inner))
+    }
+
+    /// Get a cloned `Arc<S>` for a session's inner data.
+    ///
+    /// Returns `None` if the session doesn't exist.
+    /// Use this when you need a long-lived reference (e.g., for relay threads).
+    pub fn get_inner_arc(&self, id: &SessionId) -> Option<Arc<S>> {
+        self.inner
+            .sessions
+            .read()
+            .unwrap()
+            .get(id)
+            .map(|s| Arc::clone(&s.inner))
+    }
+
     /// Get the state of a session.
     pub fn state(&self, id: &SessionId) -> Option<SessionState> {
         self.inner
@@ -261,7 +295,7 @@ impl<S: Send + Sync + 'static> SessionManager<S> {
             state: SessionState::Active,
             access_count: Arc::new(AtomicU64::new(0)),
             timeout_gen: Arc::new(AtomicU64::new(0)),
-            inner: session_state,
+            inner: Arc::new(session_state),
         };
 
         sessions.insert(id.clone(), session);

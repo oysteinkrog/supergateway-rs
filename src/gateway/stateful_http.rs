@@ -980,25 +980,7 @@ impl StatefulHttpGateway {
     where
         F: FnOnce(&SessionData) -> T,
     {
-        // Access sessions through the manager's internal read lock.
-        // This is safe because we only hold the lock briefly.
-        //
-        // NOTE: This accesses the sessions field directly through the
-        // SessionManager's public API. Since SessionManager doesn't expose
-        // a with_session method, we use acquire() to validate the session
-        // exists and then access the data through the session manager's
-        // internal structure. For now, we work around this by holding a
-        // reference to the session data through the SessionData Arc pattern.
-        //
-        // TODO: Add a with_session() method to SessionManager for clean access.
-        //
-        // For the current implementation, session data is accessed via the
-        // relay thread's Arc<SessionData>. The handlers use acquire() for
-        // access counting and the relay thread holds the data reference.
-        //
-        // This is a design limitation that will be resolved when we add
-        // data access methods to SessionManager.
-        None
+        self.sessions.with_session(id, f)
     }
 
     /// Shutdown: clear all sessions and kill children.
@@ -1015,44 +997,25 @@ impl StatefulHttpGateway {
 
 /// Spawn the relay thread for a session. This is called after session creation.
 ///
-/// The relay thread needs access to the SessionData. Since SessionManager stores
-/// sessions in a HashMap behind RwLock, we can't hold a long-lived reference.
-/// Instead, the relay thread accesses the child through the SessionData's ChildBridge
-/// (which is self-contained with its own receiver channel).
-///
-/// Architecture: The relay thread holds the session_id and weak_mgr, and accesses
-/// the session data by upgrading the weak reference when needed. The ChildBridge's
-/// stdout channel (recv_message) is self-contained and doesn't need the session lock.
+/// Gets an `Arc<SessionData>` from the session manager so the relay thread can
+/// hold a long-lived reference independent of the session map's lock.
 fn spawn_relay_for_session(
     mgr: &SessionManager<SessionData>,
     session_id: &SessionId,
-    _logger: Arc<Logger>,
+    logger: Arc<Logger>,
 ) {
+    let data = match mgr.get_inner_arc(session_id) {
+        Some(arc) => arc,
+        None => {
+            logger.error(&format!(
+                "session {session_id}: cannot spawn relay, session not found"
+            ));
+            return;
+        }
+    };
+
     let weak = mgr.downgrade();
-    let sid = session_id.clone();
-
-    // We need access to the SessionData's child for the relay.
-    // The child's recv_message() blocks on an mpsc::Receiver which is independent
-    // of the session lock. So the relay thread can call recv_message() without
-    // holding the session lock.
-    //
-    // However, routing responses/notifications requires accessing SessionData fields.
-    // These are behind Mutex/RwLock within SessionData itself, so once we have a
-    // reference to SessionData, we can safely access its fields.
-    //
-    // The challenge is getting the reference. SessionManager stores Session<SessionData>
-    // in a HashMap, but doesn't expose a method to get &SessionData directly.
-    //
-    // SOLUTION: Extract the ChildBridge's stdout receiver and SessionData's routing
-    // structures into a separate Arc that the relay thread owns independently.
-    // This is done in the redesigned SessionData which uses Arc internally.
-
-    // For now, we'll use a simplified approach: the relay thread will be started
-    // with direct access to a cloned Arc of session components.
-    // This will be wired up when SessionManager gets data access methods.
-
-    // Placeholder: relay thread will be spawned with proper data access
-    // once we add SessionManager::with_session_data() or similar.
+    spawn_relay_thread(session_id.clone(), data, weak);
 }
 
 // ─── Tests ─────────────────────────────────────────────────────────────
