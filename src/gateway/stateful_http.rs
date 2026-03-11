@@ -443,6 +443,47 @@ impl GatewayResponse {
     }
 }
 
+// ─── Streaming SSE connection ──────────────────────────────────────────
+
+/// Streaming SSE connection returned by the GET handler.
+///
+/// The caller (HTTP server layer) must:
+/// 1. Write HTTP 200 with the provided `headers`
+/// 2. Loop on `receiver`, formatting each [`RawMessage`] via [`format_sse_event`]
+/// 3. Send `": keepalive\n\n"` every [`KEEPALIVE_INTERVAL`] if no events arrive
+/// 4. On client disconnect or receiver close, call
+///    [`StatefulHttpGateway::disconnect_sse_stream`]
+#[allow(dead_code)]
+pub struct SseStreamConnection {
+    /// Session ID for this stream.
+    pub session_id: SessionId,
+    /// Response headers to write (Content-Type, Cache-Control, etc.).
+    pub headers: Vec<(String, String)>,
+    /// Receiver for notification messages from the child relay thread.
+    pub receiver: Receiver<RawMessage>,
+    /// Access guard — holds the session access count alive for the stream's lifetime.
+    /// The caller should keep this alive until the stream ends.
+    pub guard: SessionAccessGuard,
+}
+
+/// Result of [`StatefulHttpGateway::handle_request`] dispatch.
+///
+/// Most methods return a complete [`GatewayResponse`]. The GET SSE handler returns
+/// a long-lived [`SseStreamConnection`] that the HTTP server layer must stream.
+#[allow(dead_code)]
+pub enum RequestResult {
+    /// Complete HTTP response (POST, DELETE, errors, CORS preflight, health).
+    Response(GatewayResponse),
+    /// Streaming SSE connection for GET /mcp.
+    SseStream(SseStreamConnection),
+}
+
+impl From<GatewayResponse> for RequestResult {
+    fn from(r: GatewayResponse) -> Self {
+        RequestResult::Response(r)
+    }
+}
+
 // ─── SSE event formatting ──────────────────────────────────────────────
 
 /// Format a RawMessage as an SSE event.
@@ -529,9 +570,12 @@ impl StatefulHttpGateway {
 
     // ─── Request dispatch ──────────────────────────────────────────
 
-    /// Handle an incoming HTTP request. Returns a response.
+    /// Handle an incoming HTTP request.
+    ///
+    /// Returns [`RequestResult::Response`] for most methods, or
+    /// [`RequestResult::SseStream`] for a successful GET SSE connection.
     #[allow(dead_code)]
-    pub fn handle_request(&self, req: &GatewayRequest) -> GatewayResponse {
+    pub fn handle_request(&self, req: &GatewayRequest) -> RequestResult {
         // CORS handling
         let cors_result = self.cors.process(
             &req.method,
@@ -542,7 +586,7 @@ impl StatefulHttpGateway {
             CorsResult::Preflight(headers) => {
                 let mut resp = GatewayResponse::no_content();
                 resp.headers.extend(headers.iter().cloned());
-                return resp;
+                return resp.into();
             }
             CorsResult::Disabled => {}
             CorsResult::ResponseHeaders(_) => {} // applied after handler
@@ -560,20 +604,26 @@ impl StatefulHttpGateway {
                 let mut h = Vec::new();
                 cors::apply_custom_headers(&mut h, &self.custom_headers);
                 resp.headers.extend(h);
-                return self.apply_cors(resp, &cors_result);
+                return self.apply_cors(resp, &cors_result).into();
             }
         }
 
         // MCP endpoint dispatch
         if req.path == self.mcp_path {
             Metrics::inc(&self.metrics.total_requests);
-            let resp = match req.method.as_str() {
-                "POST" => self.handle_post(req),
-                "GET" => self.handle_get(req),
-                "DELETE" => self.handle_delete(req),
-                _ => GatewayResponse::from_error(&GatewayError::method_not_allowed()),
+            return match req.method.as_str() {
+                "POST" => self.apply_cors(self.handle_post(req), &cors_result).into(),
+                "GET" => self.handle_get(req, &cors_result),
+                "DELETE" => self
+                    .apply_cors(self.handle_delete(req), &cors_result)
+                    .into(),
+                _ => self
+                    .apply_cors(
+                        GatewayResponse::from_error(&GatewayError::method_not_allowed()),
+                        &cors_result,
+                    )
+                    .into(),
             };
-            return self.apply_cors(resp, &cors_result);
         }
 
         // Not found
@@ -581,6 +631,7 @@ impl StatefulHttpGateway {
             GatewayResponse::plain_text(404, "Not Found"),
             &cors_result,
         )
+        .into()
     }
 
     #[allow(dead_code)]
@@ -896,33 +947,54 @@ impl StatefulHttpGateway {
 
     // ─── GET handler (SSE stream) ──────────────────────────────────
 
+    /// Handle GET /mcp — returns a long-lived streaming SSE connection.
+    ///
+    /// On error, returns `RequestResult::Response` with the appropriate status.
+    /// On success, returns `RequestResult::SseStream` with the notification
+    /// receiver. The caller (HTTP server layer) must stream events from the
+    /// receiver and call [`disconnect_sse_stream`](Self::disconnect_sse_stream)
+    /// when the client disconnects.
     #[allow(dead_code)]
-    fn handle_get(&self, req: &GatewayRequest) -> GatewayResponse {
+    fn handle_get(&self, req: &GatewayRequest, cors_result: &CorsResult) -> RequestResult {
         // 1. Validate Accept
         if !req.accepts("text/event-stream") {
-            return GatewayResponse::from_error(
-                &GatewayError::NotAcceptable("missing Accept: text/event-stream".into()),
-            );
+            return self
+                .apply_cors(
+                    GatewayResponse::from_error(
+                        &GatewayError::NotAcceptable(
+                            "missing Accept: text/event-stream".into(),
+                        ),
+                    ),
+                    cors_result,
+                )
+                .into();
         }
 
         // 2. Require Mcp-Session-Id
         let sid_str = match req.session_id_header() {
             Some(s) => s,
             None => {
-                return GatewayResponse::from_error(
-                    &GatewayError::bad_request("missing Mcp-Session-Id header"),
-                );
+                return self
+                    .apply_cors(
+                        GatewayResponse::from_error(
+                            &GatewayError::bad_request("missing Mcp-Session-Id header"),
+                        ),
+                        cors_result,
+                    )
+                    .into();
             }
         };
 
         let sid = SessionId::from_value(sid_str);
 
-        // 3. Validate session exists
+        // 3. Validate session exists and acquire access guard
         let guard = match self.sessions.acquire(&sid) {
             Ok(g) => g,
             Err(e) => {
                 let err: GatewayError = e.into();
-                return GatewayResponse::from_error(&err);
+                return self
+                    .apply_cors(GatewayResponse::from_error(&err), cors_result)
+                    .into();
             }
         };
 
@@ -934,7 +1006,12 @@ impl StatefulHttpGateway {
         });
 
         if claimed != Some(true) {
-            return GatewayResponse::from_error(&GatewayError::sse_stream_conflict());
+            return self
+                .apply_cors(
+                    GatewayResponse::from_error(&GatewayError::sse_stream_conflict()),
+                    cors_result,
+                )
+                .into();
         }
 
         // 5. Take notification receiver
@@ -943,39 +1020,55 @@ impl StatefulHttpGateway {
         let rx = match rx {
             Some(Some(rx)) => rx,
             _ => {
-                return GatewayResponse::from_error(&GatewayError::sse_stream_conflict());
+                return self
+                    .apply_cors(
+                        GatewayResponse::from_error(&GatewayError::sse_stream_conflict()),
+                        cors_result,
+                    )
+                    .into();
             }
         };
 
-        // 6. Collect available notifications (non-blocking drain)
-        //
-        // NOTE: For a true long-lived SSE stream, this handler would need to
-        // keep the connection open and push events as they arrive. Asupersync's
-        // web framework only supports batch responses, so we drain available
-        // notifications and return them. A real implementation would use lower-level
-        // HTTP APIs for streaming. This provides the correct test surface for
-        // integration tests that send messages before the GET connects.
-        let mut sse_body = String::new();
-
-        // Drain all immediately available notifications
-        loop {
-            match rx.try_recv() {
-                Ok(msg) => {
-                    sse_body.push_str(&format_sse_event(&msg));
-                }
-                Err(mpsc::TryRecvError::Empty) => break,
-                Err(mpsc::TryRecvError::Disconnected) => break,
-            }
-        }
-
         Metrics::inc_and_log(&self.metrics.active_clients, "active_clients", &self.logger);
+        self.logger
+            .info(&format!("SSE stream connected: session={sid}"));
 
-        // Drop guard before checking idle timer
-        drop(guard);
-        self.spawn_idle_timer_if_needed(&sid);
+        // 6. Build SSE response headers
+        let mut headers = vec![
+            ("Content-Type".to_string(), "text/event-stream".to_string()),
+            ("Cache-Control".to_string(), "no-cache".to_string()),
+            ("Connection".to_string(), "keep-alive".to_string()),
+            (
+                "X-Accel-Buffering".to_string(),
+                "no".to_string(),
+            ),
+            ("Mcp-Session-Id".to_string(), sid_str.to_string()),
+        ];
+        if let CorsResult::ResponseHeaders(cors_headers) = cors_result {
+            headers.extend(cors_headers.iter().cloned());
+        }
+        cors::apply_custom_headers(&mut headers, &self.custom_headers);
 
-        GatewayResponse::sse(200, &sse_body)
-            .header("Mcp-Session-Id", sid_str)
+        // Return streaming connection — caller handles the event loop
+        RequestResult::SseStream(SseStreamConnection {
+            session_id: sid,
+            headers,
+            receiver: rx,
+            guard,
+        })
+    }
+
+    /// Clean up after an SSE stream disconnects.
+    ///
+    /// Must be called by the HTTP server layer when the GET SSE connection ends
+    /// (client disconnect, receiver closed, or error). Decrements active_clients
+    /// and spawns an idle timer if needed.
+    #[allow(dead_code)]
+    pub fn disconnect_sse_stream(&self, session_id: &SessionId) {
+        Metrics::dec_and_log(&self.metrics.active_clients, "active_clients", &self.logger);
+        self.logger
+            .info(&format!("SSE stream disconnected: session={session_id}"));
+        self.spawn_idle_timer_if_needed(session_id);
     }
 
     // ─── DELETE handler ──────────────────────────────────────────────
@@ -1251,6 +1344,15 @@ mod tests {
         }
     }
 
+    /// Unwrap a RequestResult into a GatewayResponse, panicking on SseStream.
+    #[allow(dead_code)]
+    fn expect_response(result: RequestResult) -> GatewayResponse {
+        match result {
+            RequestResult::Response(r) => r,
+            RequestResult::SseStream(_) => panic!("expected Response, got SseStream"),
+        }
+    }
+
     // ─── SSE event formatting ──────────────────────────────────────
 
     #[test]
@@ -1486,7 +1588,7 @@ mod tests {
                 ("accept", "application/json, text/event-stream"),
             ],
         );
-        let resp = gw.handle_request(&req);
+        let resp = expect_response(gw.handle_request(&req));
         assert_eq!(resp.status, 415);
     }
 
@@ -1499,7 +1601,7 @@ mod tests {
             "{}",
             vec![("content-type", "application/json")],
         );
-        let resp = gw.handle_request(&req);
+        let resp = expect_response(gw.handle_request(&req));
         assert_eq!(resp.status, 406);
     }
 
@@ -1516,7 +1618,7 @@ mod tests {
                 ("accept", "application/json, text/event-stream"),
             ],
         );
-        let resp = gw.handle_request(&req);
+        let resp = expect_response(gw.handle_request(&req));
         assert_eq!(resp.status, 413);
     }
 
@@ -1532,7 +1634,7 @@ mod tests {
                 ("accept", "application/json, text/event-stream"),
             ],
         );
-        let resp = gw.handle_request(&req);
+        let resp = expect_response(gw.handle_request(&req));
         assert_eq!(resp.status, 400);
     }
 
@@ -1549,7 +1651,7 @@ mod tests {
                 ("accept", "application/json, text/event-stream"),
             ],
         );
-        let resp = gw.handle_request(&req);
+        let resp = expect_response(gw.handle_request(&req));
         assert_eq!(resp.status, 400);
     }
 
@@ -1567,7 +1669,7 @@ mod tests {
                 ("mcp-session-id", "nonexistent-session"),
             ],
         );
-        let resp = gw.handle_request(&req);
+        let resp = expect_response(gw.handle_request(&req));
         assert_eq!(resp.status, 404);
     }
 
@@ -1577,7 +1679,7 @@ mod tests {
     fn get_missing_accept_returns_406() {
         let gw = make_test_gateway();
         let req = make_gateway_request("GET", "/mcp", "", vec![]);
-        let resp = gw.handle_request(&req);
+        let resp = expect_response(gw.handle_request(&req));
         assert_eq!(resp.status, 406);
     }
 
@@ -1590,7 +1692,7 @@ mod tests {
             "",
             vec![("accept", "text/event-stream")],
         );
-        let resp = gw.handle_request(&req);
+        let resp = expect_response(gw.handle_request(&req));
         assert_eq!(resp.status, 400);
     }
 
@@ -1606,7 +1708,7 @@ mod tests {
                 ("mcp-session-id", "nonexistent"),
             ],
         );
-        let resp = gw.handle_request(&req);
+        let resp = expect_response(gw.handle_request(&req));
         assert_eq!(resp.status, 404);
     }
 
@@ -1616,7 +1718,7 @@ mod tests {
     fn delete_missing_session_id_returns_400() {
         let gw = make_test_gateway();
         let req = make_gateway_request("DELETE", "/mcp", "", vec![]);
-        let resp = gw.handle_request(&req);
+        let resp = expect_response(gw.handle_request(&req));
         assert_eq!(resp.status, 400);
     }
 
@@ -1629,7 +1731,7 @@ mod tests {
             "",
             vec![("mcp-session-id", "nonexistent")],
         );
-        let resp = gw.handle_request(&req);
+        let resp = expect_response(gw.handle_request(&req));
         assert_eq!(resp.status, 404);
     }
 
@@ -1639,7 +1741,7 @@ mod tests {
     fn put_returns_405_json_rpc() {
         let gw = make_test_gateway();
         let req = make_gateway_request("PUT", "/mcp", "", vec![]);
-        let resp = gw.handle_request(&req);
+        let resp = expect_response(gw.handle_request(&req));
         assert_eq!(resp.status, 405);
         let body = String::from_utf8_lossy(&resp.body);
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -1652,7 +1754,7 @@ mod tests {
     fn health_endpoint_returns_503_before_ready() {
         let gw = make_test_gateway();
         let req = make_gateway_request("GET", "/healthz", "", vec![]);
-        let resp = gw.handle_request(&req);
+        let resp = expect_response(gw.handle_request(&req));
         assert_eq!(resp.status, 503);
     }
 
@@ -1661,7 +1763,7 @@ mod tests {
         let gw = make_test_gateway();
         gw.metrics.set_ready();
         let req = make_gateway_request("GET", "/healthz", "", vec![]);
-        let resp = gw.handle_request(&req);
+        let resp = expect_response(gw.handle_request(&req));
         assert_eq!(resp.status, 200);
         assert_eq!(String::from_utf8_lossy(&resp.body), "ok");
     }
@@ -1677,7 +1779,7 @@ mod tests {
             "",
             vec![("origin", "https://example.com")],
         );
-        let resp = gw.handle_request(&req);
+        let resp = expect_response(gw.handle_request(&req));
         assert_eq!(resp.status, 204);
         let acao = resp
             .headers
@@ -1698,7 +1800,7 @@ mod tests {
                 ("mcp-session-id", "test"),
             ],
         );
-        let resp = gw.handle_request(&req);
+        let resp = expect_response(gw.handle_request(&req));
         let expose = resp
             .headers
             .iter()
@@ -1713,7 +1815,7 @@ mod tests {
     fn unknown_path_returns_404() {
         let gw = make_test_gateway();
         let req = make_gateway_request("GET", "/unknown", "", vec![]);
-        let resp = gw.handle_request(&req);
+        let resp = expect_response(gw.handle_request(&req));
         assert_eq!(resp.status, 404);
     }
 
@@ -1732,7 +1834,7 @@ mod tests {
                 ("accept", "application/json, text/event-stream"),
             ],
         );
-        let resp = gw.handle_request(&req);
+        let resp = expect_response(gw.handle_request(&req));
 
         // Should succeed (either SSE response or error from child timeout)
         // The key assertion is that the session was created
@@ -1770,7 +1872,7 @@ mod tests {
                 ("mcp-session-id", sid.as_str()),
             ],
         );
-        let resp = gw.handle_request(&req);
+        let resp = expect_response(gw.handle_request(&req));
         assert_eq!(resp.status, 202);
     }
 
@@ -1785,7 +1887,7 @@ mod tests {
             "",
             vec![("mcp-session-id", sid.as_str())],
         );
-        let resp = gw.handle_request(&req);
+        let resp = expect_response(gw.handle_request(&req));
         assert_eq!(resp.status, 200);
     }
 
@@ -1801,11 +1903,11 @@ mod tests {
             "",
             vec![("mcp-session-id", sid.as_str())],
         );
-        let resp1 = gw.handle_request(&req);
+        let resp1 = expect_response(gw.handle_request(&req));
         assert_eq!(resp1.status, 200);
 
         // Second DELETE (idempotent)
-        let resp2 = gw.handle_request(&req);
+        let resp2 = expect_response(gw.handle_request(&req));
         assert_eq!(resp2.status, 200);
     }
 
@@ -1821,7 +1923,7 @@ mod tests {
             "",
             vec![("mcp-session-id", sid.as_str())],
         );
-        gw.handle_request(&del_req);
+        expect_response(gw.handle_request(&del_req));
 
         // POST to closing session
         let body = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
@@ -1835,7 +1937,7 @@ mod tests {
                 ("mcp-session-id", sid.as_str()),
             ],
         );
-        let resp = gw.handle_request(&req);
+        let resp = expect_response(gw.handle_request(&req));
         assert_eq!(resp.status, 503);
     }
 
@@ -1860,7 +1962,7 @@ mod tests {
                 ("accept", "application/json, text/event-stream"),
             ],
         );
-        let resp = gw.handle_request(&req);
+        let resp = expect_response(gw.handle_request(&req));
         assert_eq!(resp.status, 503);
     }
 
