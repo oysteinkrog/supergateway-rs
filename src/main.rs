@@ -1,23 +1,43 @@
+mod child;
 mod cli;
+mod client;
+mod codec;
 mod cors;
+mod error;
+mod gateway;
 mod health;
+mod jsonrpc;
 mod observe;
 mod session;
+mod signal;
 
-fn main() {
+use cli::{InputMode, OutputTransport};
+
+fn main() -> anyhow::Result<()> {
+    let rt = asupersync::runtime::RuntimeBuilder::new().build()?;
+    rt.block_on(async_main())
+}
+
+async fn async_main() -> anyhow::Result<()> {
     let config = cli::Config::parse();
 
-    let logger = observe::Logger::new(config.output_transport, config.log_level);
-    let _metrics = observe::Metrics::new();
-
-    logger.startup(
-        env!("CARGO_PKG_VERSION"),
-        &config.input_value,
-        &config.output_transport.to_string(),
-        config.port,
-    );
-
-    // Gateway dispatch will be implemented by downstream beads.
-    logger.error("gateway not yet implemented");
-    std::process::exit(1);
+    match (&config.input_mode, &config.output_transport) {
+        (InputMode::Stdio, OutputTransport::Sse) => gateway::sse::run(config).await,
+        (InputMode::Stdio, OutputTransport::Ws) => gateway::ws::run(config).await,
+        (InputMode::Stdio, OutputTransport::StreamableHttp) if config.stateful => {
+            gateway::stateful_http::run(config).await
+        }
+        (InputMode::Stdio, OutputTransport::StreamableHttp) => {
+            gateway::stateless_http::run(config).await
+        }
+        (InputMode::Sse, OutputTransport::Stdio) => gateway::sse_to_stdio::run(config).await,
+        (InputMode::StreamableHttp, OutputTransport::Stdio) => {
+            gateway::http_to_stdio::run(config).await
+        }
+        _ => anyhow::bail!(
+            "unsupported transport combination: {:?} -> {}",
+            config.input_mode,
+            config.output_transport
+        ),
+    }
 }

@@ -708,6 +708,42 @@ impl WsGateway {
     }
 }
 
+// ─── Entry point ────────────────────────────────────────────────────────
+
+/// Run the stdio → WebSocket gateway.
+pub async fn run(config: crate::cli::Config) -> anyhow::Result<()> {
+    let logger = Arc::new(Logger::new(config.output_transport, config.log_level));
+    let metrics = Metrics::new();
+
+    logger.startup(
+        env!("CARGO_PKG_VERSION"),
+        &config.input_value,
+        &config.output_transport.to_string(),
+        config.port,
+    );
+
+    let _shutdown = crate::signal::install(&logger)?;
+
+    let child = Arc::new(crate::child::ChildBridge::spawn(
+        &config.input_value,
+        metrics.clone(),
+        logger.clone(),
+    )?);
+
+    let cors_handler = CorsHandler::new(config.cors, false);
+    let _gw = WsGateway::new(
+        child,
+        cors_handler,
+        metrics,
+        logger,
+        config.log_level,
+        config.health_endpoints,
+    );
+
+    // TODO: Wire up TCP listener + WebSocket serving (upcoming bead)
+    anyhow::bail!("stdio->WS serving not yet implemented")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

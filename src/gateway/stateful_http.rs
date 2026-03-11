@@ -1018,6 +1018,38 @@ fn spawn_relay_for_session(
     spawn_relay_thread(session_id.clone(), data, weak);
 }
 
+// ─── Entry point ────────────────────────────────────────────────────────
+
+/// Run the stdio → Streamable HTTP (stateful) gateway.
+pub async fn run(config: Config) -> anyhow::Result<()> {
+    let logger = Arc::new(Logger::new(config.output_transport, config.log_level));
+    let metrics = Metrics::new();
+
+    logger.startup(
+        env!("CARGO_PKG_VERSION"),
+        &config.input_value,
+        &config.output_transport.to_string(),
+        config.port,
+    );
+
+    let _shutdown = crate::signal::install(&logger)?;
+
+    let session_timeout = config.session_timeout.map(Duration::from_millis);
+    let _gw = StatefulHttpGateway::new(
+        config.input_value,
+        config.streamable_http_path,
+        config.health_endpoints,
+        config.cors,
+        config.headers,
+        session_timeout,
+        metrics,
+        logger,
+    );
+
+    // TODO: Wire up TCP listener + HTTP serving (upcoming bead)
+    anyhow::bail!("stdio->stateful HTTP serving not yet implemented")
+}
+
 // ─── Tests ─────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1042,6 +1074,7 @@ mod tests {
             params: None,
             result: None,
             error: None,
+            ..Default::default()
         }
     }
 
@@ -1053,6 +1086,7 @@ mod tests {
             params: None,
             result: None,
             error: None,
+            ..Default::default()
         }
     }
 
@@ -1065,6 +1099,7 @@ mod tests {
             params: None,
             result: Some(result),
             error: None,
+            ..Default::default()
         }
     }
 

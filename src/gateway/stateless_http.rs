@@ -205,6 +205,7 @@ fn build_synthetic_init(init_id: &str, protocol_version: &str) -> RawMessage {
         params: Some(serde_json::value::to_raw_value(&params).unwrap()),
         result: None,
         error: None,
+        ..Default::default()
     }
 }
 
@@ -217,6 +218,7 @@ fn build_initialized_notification() -> RawMessage {
         params: None,
         result: None,
         error: None,
+        ..Default::default()
     }
 }
 
@@ -627,6 +629,40 @@ impl StatelessHttpGateway {
     }
 }
 
+// ─── Entry point ────────────────────────────────────────────────────────
+
+/// Run the stdio → Streamable HTTP (stateless) gateway.
+pub async fn run(config: crate::cli::Config) -> anyhow::Result<()> {
+    let logger = Arc::new(crate::observe::Logger::new(
+        config.output_transport,
+        config.log_level,
+    ));
+    let metrics = crate::observe::Metrics::new();
+
+    logger.startup(
+        env!("CARGO_PKG_VERSION"),
+        &config.input_value,
+        &config.output_transport.to_string(),
+        config.port,
+    );
+
+    let _shutdown = crate::signal::install(&logger)?;
+
+    let _gw = StatelessHttpGateway::new(
+        config.input_value,
+        config.streamable_http_path,
+        config.health_endpoints,
+        config.cors,
+        config.headers,
+        config.protocol_version,
+        metrics,
+        logger,
+    );
+
+    // TODO: Wire up TCP listener + HTTP serving (upcoming bead)
+    anyhow::bail!("stdio->stateless HTTP serving not yet implemented")
+}
+
 // ─── Tests ─────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -730,6 +766,7 @@ mod tests {
             params: None,
             result: Some(result),
             error: None,
+            ..Default::default()
         };
         let event = format_sse_event(&msg);
         assert!(event.starts_with("event: message\ndata: "));

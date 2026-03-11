@@ -338,6 +338,7 @@ pub fn build_fallback_init(id: &str, protocol_version: &str) -> RawMessage {
         params: Some(params_raw),
         result: None,
         error: None,
+        ..Default::default()
     }
 }
 
@@ -350,6 +351,7 @@ pub fn build_initialized_notification() -> RawMessage {
         params: None,
         result: None,
         error: None,
+        ..Default::default()
     }
 }
 
@@ -428,6 +430,34 @@ pub fn write_stdout(msg: &RawMessage) -> std::io::Result<()> {
     stdout.write_all(json.as_bytes())?;
     stdout.write_all(b"\n")?;
     stdout.flush()
+}
+
+// ─── Entry point ────────────────────────────────────────────────────────
+
+/// Run the SSE → stdio client gateway.
+pub async fn run(config: crate::cli::Config) -> anyhow::Result<()> {
+    let logger = Arc::new(Logger::new(config.output_transport, config.log_level));
+    let metrics = Metrics::new();
+
+    logger.startup(
+        env!("CARGO_PKG_VERSION"),
+        &config.input_value,
+        &config.output_transport.to_string(),
+        config.port,
+    );
+
+    let _shutdown = crate::signal::install(&logger)?;
+
+    let _gw = SseToStdioGateway::new(
+        config.input_value,
+        config.protocol_version,
+        config.headers,
+        logger,
+        metrics,
+    );
+
+    // TODO: Wire up SSE client connection + stdin/stdout bridge (upcoming bead)
+    anyhow::bail!("SSE->stdio client not yet implemented")
 }
 
 // ─── Tests ─────────────────────────────────────────────────────────
@@ -573,6 +603,7 @@ mod tests {
             ),
             result: None,
             error: None,
+            ..Default::default()
         };
         let result = intercept_protocol_version(msg, "2024-11-05");
         let params: serde_json::Value =
@@ -590,6 +621,7 @@ mod tests {
             params: None,
             result: None,
             error: None,
+            ..Default::default()
         };
         let result = intercept_protocol_version(msg, "2024-11-05");
         assert_eq!(result.method_str(), Some("tools/list"));
@@ -611,6 +643,7 @@ mod tests {
             ),
             result: None,
             error: None,
+            ..Default::default()
         };
         let result = intercept_protocol_version(msg, "2024-11-05");
         let params: serde_json::Value =
@@ -754,6 +787,7 @@ mod tests {
             params: None,
             result: None,
             error: None,
+            ..Default::default()
         });
 
         // Server sends init response.
@@ -843,6 +877,7 @@ mod tests {
             ),
             result: None,
             error: None,
+            ..Default::default()
         };
         let action = gw.handle_stdin_message(msg);
 
@@ -875,6 +910,7 @@ mod tests {
             params: None,
             result: None,
             error: None,
+            ..Default::default()
         };
         let action = gw.handle_stdin_message(msg);
 
@@ -907,6 +943,7 @@ mod tests {
             params: None,
             result: None,
             error: None,
+            ..Default::default()
         };
         let action = gw.handle_stdin_message(msg);
         assert!(matches!(action, StdinAction::Buffered));
@@ -927,6 +964,7 @@ mod tests {
             params: None,
             result: None,
             error: None,
+            ..Default::default()
         };
         let action = gw.handle_stdin_message(msg);
 
@@ -962,6 +1000,7 @@ mod tests {
             params: None,
             result: None,
             error: None,
+            ..Default::default()
         };
         let action = gw.handle_stdin_message(stdin_msg);
         let init_msg = match action {
@@ -984,6 +1023,7 @@ mod tests {
             params: None,
             result: None,
             error: None,
+            ..Default::default()
         };
         let action2 = gw.handle_stdin_message(stdin_msg2);
         assert!(matches!(action2, StdinAction::Buffered));
@@ -1046,6 +1086,7 @@ mod tests {
             ),
             result: None,
             error: None,
+            ..Default::default()
         };
         let action = gw.handle_stdin_message(init_msg);
 

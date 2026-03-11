@@ -318,6 +318,34 @@ impl HttpToStdioGateway {
     }
 }
 
+// ─── Entry point ────────────────────────────────────────────────────────
+
+/// Run the Streamable HTTP → stdio client gateway.
+pub async fn run(config: crate::cli::Config) -> anyhow::Result<()> {
+    let logger = Arc::new(Logger::new(config.output_transport, config.log_level));
+    let metrics = Metrics::new();
+
+    logger.startup(
+        env!("CARGO_PKG_VERSION"),
+        &config.input_value,
+        &config.output_transport.to_string(),
+        config.port,
+    );
+
+    let _shutdown = crate::signal::install(&logger)?;
+
+    let _gw = HttpToStdioGateway::new(
+        config.input_value,
+        config.protocol_version,
+        config.headers,
+        logger,
+        metrics,
+    );
+
+    // TODO: Wire up HTTP client + stdin/stdout bridge (upcoming bead)
+    anyhow::bail!("HTTP->stdio client not yet implemented")
+}
+
 // ─── Tests ─────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -414,6 +442,7 @@ mod tests {
             ),
             result: None,
             error: None,
+            ..Default::default()
         };
         let action = gw.handle_stdin_message(msg);
 
@@ -447,6 +476,7 @@ mod tests {
             params: None,
             result: None,
             error: None,
+            ..Default::default()
         };
         let action = gw.handle_stdin_message(msg);
 
@@ -479,6 +509,7 @@ mod tests {
             params: None,
             result: None,
             error: None,
+            ..Default::default()
         };
         let action = gw.handle_stdin_message(msg);
         assert!(matches!(action, StdinAction::Buffered));
@@ -499,6 +530,7 @@ mod tests {
             params: None,
             result: None,
             error: None,
+            ..Default::default()
         };
         let action = gw.handle_stdin_message(msg);
 
@@ -531,6 +563,7 @@ mod tests {
                 .unwrap(),
             ),
             error: None,
+            ..Default::default()
         };
 
         let result = gw.handle_response_messages(vec![resp_msg]);
@@ -557,6 +590,7 @@ mod tests {
             params: None,
             result: None,
             error: None,
+            ..Default::default()
         });
 
         let resp_msg = RawMessage {
@@ -572,6 +606,7 @@ mod tests {
                 .unwrap(),
             ),
             error: None,
+            ..Default::default()
         };
 
         let result = gw.handle_response_messages(vec![resp_msg]);
@@ -604,6 +639,7 @@ mod tests {
                     .unwrap(),
             ),
             error: None,
+            ..Default::default()
         };
 
         let result = gw.handle_response_messages(vec![resp_msg]);
@@ -631,6 +667,7 @@ mod tests {
             ),
             result: None,
             error: None,
+            ..Default::default()
         };
 
         let result = gw.handle_response_messages(vec![notif]);
@@ -722,6 +759,7 @@ mod tests {
             ),
             result: None,
             error: None,
+            ..Default::default()
         };
         let action = gw.handle_stdin_message(init_msg);
         match action {
@@ -753,6 +791,7 @@ mod tests {
                 .unwrap(),
             ),
             error: None,
+            ..Default::default()
         };
         let result = gw.handle_response_messages(vec![resp_msg]);
         assert_eq!(result.stdout.len(), 1);
@@ -768,6 +807,7 @@ mod tests {
             params: None,
             result: None,
             error: None,
+            ..Default::default()
         };
         let action = gw.handle_stdin_message(msg);
         match action {
@@ -793,6 +833,7 @@ mod tests {
             params: None,
             result: None,
             error: None,
+            ..Default::default()
         };
         let action = gw.handle_stdin_message(stdin_msg);
         let init_msg = match action {
@@ -815,6 +856,7 @@ mod tests {
             params: None,
             result: None,
             error: None,
+            ..Default::default()
         };
         let action2 = gw.handle_stdin_message(stdin_msg2);
         assert!(matches!(action2, StdinAction::Buffered));
@@ -833,6 +875,7 @@ mod tests {
                 .unwrap(),
             ),
             error: None,
+            ..Default::default()
         };
         let result = gw.handle_response_messages(vec![resp_msg]);
 

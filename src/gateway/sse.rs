@@ -583,6 +583,45 @@ impl SseGateway {
     }
 }
 
+// ─── Entry point ────────────────────────────────────────────────────────
+
+/// Run the stdio → SSE gateway.
+pub async fn run(config: crate::cli::Config) -> anyhow::Result<()> {
+    let logger = Arc::new(Logger::new(config.output_transport, config.log_level));
+    let metrics = Metrics::new();
+
+    logger.startup(
+        env!("CARGO_PKG_VERSION"),
+        &config.input_value,
+        &config.output_transport.to_string(),
+        config.port,
+    );
+
+    let _shutdown = crate::signal::install(&logger)?;
+
+    let child = Arc::new(crate::child::ChildBridge::spawn(
+        &config.input_value,
+        metrics.clone(),
+        logger.clone(),
+    )?);
+
+    let cors_handler = CorsHandler::new(config.cors, false);
+    let _gw = SseGateway::new(
+        child,
+        config.base_url,
+        config.message_path,
+        cors_handler,
+        config.headers,
+        metrics,
+        logger,
+        config.log_level,
+        config.health_endpoints,
+    );
+
+    // TODO: Wire up TCP listener + HTTP serving (upcoming bead)
+    anyhow::bail!("stdio->SSE serving not yet implemented")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
