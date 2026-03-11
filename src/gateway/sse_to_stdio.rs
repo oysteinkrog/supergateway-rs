@@ -61,8 +61,8 @@ enum InitPhase {
     Pending,
     /// Synthetic init sent, waiting for response. String is the init request ID.
     WaitingSyntheticInit(String),
-    /// Passthrough init forwarded, waiting for response.
-    WaitingPassthroughInit,
+    /// Passthrough init forwarded, waiting for response. String is the init request ID.
+    WaitingPassthroughInit { init_id: String },
     /// Initialization complete, forwarding normally.
     Ready,
 }
@@ -232,12 +232,32 @@ impl SseToStdioGateway {
                     post: Vec::new(),
                 }
             }
-            InitPhase::WaitingPassthroughInit => {
-                let has_response = messages.iter().any(|m| m.is_response());
-                if has_response {
-                    *phase = InitPhase::Ready;
+            InitPhase::WaitingPassthroughInit { ref init_id } => {
+                let init_id = init_id.clone();
+                let mut found_init_response = false;
+
+                for msg in &messages {
+                    if msg.is_response() {
+                        if let Some(ref id) = msg.id {
+                            if id.get().trim_matches('"') == init_id {
+                                found_init_response = true;
+                                break;
+                            }
+                        }
+                    }
                 }
-                // Passthrough: forward all messages to stdout.
+
+                if found_init_response {
+                    *phase = InitPhase::Ready;
+                    drop(phase);
+                    let mut post = Vec::new();
+                    post.extend(self.init_pending.lock().unwrap().drain(..));
+                    return SseEventResult {
+                        stdout: messages,
+                        post,
+                    };
+                }
+                // Not the init response yet — forward but stay in WaitingPassthroughInit.
                 SseEventResult {
                     stdout: messages,
                     post: Vec::new(),
@@ -261,9 +281,14 @@ impl SseToStdioGateway {
             InitPhase::Pending => {
                 if msg.is_initialize_request() {
                     // Passthrough with protocol version interception (D-014).
+                    let init_id = msg
+                        .id
+                        .as_ref()
+                        .map(|id| id.get().trim_matches('"').to_owned())
+                        .unwrap_or_default();
                     let intercepted =
                         intercept_protocol_version(msg, &self.protocol_version);
-                    *phase = InitPhase::WaitingPassthroughInit;
+                    *phase = InitPhase::WaitingPassthroughInit { init_id };
                     self.logger.info("Stdio → SSE: passthrough initialize");
                     StdinAction::Post(vec![intercepted])
                 } else {
@@ -277,12 +302,13 @@ impl SseToStdioGateway {
                     StdinAction::PostInit(init_msg)
                 }
             }
-            InitPhase::WaitingSyntheticInit(_) => {
+            InitPhase::WaitingSyntheticInit(_)
+            | InitPhase::WaitingPassthroughInit { .. } => {
                 // Buffer until init completes.
                 self.init_pending.lock().unwrap().push(msg);
                 StdinAction::Buffered
             }
-            InitPhase::WaitingPassthroughInit | InitPhase::Ready => {
+            InitPhase::Ready => {
                 StdinAction::Post(vec![msg])
             }
         }
@@ -972,7 +998,9 @@ mod tests {
     #[test]
     fn sse_event_passthrough_init_response_forwarded() {
         let gw = make_gateway();
-        *gw.init_phase.lock().unwrap() = InitPhase::WaitingPassthroughInit;
+        *gw.init_phase.lock().unwrap() = InitPhase::WaitingPassthroughInit {
+            init_id: "0".into(),
+        };
 
         let json = concat!(
             r#"{"jsonrpc":"2.0","id":0,"#,
@@ -1024,10 +1052,12 @@ mod tests {
             }
             _ => panic!("expected Post action"),
         }
-        assert_eq!(
-            *gw.init_phase.lock().unwrap(),
-            InitPhase::WaitingPassthroughInit
-        );
+        match &*gw.init_phase.lock().unwrap() {
+            InitPhase::WaitingPassthroughInit { init_id } => {
+                assert_eq!(init_id, "0");
+            }
+            other => panic!("expected WaitingPassthroughInit, got {:?}", other),
+        }
     }
 
     // ─── handle_stdin_message: first message is non-init ──────────
