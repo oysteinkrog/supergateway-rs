@@ -26,6 +26,9 @@ use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
+use asupersync::runtime::RuntimeHandle;
+use asupersync::time::{sleep as async_sleep, wall_now};
+
 use crate::child::ChildBridge;
 use crate::cli::{Config, CorsConfig, Header};
 use crate::codec;
@@ -519,6 +522,7 @@ pub struct StatefulHttpGateway {
     health_endpoints: Vec<String>,
     metrics: Arc<Metrics>,
     logger: Arc<Logger>,
+    rt: RuntimeHandle,
 }
 
 #[allow(dead_code)]
@@ -534,6 +538,7 @@ impl StatefulHttpGateway {
         session_timeout: Option<Duration>,
         metrics: Arc<Metrics>,
         logger: Arc<Logger>,
+        rt: RuntimeHandle,
     ) -> Self {
         let session_config = SessionManagerConfig {
             max_sessions: 1024,
@@ -559,6 +564,7 @@ impl StatefulHttpGateway {
             health_endpoints,
             metrics,
             logger,
+            rt,
         }
     }
 
@@ -1098,27 +1104,24 @@ impl StatefulHttpGateway {
                 let drain_timeout = self.sessions.config().drain_timeout;
                 let drain_logger = self.logger.clone();
 
-                std::thread::Builder::new()
-                    .name(format!("drain-{}", &sid_str[..8.min(sid_str.len())]))
-                    .spawn(move || {
-                        // Poll drain status
-                        let start = std::time::Instant::now();
-                        while start.elapsed() < drain_timeout {
-                            if mgr.try_drain_close(&drain_sid) {
-                                drain_logger.info(&format!(
-                                    "session {drain_sid} drained and closed"
-                                ));
-                                return;
-                            }
-                            std::thread::sleep(Duration::from_millis(100));
+                self.rt.spawn(async move {
+                    // Poll drain status
+                    let start = std::time::Instant::now();
+                    while start.elapsed() < drain_timeout {
+                        if mgr.try_drain_close(&drain_sid) {
+                            drain_logger.info(&format!(
+                                "session {drain_sid} drained and closed"
+                            ));
+                            return;
                         }
-                        // Force close after drain timeout
-                        drain_logger.info(&format!(
-                            "session {drain_sid} drain timeout, force closing"
-                        ));
-                        mgr.complete_close(&drain_sid);
-                    })
-                    .expect("spawn drain thread");
+                        async_sleep(wall_now(), Duration::from_millis(100)).await;
+                    }
+                    // Force close after drain timeout
+                    drain_logger.info(&format!(
+                        "session {drain_sid} drain timeout, force closing"
+                    ));
+                    mgr.complete_close(&drain_sid);
+                });
 
                 GatewayResponse::new(200)
                     .header("content-type", "text/plain")
@@ -1181,19 +1184,15 @@ impl StatefulHttpGateway {
         let weak = self.sessions.downgrade();
         let sid = session_id.clone();
         let logger = self.logger.clone();
-        let sid_prefix = &sid.as_str()[..8.min(sid.as_str().len())];
 
-        std::thread::Builder::new()
-            .name(format!("idle-{sid_prefix}"))
-            .spawn(move || {
-                std::thread::sleep(timeout);
-                if let Some(mgr) = weak.upgrade() {
-                    if mgr.try_idle_close(&sid, gen) {
-                        logger.info(&format!("session {sid} idle timeout expired, closed"));
-                    }
+        self.rt.spawn(async move {
+            async_sleep(wall_now(), timeout).await;
+            if let Some(mgr) = weak.upgrade() {
+                if mgr.try_idle_close(&sid, gen) {
+                    logger.info(&format!("session {sid} idle timeout expired, closed"));
                 }
-            })
-            .expect("spawn idle timeout thread");
+            }
+        });
     }
 
     /// Shutdown: clear all sessions and kill children.
@@ -1237,7 +1236,7 @@ fn spawn_relay_for_session(
 
 /// Run the stdio → Streamable HTTP (stateful) gateway.
 #[allow(dead_code)]
-pub async fn run(config: Config) -> anyhow::Result<()> {
+pub async fn run(config: Config, rt_handle: RuntimeHandle) -> anyhow::Result<()> {
     let logger = Arc::new(Logger::new(config.output_transport, config.log_level));
     let metrics = Metrics::new();
 
@@ -1260,6 +1259,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         session_timeout,
         metrics,
         logger,
+        rt_handle,
     );
 
     // TODO: Wire up TCP listener + HTTP serving (upcoming bead)
@@ -1273,6 +1273,16 @@ mod tests {
     use super::*;
     use crate::cli::{LogLevel, OutputTransport};
     use serde_json::value::RawValue;
+
+    fn test_rt_handle() -> RuntimeHandle {
+        static RT: std::sync::OnceLock<asupersync::runtime::Runtime> = std::sync::OnceLock::new();
+        RT.get_or_init(|| {
+            asupersync::runtime::RuntimeBuilder::new()
+                .build()
+                .expect("test runtime")
+        })
+        .handle()
+    }
 
     #[allow(dead_code)]
     fn test_logger() -> Arc<Logger> {
@@ -1979,6 +1989,7 @@ mod tests {
             None,
             test_metrics(),
             test_logger(),
+            test_rt_handle(),
         )
     }
 
@@ -1993,6 +2004,7 @@ mod tests {
             None,
             test_metrics(),
             test_logger(),
+            test_rt_handle(),
         )
     }
 
@@ -2016,6 +2028,7 @@ mod tests {
             health_endpoints: vec!["/healthz".into()],
             metrics,
             logger,
+            rt: test_rt_handle(),
         }
     }
 

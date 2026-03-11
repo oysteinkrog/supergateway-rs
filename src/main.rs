@@ -15,17 +15,18 @@ use cli::{InputMode, OutputTransport};
 
 fn main() -> anyhow::Result<()> {
     let rt = asupersync::runtime::RuntimeBuilder::new().build()?;
-    rt.block_on(async_main())
+    let rt_handle = rt.handle();
+    rt.block_on(async_main(rt_handle))
 }
 
-async fn async_main() -> anyhow::Result<()> {
+async fn async_main(rt_handle: asupersync::runtime::RuntimeHandle) -> anyhow::Result<()> {
     let config = cli::Config::parse();
 
     match (&config.input_mode, &config.output_transport) {
         (InputMode::Stdio, OutputTransport::Sse) => gateway::sse::run(config).await,
         (InputMode::Stdio, OutputTransport::Ws) => gateway::ws::run(config).await,
         (InputMode::Stdio, OutputTransport::StreamableHttp) if config.stateful => {
-            gateway::stateful_http::run(config).await
+            gateway::stateful_http::run(config, rt_handle).await
         }
         (InputMode::Stdio, OutputTransport::StreamableHttp) => {
             gateway::stateless_http::run(config).await
