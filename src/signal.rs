@@ -47,12 +47,12 @@ static FORCE_EXIT: AtomicBool = AtomicBool::new(false);
 /// Last signal number received (0 = programmatic shutdown / stdin EOF).
 static SIGNAL_NUM: AtomicI32 = AtomicI32::new(0);
 
-/// Self-pipe: [read_fd, write_fd]. Initialized once by [`install()`].
-///
-/// SAFETY: Written once in `install()` before any handler is active.
-/// Read by signal handler (async-signal-safe `write` syscall) and
-/// [`ShutdownSignal::wait()`].
-static mut SIGNAL_PIPE: [libc::c_int; 2] = [-1, -1];
+/// Self-pipe read fd. Initialized once by [`install()`].
+static SIGNAL_PIPE_READ: AtomicI32 = AtomicI32::new(-1);
+
+/// Self-pipe write fd. Initialized once by [`install()`].
+/// Read by signal handler via atomic load (async-signal-safe).
+static SIGNAL_PIPE_WRITE: AtomicI32 = AtomicI32::new(-1);
 
 // ─── Signal handlers (async-signal-safe) ────────────────────────────────
 
@@ -65,11 +65,9 @@ extern "C" fn shutdown_handler(sig: libc::c_int) {
     }
     SIGNAL_NUM.store(sig, Ordering::SeqCst);
     // Wake any thread blocked on the pipe (async-signal-safe write)
-    unsafe {
-        let fd = SIGNAL_PIPE[1];
-        if fd >= 0 {
-            libc::write(fd, [1u8].as_ptr().cast(), 1);
-        }
+    let fd = SIGNAL_PIPE_WRITE.load(Ordering::Relaxed);
+    if fd >= 0 {
+        unsafe { libc::write(fd, [1u8].as_ptr().cast(), 1) };
     }
 }
 
@@ -136,8 +134,9 @@ pub fn install(logger: &Logger) -> io::Result<ShutdownSignal> {
     unsafe {
         let flags = libc::fcntl(fds[1], libc::F_GETFL);
         libc::fcntl(fds[1], libc::F_SETFL, flags | libc::O_NONBLOCK);
-        SIGNAL_PIPE = fds;
     }
+    SIGNAL_PIPE_READ.store(fds[0], Ordering::SeqCst);
+    SIGNAL_PIPE_WRITE.store(fds[1], Ordering::SeqCst);
 
     // Install shutdown handlers for SIGINT, SIGTERM, SIGHUP
     let action = SigAction::new(
@@ -190,11 +189,9 @@ pub fn request_shutdown() {
         FORCE_EXIT.store(true, Ordering::SeqCst);
     }
     // SIGNAL_NUM stays 0 for programmatic shutdown
-    unsafe {
-        let fd = SIGNAL_PIPE[1];
-        if fd >= 0 {
-            libc::write(fd, [1u8].as_ptr().cast(), 1);
-        }
+    let fd = SIGNAL_PIPE_WRITE.load(Ordering::Relaxed);
+    if fd >= 0 {
+        unsafe { libc::write(fd, [1u8].as_ptr().cast(), 1) };
     }
 }
 
