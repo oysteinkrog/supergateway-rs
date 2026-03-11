@@ -135,3 +135,8 @@ Both versions use reference-counted session tracking. Increment on request accep
 
 ### B-004: Client mode exit behavior
 Both versions: remote transport close → exit(1). Remote transport error → log only, do not exit. This asymmetry is intentional for pm2/systemd restart semantics.
+
+### B-005: WebSocket batch decomposition
+**TS behavior:** Receives a JSON batch array (e.g. `[{...}, {...}]`) on stdin and writes the entire array as a single line to the child process's stdin.
+**Rust behavior:** Deserializes the batch into individual messages and writes each message as a separate JSON line to the child process's stdin. The child therefore sees one `\n`-terminated JSON object per message, not a single batch array.
+**Impact:** Child processes that read newline-delimited JSON see identical behavior for both batch and non-batch requests. This is the correct behavior for JSON-RPC over stdio (spec §6).
