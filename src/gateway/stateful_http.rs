@@ -717,6 +717,9 @@ impl StatefulHttpGateway {
         // Forward messages and collect responses
         let resp = self.forward_and_respond(&session_id, messages);
 
+        // Start idle timer (session starts at access count 0)
+        self.spawn_idle_timer_if_needed(&session_id);
+
         // Add Mcp-Session-Id header to response
         let mut response = resp;
         response.headers.push((
@@ -735,7 +738,7 @@ impl StatefulHttpGateway {
         messages: Vec<RawMessage>,
     ) -> GatewayResponse {
         // Acquire session access guard
-        let _guard = match self.sessions.acquire(session_id) {
+        let guard = match self.sessions.acquire(session_id) {
             Ok(g) => g,
             Err(e) => {
                 let err: GatewayError = e.into();
@@ -743,7 +746,13 @@ impl StatefulHttpGateway {
             }
         };
 
-        self.forward_and_respond(session_id, messages)
+        let resp = self.forward_and_respond(session_id, messages);
+
+        // Drop guard before checking idle timer (count must reflect this drop)
+        drop(guard);
+        self.spawn_idle_timer_if_needed(session_id);
+
+        resp
     }
 
     /// Forward messages to child and collect responses.
@@ -897,7 +906,7 @@ impl StatefulHttpGateway {
         let sid = SessionId::from_value(sid_str);
 
         // 3. Validate session exists
-        let _guard = match self.sessions.acquire(&sid) {
+        let guard = match self.sessions.acquire(&sid) {
             Ok(g) => g,
             Err(e) => {
                 let err: GatewayError = e.into();
@@ -948,6 +957,10 @@ impl StatefulHttpGateway {
         }
 
         Metrics::inc_and_log(&self.metrics.active_clients, "active_clients", &self.logger);
+
+        // Drop guard before checking idle timer
+        drop(guard);
+        self.spawn_idle_timer_if_needed(&sid);
 
         GatewayResponse::sse(200, &sse_body)
             .header("Mcp-Session-Id", sid_str)
@@ -1033,6 +1046,49 @@ impl StatefulHttpGateway {
         F: FnOnce(&SessionData) -> T,
     {
         self.sessions.with_session(id, f)
+    }
+
+    /// Spawn an idle timeout timer for a session if configured and count is 0.
+    ///
+    /// Called after a request handler completes (guard dropped) or after session
+    /// creation. If `session_timeout` is configured and access count is 0, spawns
+    /// a thread that sleeps for the timeout duration and then calls
+    /// `try_idle_close` with the current generation. If a new request arrives
+    /// before the timer fires, `acquire()` bumps the generation, making the
+    /// stale timer a no-op.
+    fn spawn_idle_timer_if_needed(&self, session_id: &SessionId) {
+        let timeout = match self.sessions.config().session_timeout {
+            Some(t) => t,
+            None => return,
+        };
+
+        // Only spawn if access count is currently 0
+        if self.sessions.access_count(session_id) != Some(0) {
+            return;
+        }
+
+        // Read current generation — timer will check this hasn't changed
+        let gen = match self.sessions.timeout_gen(session_id) {
+            Some(g) => g,
+            None => return, // session already gone
+        };
+
+        let weak = self.sessions.downgrade();
+        let sid = session_id.clone();
+        let logger = self.logger.clone();
+        let sid_prefix = &sid.as_str()[..8.min(sid.as_str().len())];
+
+        std::thread::Builder::new()
+            .name(format!("idle-{sid_prefix}"))
+            .spawn(move || {
+                std::thread::sleep(timeout);
+                if let Some(mgr) = weak.upgrade() {
+                    if mgr.try_idle_close(&sid, gen) {
+                        logger.info(&format!("session {sid} idle timeout expired, closed"));
+                    }
+                }
+            })
+            .expect("spawn idle timeout thread");
     }
 
     /// Shutdown: clear all sessions and kill children.
