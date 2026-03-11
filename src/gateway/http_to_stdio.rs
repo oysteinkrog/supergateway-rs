@@ -902,6 +902,7 @@ mod tests {
                     .unwrap(),
             ),
             error: None,
+            ..Default::default()
         };
         let result2 = gw.handle_response_messages(vec![resp_msg2]);
         assert_eq!(result2.stdout.len(), 1);

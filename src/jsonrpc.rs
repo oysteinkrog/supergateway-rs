@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::value::RawValue;
 
@@ -7,6 +9,9 @@ use serde_json::value::RawValue;
 /// responses, notifications, and errors. Classification is done via helper methods.
 /// All payload fields use `Box<RawValue>` for opaque pass-through — we never
 /// interpret params, result, or error contents.
+///
+/// Extension fields (e.g. `_meta`) are captured in [`extra`](Self::extra) via
+/// `#[serde(flatten)]` so they survive round-trip serialization (protocol transparency).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RawMessage {
     pub jsonrpc: String,
@@ -31,6 +36,25 @@ pub struct RawMessage {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<Box<RawValue>>,
+
+    /// Extension fields not part of the core JSON-RPC spec (e.g. `_meta`).
+    /// Captured via flatten to preserve protocol transparency on round-trip.
+    #[serde(flatten)]
+    pub extra: HashMap<String, Box<RawValue>>,
+}
+
+impl Default for RawMessage {
+    fn default() -> Self {
+        Self {
+            jsonrpc: "2.0".into(),
+            id: None,
+            method: None,
+            params: None,
+            result: None,
+            error: None,
+            extra: HashMap::new(),
+        }
+    }
 }
 
 // ─── id field: distinguish absent vs null vs value ──────────────────────────
@@ -110,6 +134,7 @@ impl RawMessage {
             params: None,
             result: None,
             error: Some(error_raw),
+            ..Default::default()
         }
     }
 }
@@ -234,6 +259,7 @@ mod tests {
             params: None,
             result: None,
             error: None,
+            ..Default::default()
         };
         let s = serde_json::to_string(&msg).unwrap();
         assert!(!s.contains("\"id\""));
@@ -248,6 +274,7 @@ mod tests {
             params: None,
             result: None,
             error: None,
+            ..Default::default()
         };
         let s = serde_json::to_string(&msg).unwrap();
         assert!(s.contains(r#""id":null"#));
@@ -299,14 +326,19 @@ mod tests {
         assert_eq!(msg.method_str(), Some("custom/fooBar"));
     }
 
-    // ─── Extension fields not rejected ──────────────────────────────────
+    // ─── Extension fields preserved ─────────────────────────────────────
 
     #[test]
-    fn extension_fields_not_rejected() {
+    fn extension_fields_preserved() {
         let json = r#"{"jsonrpc":"2.0","id":1,"method":"foo","_meta":{"token":"x"}}"#;
-        // Must not error — extension fields silently dropped (no deny_unknown_fields).
         let msg: RawMessage = serde_json::from_str(json).unwrap();
         assert!(msg.is_request());
+        // Extension field must be captured in extra
+        assert!(msg.extra.contains_key("_meta"));
+        assert_eq!(msg.extra["_meta"].get(), r#"{"token":"x"}"#);
+        // Roundtrip: extension fields survive serialization
+        let reserialized = serde_json::to_string(&msg).unwrap();
+        assert!(reserialized.contains(r#""_meta":{"token":"x"}"#));
     }
 
     // ─── Large params ───────────────────────────────────────────────────

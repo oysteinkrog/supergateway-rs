@@ -734,6 +734,7 @@ pub async fn run(config: crate::cli::Config) -> anyhow::Result<()> {
     let _gw = WsGateway::new(
         child,
         cors_handler,
+        config.headers,
         metrics,
         logger,
         config.log_level,

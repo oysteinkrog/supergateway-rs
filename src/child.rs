@@ -402,6 +402,7 @@ mod tests {
             params: None,
             result: None,
             error: None,
+            ..Default::default()
         }
     }
 

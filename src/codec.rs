@@ -436,6 +436,7 @@ mod tests {
             params: None,
             result: None,
             error: None,
+            ..Default::default()
         };
         let mut out = Vec::new();
         write_message(&mut out, &msg).unwrap();
