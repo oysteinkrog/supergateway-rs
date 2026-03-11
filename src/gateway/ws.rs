@@ -70,6 +70,10 @@ const BACKPRESSURE_TIMEOUT: Duration = Duration::from_secs(30);
 #[allow(dead_code)]
 const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
 
+/// Maximum concurrent WebSocket clients (D-102).
+#[allow(dead_code)]
+const MAX_WS_CLIENTS: usize = 1024;
+
 // ─── WS close codes ────────────────────────────────────────────────
 
 /// Normal closure.
@@ -698,7 +702,7 @@ impl WsGateway {
         }
 
         let health_resp = health::check_health(&self.metrics, detail, self.log_level);
-        let cors_headers = match self.cors.process("GET", origin) {
+        let cors_headers = match self.cors.process("GET", origin, None) {
             CorsResult::Disabled => vec![],
             CorsResult::ResponseHeaders(h) => h,
             CorsResult::Preflight(_) => vec![],
@@ -715,8 +719,12 @@ impl WsGateway {
 
     /// Handle a CORS preflight request. Returns `None` if CORS is disabled.
     #[allow(dead_code)]
-    pub fn handle_options(&self, origin: Option<&str>) -> Option<GatewayResponse> {
-        match self.cors.process("OPTIONS", origin) {
+    pub fn handle_options(
+        &self,
+        origin: Option<&str>,
+        request_headers: Option<&str>,
+    ) -> Option<GatewayResponse> {
+        match self.cors.process("OPTIONS", origin, request_headers) {
             CorsResult::Preflight(headers) => {
                 let mut resp = GatewayResponse::new(204, "").with_headers(headers);
                 cors::apply_custom_headers(&mut resp.headers, &self.custom_headers);

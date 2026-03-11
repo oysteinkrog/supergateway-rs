@@ -359,7 +359,7 @@ impl SseGateway {
     /// 4. Call [`disconnect_client`](Self::disconnect_client) on connection close
     #[allow(dead_code)]
     pub fn handle_sse_connect(&self, origin: Option<&str>) -> SseConnection {
-        let cors_headers = match self.cors.process("GET", origin) {
+        let cors_headers = match self.cors.process("GET", origin, None) {
             CorsResult::Disabled => vec![],
             CorsResult::ResponseHeaders(h) => h,
             CorsResult::Preflight(_) => vec![], // unreachable for GET
@@ -457,7 +457,7 @@ impl SseGateway {
     ) -> GatewayResponse {
         Metrics::inc(&self.metrics.total_requests);
 
-        let cors_headers = match self.cors.process("POST", origin) {
+        let cors_headers = match self.cors.process("POST", origin, None) {
             CorsResult::Disabled => vec![],
             CorsResult::ResponseHeaders(h) => h,
             CorsResult::Preflight(_) => vec![], // unreachable for POST
@@ -533,8 +533,12 @@ impl SseGateway {
 
     /// Handle a CORS preflight request. Returns `None` if CORS is disabled.
     #[allow(dead_code)]
-    pub fn handle_options(&self, origin: Option<&str>) -> Option<GatewayResponse> {
-        match self.cors.process("OPTIONS", origin) {
+    pub fn handle_options(
+        &self,
+        origin: Option<&str>,
+        request_headers: Option<&str>,
+    ) -> Option<GatewayResponse> {
+        match self.cors.process("OPTIONS", origin, request_headers) {
             CorsResult::Preflight(headers) => {
                 let mut resp = GatewayResponse::new(204, "").with_headers(headers);
                 cors::apply_custom_headers(&mut resp.headers, &self.custom_headers);
@@ -559,7 +563,7 @@ impl SseGateway {
         }
 
         let health_resp = health::check_health(&self.metrics, detail, self.log_level);
-        let cors_headers = match self.cors.process("GET", origin) {
+        let cors_headers = match self.cors.process("GET", origin, None) {
             CorsResult::Disabled => vec![],
             CorsResult::ResponseHeaders(h) => h,
             CorsResult::Preflight(_) => vec![],
@@ -1112,7 +1116,7 @@ mod tests {
             vec![],
         );
 
-        let resp = gw.handle_options(Some("https://example.com"));
+        let resp = gw.handle_options(Some("https://example.com"), None);
         assert!(resp.is_some());
         let resp = resp.unwrap();
         assert_eq!(resp.status, 204);
@@ -1121,7 +1125,7 @@ mod tests {
     #[test]
     fn cors_disabled_no_options() {
         let gw = make_gateway("cat");
-        assert!(gw.handle_options(Some("https://example.com")).is_none());
+        assert!(gw.handle_options(Some("https://example.com"), None).is_none());
     }
 
     // ─── Custom headers ─────────────────────────────────────────────

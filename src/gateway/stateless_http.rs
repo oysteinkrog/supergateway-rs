@@ -313,7 +313,11 @@ impl StatelessHttpGateway {
     #[allow(dead_code)]
     pub fn handle_request(&self, req: &GatewayRequest) -> GatewayResponse {
         // CORS handling
-        let cors_result = self.cors.process(&req.method, req.header("origin"));
+        let cors_result = self.cors.process(
+            &req.method,
+            req.header("origin"),
+            req.header("access-control-request-headers"),
+        );
         match &cors_result {
             CorsResult::Preflight(headers) => {
                 let mut resp = response_no_content();

@@ -536,6 +536,7 @@ impl StatefulHttpGateway {
         let cors_result = self.cors.process(
             &req.method,
             req.header("origin"),
+            req.header("access-control-request-headers"),
         );
         match &cors_result {
             CorsResult::Preflight(headers) => {

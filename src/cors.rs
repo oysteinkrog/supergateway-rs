@@ -9,7 +9,8 @@ pub const MAX_HEADER_SIZE: usize = 8192;
 #[allow(dead_code)]
 const ALLOW_METHODS: &str = "GET, POST, DELETE, OPTIONS";
 
-/// Allowed request headers for CORS preflight.
+/// Allowed request headers for CORS preflight (fallback when the browser
+/// does not send `Access-Control-Request-Headers`).
 #[allow(dead_code)]
 const ALLOW_HEADERS: &str = "Content-Type, Accept, Mcp-Session-Id, Last-Event-ID";
 
@@ -68,12 +69,23 @@ impl CorsHandler {
     /// - `Disabled`: do nothing
     /// - `ResponseHeaders`: add headers to the response
     /// - `Preflight`: return 204 with these headers immediately
+    ///
+    /// `request_headers` is the value of the incoming `Access-Control-Request-Headers`
+    /// header. When present on a preflight, its value is reflected as-is in the
+    /// `Access-Control-Allow-Headers` response header (mirroring the behaviour of
+    /// the TS `cors` npm package). When absent, the static `ALLOW_HEADERS` list is
+    /// used as a fallback.
     #[allow(dead_code)]
-    pub fn process(&self, method: &str, request_origin: Option<&str>) -> CorsResult {
+    pub fn process(
+        &self,
+        method: &str,
+        request_origin: Option<&str>,
+        request_headers: Option<&str>,
+    ) -> CorsResult {
         match &self.config {
             CorsConfig::Disabled => CorsResult::Disabled,
             _ if method.eq_ignore_ascii_case("OPTIONS") => {
-                CorsResult::Preflight(self.build_preflight(request_origin))
+                CorsResult::Preflight(self.build_preflight(request_origin, request_headers))
             }
             _ => CorsResult::ResponseHeaders(self.build_response(request_origin)),
         }
@@ -129,14 +141,23 @@ impl CorsHandler {
     }
 
     #[allow(dead_code)]
-    fn build_preflight(&self, request_origin: Option<&str>) -> Vec<(String, String)> {
+    fn build_preflight(
+        &self,
+        request_origin: Option<&str>,
+        request_headers: Option<&str>,
+    ) -> Vec<(String, String)> {
+        // Mirror the TS `cors` npm package: if the browser sent
+        // Access-Control-Request-Headers, reflect that value as-is.
+        // Otherwise fall back to the static ALLOW_HEADERS list.
+        let allow_headers = request_headers.unwrap_or(ALLOW_HEADERS);
+
         match &self.config {
             CorsConfig::Disabled => vec![],
             CorsConfig::Wildcard => {
                 let mut h = vec![
                     header("Access-Control-Allow-Origin", "*"),
                     header("Access-Control-Allow-Methods", ALLOW_METHODS),
-                    header("Access-Control-Allow-Headers", ALLOW_HEADERS),
+                    header("Access-Control-Allow-Headers", allow_headers),
                     header("Access-Control-Max-Age", MAX_AGE),
                 ];
                 if self.expose_session_header {
@@ -153,7 +174,7 @@ impl CorsHandler {
                     if self.origin_allowed(origin) {
                         h.push(header("Access-Control-Allow-Origin", origin));
                         h.push(header("Access-Control-Allow-Methods", ALLOW_METHODS));
-                        h.push(header("Access-Control-Allow-Headers", ALLOW_HEADERS));
+                        h.push(header("Access-Control-Allow-Headers", allow_headers));
                         h.push(header("Access-Control-Max-Age", MAX_AGE));
                         if self.expose_session_header {
                             h.push(header(
@@ -237,7 +258,7 @@ mod tests {
         let h = disabled();
         assert!(!h.is_enabled());
         assert!(matches!(
-            h.process("GET", Some("https://example.com")),
+            h.process("GET", Some("https://example.com"), None),
             CorsResult::Disabled
         ));
     }
@@ -246,7 +267,7 @@ mod tests {
     fn disabled_no_options_handling() {
         let h = disabled();
         assert!(matches!(
-            h.process("OPTIONS", Some("https://example.com")),
+            h.process("OPTIONS", Some("https://example.com"), None),
             CorsResult::Disabled
         ));
     }
@@ -257,7 +278,7 @@ mod tests {
     fn wildcard_allow_all_on_response() {
         let h = wildcard(false);
         assert!(h.is_enabled());
-        let result = h.process("POST", Some("https://any-origin.com"));
+        let result = h.process("POST", Some("https://any-origin.com"), None);
         match result {
             CorsResult::ResponseHeaders(headers) => {
                 assert_eq!(find_header(&headers, "Access-Control-Allow-Origin"), Some("*"));
@@ -273,7 +294,7 @@ mod tests {
     #[test]
     fn wildcard_options_preflight() {
         let h = wildcard(false);
-        let result = h.process("OPTIONS", Some("https://any-origin.com"));
+        let result = h.process("OPTIONS", Some("https://any-origin.com"), None);
         match result {
             CorsResult::Preflight(headers) => {
                 assert_eq!(find_header(&headers, "Access-Control-Allow-Origin"), Some("*"));
@@ -296,7 +317,7 @@ mod tests {
     fn wildcard_no_credentials() {
         // Credentials safety: wildcard must NOT be combined with Allow-Credentials.
         let h = wildcard(false);
-        match h.process("GET", None) {
+        match h.process("GET", None, None) {
             CorsResult::ResponseHeaders(headers) => {
                 assert_eq!(find_header(&headers, "Access-Control-Allow-Origin"), Some("*"));
                 assert!(find_header(&headers, "Access-Control-Allow-Credentials").is_none());
@@ -313,7 +334,7 @@ mod tests {
             vec![CorsOrigin::Literal("https://example.com".into())],
             false,
         );
-        match h.process("GET", Some("https://example.com")) {
+        match h.process("GET", Some("https://example.com"), None) {
             CorsResult::ResponseHeaders(headers) => {
                 assert_eq!(
                     find_header(&headers, "Access-Control-Allow-Origin"),
@@ -331,7 +352,7 @@ mod tests {
             vec![CorsOrigin::Literal("https://example.com".into())],
             false,
         );
-        match h.process("GET", Some("https://evil.com")) {
+        match h.process("GET", Some("https://evil.com"), None) {
             CorsResult::ResponseHeaders(headers) => {
                 // No Allow-Origin for unmatched origin
                 assert!(find_header(&headers, "Access-Control-Allow-Origin").is_none());
@@ -348,7 +369,7 @@ mod tests {
             vec![CorsOrigin::Literal("https://example.com".into())],
             false,
         );
-        match h.process("GET", None) {
+        match h.process("GET", None, None) {
             CorsResult::ResponseHeaders(headers) => {
                 assert!(find_header(&headers, "Access-Control-Allow-Origin").is_none());
                 assert_eq!(find_header(&headers, "Vary"), Some("Origin"));
@@ -363,7 +384,7 @@ mod tests {
     fn regex_origin_matched() {
         let re = Regex::new(r"^https://.*\.example\.com$").unwrap();
         let h = allow_list(vec![CorsOrigin::Regex(re)], false);
-        match h.process("GET", Some("https://sub.example.com")) {
+        match h.process("GET", Some("https://sub.example.com"), None) {
             CorsResult::ResponseHeaders(headers) => {
                 assert_eq!(
                     find_header(&headers, "Access-Control-Allow-Origin"),
@@ -378,7 +399,7 @@ mod tests {
     fn regex_origin_not_matched() {
         let re = Regex::new(r"^https://.*\.example\.com$").unwrap();
         let h = allow_list(vec![CorsOrigin::Regex(re)], false);
-        match h.process("GET", Some("https://evil.com")) {
+        match h.process("GET", Some("https://evil.com"), None) {
             CorsResult::ResponseHeaders(headers) => {
                 assert!(find_header(&headers, "Access-Control-Allow-Origin").is_none());
             }
@@ -398,7 +419,7 @@ mod tests {
         );
 
         // Exact match
-        match h.process("GET", Some("https://prod.example.com")) {
+        match h.process("GET", Some("https://prod.example.com"), None) {
             CorsResult::ResponseHeaders(headers) => {
                 assert_eq!(
                     find_header(&headers, "Access-Control-Allow-Origin"),
@@ -409,7 +430,7 @@ mod tests {
         }
 
         // Regex match
-        match h.process("GET", Some("https://app.dev")) {
+        match h.process("GET", Some("https://app.dev"), None) {
             CorsResult::ResponseHeaders(headers) => {
                 assert_eq!(
                     find_header(&headers, "Access-Control-Allow-Origin"),
@@ -420,7 +441,7 @@ mod tests {
         }
 
         // Neither
-        match h.process("GET", Some("https://other.com")) {
+        match h.process("GET", Some("https://other.com"), None) {
             CorsResult::ResponseHeaders(headers) => {
                 assert!(find_header(&headers, "Access-Control-Allow-Origin").is_none());
             }
@@ -436,7 +457,7 @@ mod tests {
             vec![CorsOrigin::Literal("https://example.com".into())],
             false,
         );
-        match h.process("OPTIONS", Some("https://example.com")) {
+        match h.process("OPTIONS", Some("https://example.com"), None) {
             CorsResult::Preflight(headers) => {
                 assert_eq!(
                     find_header(&headers, "Access-Control-Allow-Origin"),
@@ -457,7 +478,7 @@ mod tests {
             vec![CorsOrigin::Literal("https://example.com".into())],
             false,
         );
-        match h.process("OPTIONS", Some("https://evil.com")) {
+        match h.process("OPTIONS", Some("https://evil.com"), None) {
             CorsResult::Preflight(headers) => {
                 // No Allow-Origin
                 assert!(find_header(&headers, "Access-Control-Allow-Origin").is_none());
@@ -475,7 +496,7 @@ mod tests {
     #[test]
     fn expose_session_header_when_enabled() {
         let h = wildcard(true);
-        match h.process("GET", Some("https://example.com")) {
+        match h.process("GET", Some("https://example.com"), None) {
             CorsResult::ResponseHeaders(headers) => {
                 assert_eq!(
                     find_header(&headers, "Access-Control-Expose-Headers"),
@@ -489,7 +510,7 @@ mod tests {
     #[test]
     fn no_expose_session_header_when_disabled() {
         let h = wildcard(false);
-        match h.process("GET", Some("https://example.com")) {
+        match h.process("GET", Some("https://example.com"), None) {
             CorsResult::ResponseHeaders(headers) => {
                 assert!(find_header(&headers, "Access-Control-Expose-Headers").is_none());
             }
@@ -500,7 +521,7 @@ mod tests {
     #[test]
     fn expose_session_on_preflight() {
         let h = wildcard(true);
-        match h.process("OPTIONS", Some("https://example.com")) {
+        match h.process("OPTIONS", Some("https://example.com"), None) {
             CorsResult::Preflight(headers) => {
                 assert_eq!(
                     find_header(&headers, "Access-Control-Expose-Headers"),
@@ -517,7 +538,7 @@ mod tests {
             vec![CorsOrigin::Literal("https://example.com".into())],
             true,
         );
-        match h.process("GET", Some("https://example.com")) {
+        match h.process("GET", Some("https://example.com"), None) {
             CorsResult::ResponseHeaders(headers) => {
                 assert_eq!(
                     find_header(&headers, "Access-Control-Expose-Headers"),
@@ -534,11 +555,11 @@ mod tests {
     fn options_case_insensitive() {
         let h = wildcard(false);
         assert!(matches!(
-            h.process("options", Some("https://x.com")),
+            h.process("options", Some("https://x.com"), None),
             CorsResult::Preflight(_)
         ));
         assert!(matches!(
-            h.process("Options", Some("https://x.com")),
+            h.process("Options", Some("https://x.com"), None),
             CorsResult::Preflight(_)
         ));
     }
@@ -553,7 +574,7 @@ mod tests {
         );
 
         // Matched origin
-        match h.process("GET", Some("https://example.com")) {
+        match h.process("GET", Some("https://example.com"), None) {
             CorsResult::ResponseHeaders(headers) => {
                 assert_eq!(find_header(&headers, "Vary"), Some("Origin"));
             }
@@ -561,7 +582,7 @@ mod tests {
         }
 
         // Unmatched origin — still has Vary
-        match h.process("GET", Some("https://other.com")) {
+        match h.process("GET", Some("https://other.com"), None) {
             CorsResult::ResponseHeaders(headers) => {
                 assert_eq!(find_header(&headers, "Vary"), Some("Origin"));
             }
@@ -572,11 +593,69 @@ mod tests {
     #[test]
     fn no_vary_in_wildcard_mode() {
         let h = wildcard(false);
-        match h.process("GET", Some("https://example.com")) {
+        match h.process("GET", Some("https://example.com"), None) {
             CorsResult::ResponseHeaders(headers) => {
                 assert!(find_header(&headers, "Vary").is_none());
             }
             _ => panic!("expected ResponseHeaders"),
+        }
+    }
+
+    // ─── Dynamic Access-Control-Request-Headers reflection ──────────
+
+    #[test]
+    fn preflight_reflects_request_headers_wildcard() {
+        let h = wildcard(false);
+        let result = h.process(
+            "OPTIONS",
+            Some("https://example.com"),
+            Some("Authorization, X-Custom-Header"),
+        );
+        match result {
+            CorsResult::Preflight(headers) => {
+                assert_eq!(
+                    find_header(&headers, "Access-Control-Allow-Headers"),
+                    Some("Authorization, X-Custom-Header")
+                );
+            }
+            _ => panic!("expected Preflight"),
+        }
+    }
+
+    #[test]
+    fn preflight_reflects_request_headers_allowlist() {
+        let h = allow_list(
+            vec![CorsOrigin::Literal("https://example.com".into())],
+            false,
+        );
+        let result = h.process(
+            "OPTIONS",
+            Some("https://example.com"),
+            Some("Authorization, Content-Type, X-Requested-With"),
+        );
+        match result {
+            CorsResult::Preflight(headers) => {
+                assert_eq!(
+                    find_header(&headers, "Access-Control-Allow-Headers"),
+                    Some("Authorization, Content-Type, X-Requested-With")
+                );
+            }
+            _ => panic!("expected Preflight"),
+        }
+    }
+
+    #[test]
+    fn preflight_falls_back_to_static_headers_when_absent() {
+        let h = wildcard(false);
+        let result = h.process("OPTIONS", Some("https://example.com"), None);
+        match result {
+            CorsResult::Preflight(headers) => {
+                assert_eq!(
+                    find_header(&headers, "Access-Control-Allow-Headers"),
+                    Some(ALLOW_HEADERS)
+                );
+            }
+            _ => panic!("expected Preflight"),
         }
     }
 
