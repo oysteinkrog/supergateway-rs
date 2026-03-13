@@ -83,7 +83,7 @@ pub struct ChildBridge {
     pid: Pid,
     pgid: Pid,
     stdin: Mutex<Option<ChildStdin>>,
-    stdout_rx: Mutex<async_mpsc::Receiver<Result<Parsed, CodecError>>>,
+    stdout_rx: Mutex<Option<async_mpsc::Receiver<Result<Parsed, CodecError>>>>,
     dead: Arc<AtomicBool>,
     exit_code: Arc<Mutex<Option<i32>>>,
     stdout_handle: Option<JoinHandle<()>>,
@@ -183,7 +183,7 @@ impl ChildBridge {
             pid,
             pgid,
             stdin: Mutex::new(child_stdin),
-            stdout_rx: Mutex::new(stdout_rx),
+            stdout_rx: Mutex::new(Some(stdout_rx)),
             dead,
             exit_code,
             stdout_handle: Some(stdout_handle),
@@ -194,15 +194,31 @@ impl ChildBridge {
         })
     }
 
-    /// Receive the next message from child stdout (blocking).
+    /// Take exclusive ownership of the stdout receiver for async use.
     ///
-    /// Returns `Err(StdoutClosed)` on EOF.
+    /// Returns `Some(rx)` on first call; subsequent calls return `None`.
+    /// Relay loops (sse.rs, ws.rs) should call this once and use
+    /// `rx.recv(cx).await` directly instead of the spin-polling methods below.
+    #[allow(dead_code)]
+    pub fn take_stdout_rx(
+        &self,
+    ) -> Option<async_mpsc::Receiver<Result<Parsed, CodecError>>> {
+        self.stdout_rx.lock().unwrap().take()
+    }
+
+    /// Receive the next message from child stdout (blocking spin-poll).
+    ///
+    /// Prefer `take_stdout_rx()` + `rx.recv(cx).await` for async callers.
+    /// This method is for sync contexts (stateful_http, stateless_http relay threads).
+    ///
+    /// Returns `Err(StdoutClosed)` on EOF or if rx was already taken.
     /// Returns `Err(Codec(e))` on fatal codec errors (InvalidUtf8, BufferOverflow).
     #[allow(dead_code)]
     pub fn recv_message(&self) -> Result<Parsed, ChildError> {
         loop {
             let guard = self.stdout_rx.lock().unwrap();
-            match guard.try_recv() {
+            let rx = guard.as_ref().ok_or(ChildError::StdoutClosed)?;
+            match rx.try_recv() {
                 Ok(Ok(parsed)) => return Ok(parsed),
                 Ok(Err(codec_err)) => return Err(ChildError::Codec(codec_err)),
                 Err(async_mpsc::RecvError::Empty) => {
@@ -220,7 +236,8 @@ impl ChildBridge {
     #[allow(dead_code)]
     pub fn try_recv_message(&self) -> Result<Option<Parsed>, ChildError> {
         let guard = self.stdout_rx.lock().unwrap();
-        match guard.try_recv() {
+        let rx = guard.as_ref().ok_or(ChildError::StdoutClosed)?;
+        match rx.try_recv() {
             Ok(Ok(parsed)) => Ok(Some(parsed)),
             Ok(Err(codec_err)) => Err(ChildError::Codec(codec_err)),
             Err(async_mpsc::RecvError::Empty) => Ok(None),
@@ -231,13 +248,14 @@ impl ChildBridge {
     /// Receive the next message from child stdout, blocking up to `timeout`.
     ///
     /// Returns `Err(Timeout)` if no message arrives within `timeout`.
-    /// Returns `Err(StdoutClosed)` on EOF.
+    /// Returns `Err(StdoutClosed)` on EOF or if rx was already taken.
     #[allow(dead_code)]
     pub fn recv_message_timeout(&self, timeout: Duration) -> Result<Parsed, ChildError> {
         let deadline = Instant::now() + timeout;
         loop {
             let guard = self.stdout_rx.lock().unwrap();
-            match guard.try_recv() {
+            let rx = guard.as_ref().ok_or(ChildError::StdoutClosed)?;
+            match rx.try_recv() {
                 Ok(Ok(parsed)) => return Ok(parsed),
                 Ok(Err(codec_err)) => return Err(ChildError::Codec(codec_err)),
                 Err(async_mpsc::RecvError::Empty) => {

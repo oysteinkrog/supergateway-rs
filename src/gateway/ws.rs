@@ -49,7 +49,7 @@ use asupersync::http::h1::{Http1Codec, Method as H1Method};
 use asupersync::io::AsyncWriteExt;
 use asupersync::net::TcpListener as AsyncTcpListener;
 use asupersync::net::websocket::{Frame, FrameCodec, ServerHandshake, HttpRequest as WsHttpRequest};
-use asupersync::runtime::{spawn_blocking, JoinHandle, RuntimeHandle};
+use asupersync::runtime::{JoinHandle, RuntimeHandle};
 use asupersync::stream::StreamExt;
 use asupersync::time::{timeout, wall_now};
 
@@ -353,17 +353,31 @@ impl WsGateway {
             .expect("spawn ws-relay thread")
     }
 
-    /// Async relay loop: reads child stdout via spawn_blocking, routes to clients.
+    /// Async relay loop: reads child stdout directly via async recv, routes to clients.
+    ///
+    /// Takes ownership of the child's stdout receiver for zero-copy async polling.
     #[allow(dead_code)]
     pub async fn run_relay_async(&self) -> Option<i32> {
-        let child = self.child.clone();
+        let cx = asupersync::Cx::current().expect("run_relay_async must run in task context");
+        let mut rx = match self.child.take_stdout_rx() {
+            Some(r) => r,
+            None => {
+                self.logger.error("stdout_rx already taken by another relay");
+                return None;
+            }
+        };
         loop {
-            let child_clone = child.clone();
-            let result = spawn_blocking(move || child_clone.recv_message()).await;
+            let result = match rx.recv(&cx).await {
+                Ok(r) => r,
+                Err(_) => {
+                    self.logger.info("child stdout channel closed");
+                    break;
+                }
+            };
             let parsed = match result {
                 Ok(p) => p,
                 Err(e) => {
-                    self.logger.info(&format!("child stdout closed: {e}"));
+                    self.logger.info(&format!("child codec error: {e}"));
                     break;
                 }
             };
