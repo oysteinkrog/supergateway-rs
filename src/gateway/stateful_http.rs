@@ -1344,7 +1344,16 @@ async fn handle_stateful_connection_async(
             .collect(),
     };
 
-    match gw.handle_request(&gw_req) {
+    // Run handle_request on a blocking thread: POST handler spins up to RESPONSE_TIMEOUT
+    // waiting for child responses — must not block the async executor.
+    let result = asupersync::runtime::spawn_blocking({
+        let gw = gw.clone();
+        let gw_req = gw_req;
+        move || gw.handle_request(&gw_req)
+    })
+    .await;
+
+    match result {
         RequestResult::Response(resp) => {
             let reason = super::sse::http_reason(resp.status);
             let parts = framed.into_parts();
