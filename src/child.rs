@@ -3,10 +3,11 @@ use std::io::{self, BufReader};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
+
+use asupersync::channel::mpsc as async_mpsc;
 
 use nix::sys::signal::{self, Signal};
 use nix::unistd::Pid;
@@ -82,7 +83,7 @@ pub struct ChildBridge {
     pid: Pid,
     pgid: Pid,
     stdin: Mutex<Option<ChildStdin>>,
-    stdout_rx: Mutex<Receiver<Result<Parsed, CodecError>>>,
+    stdout_rx: Mutex<async_mpsc::Receiver<Result<Parsed, CodecError>>>,
     dead: Arc<AtomicBool>,
     exit_code: Arc<Mutex<Option<i32>>>,
     stdout_handle: Option<JoinHandle<()>>,
@@ -138,7 +139,7 @@ impl ChildBridge {
 
         let dead = Arc::new(AtomicBool::new(false));
         let exit_code: Arc<Mutex<Option<i32>>> = Arc::new(Mutex::new(None));
-        let (stdout_tx, stdout_rx) = mpsc::sync_channel(STDOUT_CHANNEL_CAP);
+        let (stdout_tx, stdout_rx) = async_mpsc::channel::<Result<Parsed, CodecError>>(STDOUT_CHANNEL_CAP);
 
         // ─── stdout reader thread ──────────────────────────────────────
         let stdout_metrics = metrics.clone();
@@ -199,11 +200,17 @@ impl ChildBridge {
     /// Returns `Err(Codec(e))` on fatal codec errors (InvalidUtf8, BufferOverflow).
     #[allow(dead_code)]
     pub fn recv_message(&self) -> Result<Parsed, ChildError> {
-        let rx = self.stdout_rx.lock().unwrap();
-        match rx.recv() {
-            Ok(Ok(parsed)) => Ok(parsed),
-            Ok(Err(codec_err)) => Err(ChildError::Codec(codec_err)),
-            Err(_) => Err(ChildError::StdoutClosed),
+        loop {
+            let guard = self.stdout_rx.lock().unwrap();
+            match guard.try_recv() {
+                Ok(Ok(parsed)) => return Ok(parsed),
+                Ok(Err(codec_err)) => return Err(ChildError::Codec(codec_err)),
+                Err(async_mpsc::RecvError::Empty) => {
+                    drop(guard); // release lock before sleeping
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(_) => return Err(ChildError::StdoutClosed),
+            }
         }
     }
 
@@ -212,12 +219,12 @@ impl ChildBridge {
     /// Returns `Ok(None)` if no message is available yet.
     #[allow(dead_code)]
     pub fn try_recv_message(&self) -> Result<Option<Parsed>, ChildError> {
-        let rx = self.stdout_rx.lock().unwrap();
-        match rx.try_recv() {
+        let guard = self.stdout_rx.lock().unwrap();
+        match guard.try_recv() {
             Ok(Ok(parsed)) => Ok(Some(parsed)),
             Ok(Err(codec_err)) => Err(ChildError::Codec(codec_err)),
-            Err(mpsc::TryRecvError::Empty) => Ok(None),
-            Err(mpsc::TryRecvError::Disconnected) => Err(ChildError::StdoutClosed),
+            Err(async_mpsc::RecvError::Empty) => Ok(None),
+            Err(_) => Err(ChildError::StdoutClosed),
         }
     }
 
@@ -227,12 +234,21 @@ impl ChildBridge {
     /// Returns `Err(StdoutClosed)` on EOF.
     #[allow(dead_code)]
     pub fn recv_message_timeout(&self, timeout: Duration) -> Result<Parsed, ChildError> {
-        let rx = self.stdout_rx.lock().unwrap();
-        match rx.recv_timeout(timeout) {
-            Ok(Ok(parsed)) => Ok(parsed),
-            Ok(Err(codec_err)) => Err(ChildError::Codec(codec_err)),
-            Err(mpsc::RecvTimeoutError::Timeout) => Err(ChildError::Timeout),
-            Err(mpsc::RecvTimeoutError::Disconnected) => Err(ChildError::StdoutClosed),
+        let deadline = Instant::now() + timeout;
+        loop {
+            let guard = self.stdout_rx.lock().unwrap();
+            match guard.try_recv() {
+                Ok(Ok(parsed)) => return Ok(parsed),
+                Ok(Err(codec_err)) => return Err(ChildError::Codec(codec_err)),
+                Err(async_mpsc::RecvError::Empty) => {
+                    drop(guard);
+                    if Instant::now() >= deadline {
+                        return Err(ChildError::Timeout);
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(_) => return Err(ChildError::StdoutClosed),
+            }
         }
     }
 
@@ -327,7 +343,7 @@ impl ChildBridge {
     #[allow(dead_code)]
     fn stdout_reader_loop(
         reader: std::process::ChildStdout,
-        tx: SyncSender<Result<Parsed, CodecError>>,
+        tx: async_mpsc::Sender<Result<Parsed, CodecError>>,
         metrics: Arc<Metrics>,
         logger: Arc<Logger>,
         dead: Arc<AtomicBool>,
@@ -336,8 +352,18 @@ impl ChildBridge {
         loop {
             match codec.read_message(&metrics, &logger) {
                 Ok(Some(parsed)) => {
-                    if tx.send(Ok(parsed)).is_err() {
-                        break; // receiver dropped
+                    // try_send with backpressure spin: block until channel has room.
+                    // On Full, reclaim value from SendError::Full(T) to avoid clone.
+                    let mut item = Ok(parsed);
+                    loop {
+                        match tx.try_send(item) {
+                            Ok(()) => break,
+                            Err(async_mpsc::SendError::Full(returned)) => {
+                                item = returned;
+                                std::thread::sleep(Duration::from_millis(1));
+                            }
+                            Err(_) => return, // receiver dropped
+                        }
                     }
                 }
                 Ok(None) => break, // EOF
@@ -345,7 +371,7 @@ impl ChildBridge {
                     if matches!(e, CodecError::InvalidUtf8 | CodecError::BufferOverflow { .. }) {
                         dead.store(true, Ordering::Release);
                     }
-                    let _ = tx.send(Err(e));
+                    let _ = tx.try_send(Err(e));
                     break; // all errors are terminal for the reader
                 }
             }
