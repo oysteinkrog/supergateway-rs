@@ -29,8 +29,17 @@
 //! Exit code 0 on signal. No explicit transport close.
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use serde_json::value::RawValue;
+
+use asupersync::bytes::Buf;
+use asupersync::channel::mpsc as async_mpsc;
+use asupersync::http::{Body, Frame};
+use asupersync::http::h1::ClientIncomingBody;
+use asupersync::http::h1::http_client::ClientIo;
+use asupersync::runtime::RuntimeHandle;
+use asupersync::time::wall_now;
 
 use crate::cli::Header;
 use crate::client::sse::{resolve_endpoint_url, SseEvent};
@@ -530,11 +539,64 @@ pub fn handle_client_error(err: &crate::client::sse::SseClientError, logger: &Lo
     }
 }
 
+// ─── Async body line reader ─────────────────────────────────────────────
+
+/// Read the next newline-terminated line from a streaming HTTP/1.1 body.
+///
+/// Accumulates bytes from `Body::poll_frame()` into `buf`, returning each
+/// `\n`-terminated line as a `String` (with trailing `\r\n` stripped).
+/// Returns `None` when the stream ends or a body error occurs.
+async fn read_body_line(
+    body: &mut ClientIncomingBody<ClientIo>,
+    buf: &mut Vec<u8>,
+) -> Option<String> {
+    use std::future::poll_fn;
+    use std::pin::Pin;
+
+    loop {
+        // Check if a complete line is already buffered.
+        if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = buf.drain(..=pos).collect();
+            let s = String::from_utf8_lossy(&line)
+                .trim_end_matches('\n')
+                .trim_end_matches('\r')
+                .to_string();
+            return Some(s);
+        }
+
+        // Need more data — poll the next body frame.
+        let frame = poll_fn(|cx| Pin::new(&mut *body).poll_frame(cx)).await;
+        match frame {
+            Some(Ok(Frame::Data(mut cursor))) => {
+                while cursor.has_remaining() {
+                    let chunk = cursor.chunk();
+                    buf.extend_from_slice(chunk);
+                    let n = chunk.len();
+                    cursor.advance(n);
+                }
+            }
+            None => {
+                // End of stream: flush remaining bytes as a final line if non-empty.
+                if !buf.is_empty() {
+                    let line = String::from_utf8_lossy(buf)
+                        .trim_end_matches('\n')
+                        .trim_end_matches('\r')
+                        .to_string();
+                    buf.clear();
+                    return Some(line);
+                }
+                return None;
+            }
+            Some(Err(_)) | Some(Ok(Frame::Trailers(_))) => return None,
+        }
+    }
+}
+
 // ─── Entry point ────────────────────────────────────────────────────────
 
 /// Run the SSE → stdio client gateway.
 #[allow(dead_code)]
-pub async fn run(_cx: &asupersync::Cx, config: crate::cli::Config) -> anyhow::Result<()> {
+pub async fn run(_cx: &asupersync::Cx, config: crate::cli::Config, rt_handle: RuntimeHandle) -> anyhow::Result<()> {
     let logger = Arc::new(Logger::new(config.output_transport, config.log_level));
     let metrics = Metrics::new();
 
@@ -547,7 +609,7 @@ pub async fn run(_cx: &asupersync::Cx, config: crate::cli::Config) -> anyhow::Re
 
     let shutdown = crate::signal::install(&logger)?;
 
-    let gw = std::sync::Arc::new(SseToStdioGateway::new(
+    let gw = Arc::new(SseToStdioGateway::new(
         config.input_value.clone(),
         config.protocol_version,
         config.headers.clone(),
@@ -555,125 +617,142 @@ pub async fn run(_cx: &asupersync::Cx, config: crate::cli::Config) -> anyhow::Re
         metrics,
     ));
 
-    let custom_headers: Vec<(String, String)> = config.headers.iter()
-        .map(|h| (h.name.clone(), h.value.clone()))
-        .collect();
+    // Async HTTP client shared by SSE reader and stdin poster.
+    let client = Arc::new(crate::client::http::HttpClient::new(&config.headers));
 
-    // Connect to remote SSE server
-    let (sse_stream, status, _resp_headers) =
-        crate::serve::http_get_sse(&config.input_value, &custom_headers, None)
-            .map_err(|e| anyhow::anyhow!("failed to connect to SSE server: {e}"))?;
+    // Connect to SSE server (async).
+    let sse_resp = client
+        .get_stream(&config.input_value, "text/event-stream", None)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to connect to SSE server: {e}"))?;
 
-    if status != 200 {
-        anyhow::bail!("SSE server returned status {status}");
+    if sse_resp.status != 200 {
+        anyhow::bail!("SSE server returned status {}", sse_resp.status);
     }
 
-    // Spawn SSE reader thread: reads events, writes to stdout, POSTs follow-ups
-    let gw_sse = std::sync::Arc::clone(&gw);
-    let custom_headers_sse = custom_headers.clone();
-    std::thread::Builder::new()
-        .name("sse-client-reader".into())
-        .spawn(move || {
-            use std::io::{BufRead, BufReader};
-            let mut reader = BufReader::new(sse_stream);
-            let mut parser = crate::client::sse::SseParser::new();
-            loop {
-                let mut line = String::new();
-                match reader.read_line(&mut line) {
-                    Ok(0) => {
-                        // EOF = stream ended
-                        handle_client_error(
-                            &crate::client::sse::SseClientError::StreamEnded,
-                            &gw_sse.logger,
-                        );
-                        break;
+    // Spawn async SSE reader: drives Body line-by-line, writes to stdout, POSTs responses.
+    let gw_sse = Arc::clone(&gw);
+    let client_sse = Arc::clone(&client);
+    rt_handle.spawn(async move {
+        let mut body = sse_resp.body.body;
+        let mut line_buf: Vec<u8> = Vec::new();
+        let mut parser = crate::client::sse::SseParser::new();
+        loop {
+            let line = match read_body_line(&mut body, &mut line_buf).await {
+                Some(l) => l,
+                None => {
+                    handle_client_error(
+                        &crate::client::sse::SseClientError::StreamEnded,
+                        &gw_sse.logger,
+                    );
+                    break;
+                }
+            };
+            let events = parser.feed(&line);
+            for event in &events {
+                let result = gw_sse.handle_sse_event(event);
+                for msg in result.stdout {
+                    let _ = write_stdout(&msg);
+                }
+                for msg in result.post {
+                    if let Some(url) = gw_sse.endpoint_url() {
+                        let body_bytes = serde_json::to_vec(&msg).unwrap_or_default();
+                        let _ = client_sse.post(&url, &body_bytes, "application/json").await;
                     }
-                    Ok(_) => {
-                        let events = parser.feed(&line);
-                        for event in &events {
-                            let result = gw_sse.handle_sse_event(event);
-                            for msg in result.stdout {
-                                let _ = write_stdout(&msg);
-                            }
-                            for msg in result.post {
-                                if let Some(url) = gw_sse.endpoint_url() {
-                                    let body = serde_json::to_vec(&msg).unwrap_or_default();
-                                    let _ = crate::serve::http_post(
-                                        &url,
-                                        &custom_headers_sse,
-                                        &body,
-                                    );
+                }
+            }
+        }
+    });
+
+    // Stdin reader thread → async channel bridge (same pattern as child.rs stdout reader).
+    let (stdin_tx, mut stdin_rx) = async_mpsc::channel::<String>(64);
+    std::thread::Builder::new()
+        .name("sse-stdin-reader".into())
+        .spawn(move || {
+            use std::io::BufRead;
+            let stdin = std::io::stdin();
+            for line in stdin.lock().lines() {
+                match line {
+                    Ok(l) => {
+                        let l = l.trim().to_string();
+                        if l.is_empty() {
+                            continue;
+                        }
+                        let mut pending = l;
+                        loop {
+                            match stdin_tx.try_send(pending) {
+                                Ok(()) => break,
+                                Err(async_mpsc::SendError::Full(returned)) => {
+                                    pending = returned;
+                                    std::thread::sleep(Duration::from_millis(1));
                                 }
+                                Err(_) => return,
                             }
                         }
                     }
-                    Err(e) => {
-                        gw_sse.logger.error(&format!("SSE stream read error: {e}"));
-                        break;
-                    }
+                    Err(_) => break,
                 }
             }
         })
-        .expect("spawn sse-client-reader thread");
+        .expect("spawn sse-stdin-reader thread");
 
-    // Stdin reader loop: read JSON-RPC from stdin, POST to endpoint
-    use std::io::BufRead;
-    let stdin = std::io::stdin();
-    for line in stdin.lock().lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => break,
-        };
-        let line = line.trim().to_string();
-        if line.is_empty() {
-            continue;
-        }
+    // Async stdin processor: receives lines, POSTs to endpoint URL.
+    let gw_stdin = Arc::clone(&gw);
+    let client_stdin = Arc::clone(&client);
+    rt_handle.spawn(async move {
+        let cx = asupersync::Cx::current().expect("stdin processor must run in task context");
+        loop {
+            let line = match stdin_rx.recv(&cx).await {
+                Ok(l) => l,
+                Err(_) => break,
+            };
 
-        let msg = match crate::jsonrpc::parse_line(&line) {
-            Ok(crate::jsonrpc::Parsed::Single(m)) => m,
-            Ok(crate::jsonrpc::Parsed::Batch(_)) => continue,
-            Err(_) => continue,
-        };
-
-        let to_post = match gw.handle_stdin_message(msg) {
-            StdinAction::Post(msgs) => msgs,
-            StdinAction::PostInit(msg) => vec![msg],
-            StdinAction::Buffered => continue,
-        };
-
-        // Wait for endpoint URL (up to ~2 seconds)
-        let url = {
-            let mut attempts = 0u32;
-            loop {
-                if let Some(url) = gw.endpoint_url() {
-                    break url;
-                }
-                if attempts >= 200 {
-                    gw.logger.error("endpoint URL not discovered, dropping message");
-                    break String::new();
-                }
-                attempts += 1;
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-        };
-
-        if url.is_empty() {
-            continue;
-        }
-
-        for msg in to_post {
-            let body = match serde_json::to_vec(&msg) {
-                Ok(b) => b,
+            let msg = match crate::jsonrpc::parse_line(&line) {
+                Ok(crate::jsonrpc::Parsed::Single(m)) => m,
+                Ok(crate::jsonrpc::Parsed::Batch(_)) => continue,
                 Err(_) => continue,
             };
-            if let Err(e) = crate::serve::http_post(&url, &custom_headers, &body) {
-                gw.logger.error(&format!("POST to endpoint failed: {e}"));
+
+            let to_post = match gw_stdin.handle_stdin_message(msg) {
+                StdinAction::Post(msgs) => msgs,
+                StdinAction::PostInit(msg) => vec![msg],
+                StdinAction::Buffered => continue,
+            };
+
+            // Wait for endpoint URL (up to ~2 seconds, 10 ms poll interval).
+            let url = {
+                let mut attempts = 0u32;
+                loop {
+                    if let Some(url) = gw_stdin.endpoint_url() {
+                        break url;
+                    }
+                    if attempts >= 200 {
+                        gw_stdin.logger.error("endpoint URL not discovered, dropping message");
+                        break String::new();
+                    }
+                    attempts += 1;
+                    asupersync::time::sleep(wall_now(), Duration::from_millis(10)).await;
+                }
+            };
+
+            if url.is_empty() {
+                continue;
+            }
+
+            for msg in to_post {
+                let body_bytes = match serde_json::to_vec(&msg) {
+                    Ok(b) => b,
+                    Err(_) => continue,
+                };
+                if let Err(e) = client_stdin.post(&url, &body_bytes, "application/json").await {
+                    gw_stdin.logger.error(&format!("POST to endpoint failed: {e}"));
+                }
             }
         }
-    }
+    });
 
-    // Block until signal (SIGINT/SIGTERM/SIGHUP)
-    let sig = shutdown.wait();
+    // Wait for signal (SIGINT/SIGTERM/SIGHUP).
+    let sig = asupersync::runtime::spawn_blocking(move || shutdown.wait()).await;
     logger.info(&format!("received {}, shutting down", crate::signal::signal_name(sig)));
     // D-016: exit code 0 on signal
     std::process::exit(0);

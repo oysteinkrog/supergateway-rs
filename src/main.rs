@@ -35,9 +35,9 @@ async fn async_main(rt_handle: asupersync::runtime::RuntimeHandle) -> anyhow::Re
         (InputMode::Stdio, OutputTransport::StreamableHttp) => {
             gateway::stateless_http::run(&cx, config, rt_handle).await
         }
-        (InputMode::Sse, OutputTransport::Stdio) => gateway::sse_to_stdio::run(&cx, config).await,
+        (InputMode::Sse, OutputTransport::Stdio) => gateway::sse_to_stdio::run(&cx, config, rt_handle).await,
         (InputMode::StreamableHttp, OutputTransport::Stdio) => {
-            gateway::http_to_stdio::run(&cx, config).await
+            gateway::http_to_stdio::run(&cx, config, rt_handle).await
         }
         _ => anyhow::bail!(
             "unsupported transport combination: {:?} -> {}",
