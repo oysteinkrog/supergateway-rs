@@ -26,9 +26,13 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use asupersync::channel::mpsc as async_mpsc;
-
+use asupersync::codec::Framed;
+use asupersync::http::h1::Http1Codec;
+use asupersync::io::AsyncWriteExt;
+use asupersync::net::TcpListener as AsyncTcpListener;
 use asupersync::runtime::RuntimeHandle;
-use asupersync::time::{sleep as async_sleep, wall_now};
+use asupersync::stream::StreamExt;
+use asupersync::time::{sleep as async_sleep, timeout, wall_now};
 
 use crate::child::ChildBridge;
 use crate::cli::{Config, CorsConfig, Header};
@@ -1249,10 +1253,11 @@ pub async fn run(_cx: &asupersync::Cx, config: Config, rt_handle: RuntimeHandle)
         config.port,
     );
 
-    let _shutdown = crate::signal::install(&logger)?;
+    let shutdown = crate::signal::install(&logger)?;
 
     let session_timeout = config.session_timeout.map(Duration::from_millis);
     let metrics_ready = metrics.clone();
+    let rt_handle2 = rt_handle.clone();
     let gw = StatefulHttpGateway::new(
         config.input_value,
         config.streamable_http_path,
@@ -1262,110 +1267,148 @@ pub async fn run(_cx: &asupersync::Cx, config: Config, rt_handle: RuntimeHandle)
         session_timeout,
         metrics,
         logger,
-        rt_handle,
+        rt_handle2,
     );
     let gw = std::sync::Arc::new(gw);
 
-    // Bind TCP listener
-    let listener = std::net::TcpListener::bind(format!("0.0.0.0:{}", config.port))
+    // Bind async TCP listener
+    let listener = AsyncTcpListener::bind(format!("0.0.0.0:{}", config.port))
+        .await
         .map_err(|e| anyhow::anyhow!("failed to bind port {}: {e}", config.port))?;
 
     // Mark gateway as ready
     metrics_ready.set_ready();
 
-    // Accept loop
-    for stream in listener.incoming() {
-        let stream = match stream {
-            Ok(s) => s,
-            Err(_) => break,
-        };
-        let gw = std::sync::Arc::clone(&gw);
-        std::thread::Builder::new()
-            .name("stateful-http-conn".into())
-            .spawn(move || {
-                handle_stateful_connection(stream, &gw);
-            })
-            .ok();
-    }
+    // Accept loop as async task
+    let accept_gw = gw.clone();
+    let rt_accept = rt_handle.clone();
+    rt_handle.spawn(async move {
+        loop {
+            match listener.accept().await {
+                Ok((stream, _addr)) => {
+                    let gw = accept_gw.clone();
+                    rt_accept.spawn(handle_stateful_connection_async(stream, gw));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    // Wait for shutdown signal (blocking, run on blocking thread pool)
+    let sig = asupersync::runtime::spawn_blocking(move || shutdown.wait()).await;
+    gw.logger.info(&format!(
+        "received {}, shutting down",
+        crate::signal::signal_name(sig)
+    ));
     Ok(())
 }
 
-fn handle_stateful_connection(
-    stream: std::net::TcpStream,
-    gw: &StatefulHttpGateway,
+async fn handle_stateful_connection_async(
+    stream: asupersync::net::TcpStream,
+    gw: Arc<StatefulHttpGateway>,
 ) {
-    use crate::serve;
-    use std::io::Write;
-
-    let req = match serve::parse_request(&stream) {
-        Some(r) => r,
+    let cx = match asupersync::Cx::current() {
+        Some(c) => c,
         None => return,
     };
 
+    let mut framed = Framed::new(stream, Http1Codec::new());
+    let req = match framed.next().await {
+        Some(Ok(r)) => r,
+        _ => return,
+    };
+
+    let uri = req.uri.clone();
+    let (path, query_str) = if let Some(pos) = uri.find('?') {
+        (&uri[..pos], &uri[pos + 1..])
+    } else {
+        (uri.as_str(), "")
+    };
+
     let gw_req = GatewayRequest {
-        method: req.method.clone(),
-        path: req.path.clone(),
-        headers: req.headers.clone(),
-        body: req.body.clone(),
-        query: req.query.split('&').filter_map(|pair| {
-            let mut kv = pair.splitn(2, '=');
-            let k = kv.next()?.to_string();
-            let v = kv.next().unwrap_or("").to_string();
-            if k.is_empty() { None } else { Some((k, v)) }
-        }).collect(),
+        method: req.method.as_str().to_string(),
+        path: path.to_string(),
+        headers: req.headers.into_iter().map(|(k, v)| (k.to_ascii_lowercase(), v)).collect(),
+        body: req.body,
+        query: query_str
+            .split('&')
+            .filter_map(|pair| {
+                if pair.is_empty() {
+                    return None;
+                }
+                let mut kv = pair.splitn(2, '=');
+                let k = kv.next()?.to_string();
+                let v = kv.next().unwrap_or("").to_string();
+                if k.is_empty() { None } else { Some((k, v)) }
+            })
+            .collect(),
     };
 
     match gw.handle_request(&gw_req) {
         RequestResult::Response(resp) => {
-            let mut s = stream;
             let reason = super::sse::http_reason(resp.status);
-            let _ = serve::write_response(&mut s, resp.status, reason, &resp.headers, &resp.body);
+            let parts = framed.into_parts();
+            let mut stream = parts.inner;
+            write_stateful_response_async(&mut stream, resp.status, reason, &resp.headers, &resp.body).await;
         }
-        RequestResult::SseStream(conn) => {
-            let mut s = stream;
-            if serve::write_sse_response_headers(&mut s, &conn.headers).is_err() {
+        RequestResult::SseStream(mut conn) => {
+            let parts = framed.into_parts();
+            let mut stream = parts.inner;
+
+            // Write SSE response headers
+            let mut header_bytes: Vec<u8> = b"HTTP/1.1 200 OK\r\n".to_vec();
+            for (name, value) in &conn.headers {
+                header_bytes.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
+            }
+            header_bytes.extend_from_slice(b"\r\n");
+
+            if stream.write_all(&header_bytes).await.is_err() {
                 gw.disconnect_sse_stream(&conn.session_id);
                 return;
             }
 
+            // Stream SSE events with async recv + keepalive timeout
             loop {
-                // Poll for message with keepalive timeout using try_recv + sleep spin
-                let deadline = Instant::now() + KEEPALIVE_INTERVAL;
-                let msg = loop {
-                    match conn.receiver.try_recv() {
-                        Ok(msg) => break Some(msg),
-                        Err(async_mpsc::RecvError::Empty) => {
-                            if Instant::now() >= deadline {
-                                break None; // timeout → send keepalive
-                            }
-                            std::thread::sleep(Duration::from_millis(5));
-                        }
-                        Err(_) => {
-                            // channel disconnected
-                            gw.disconnect_sse_stream(&conn.session_id);
-                            return;
-                        }
-                    }
-                };
-                match msg {
-                    Some(msg) => {
+                match timeout(wall_now(), KEEPALIVE_INTERVAL, conn.receiver.recv(&cx)).await {
+                    Ok(Ok(msg)) => {
                         let event = format_sse_event(&msg);
-                        if s.write_all(event.as_bytes()).is_err() || s.flush().is_err() {
+                        if stream.write_all(event.as_bytes()).await.is_err() {
                             break;
                         }
                     }
-                    None => {
-                        if s.write_all(format_sse_keepalive().as_bytes()).is_err()
-                            || s.flush().is_err()
+                    Err(_elapsed) => {
+                        // Keepalive
+                        if stream
+                            .write_all(format_sse_keepalive().as_bytes())
+                            .await
+                            .is_err()
                         {
                             break;
                         }
                     }
+                    Ok(Err(_recv_err)) => break, // channel closed / child died
                 }
             }
             gw.disconnect_sse_stream(&conn.session_id);
         }
     }
+}
+
+async fn write_stateful_response_async(
+    stream: &mut asupersync::net::TcpStream,
+    status: u16,
+    reason: &str,
+    headers: &[(String, String)],
+    body: &[u8],
+) {
+    let mut buf = format!("HTTP/1.1 {status} {reason}\r\n").into_bytes();
+    buf.extend_from_slice(format!("Content-Length: {}\r\n", body.len()).as_bytes());
+    for (name, value) in headers {
+        buf.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
+    }
+    buf.extend_from_slice(b"\r\n");
+    buf.extend_from_slice(body);
+    let _ = stream.write_all(&buf).await;
 }
 
 // ─── Tests ─────────────────────────────────────────────────────────────
