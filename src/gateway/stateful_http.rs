@@ -22,16 +22,16 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+use asupersync::channel::mpsc as async_mpsc;
 
 use asupersync::runtime::RuntimeHandle;
 use asupersync::time::{sleep as async_sleep, wall_now};
 
 use crate::child::ChildBridge;
 use crate::cli::{Config, CorsConfig, Header};
-use crate::codec;
 use crate::cors::{self, CorsHandler, CorsResult};
 use crate::error::GatewayError;
 use crate::health;
@@ -80,13 +80,13 @@ pub struct SessionData {
     ///
     /// POST handlers insert entries; the relay thread sends matching responses
     /// and removes entries. Stale/unmatched responses are logged and discarded.
-    pending_requests: RwLock<HashMap<String, SyncSender<RawMessage>>>,
+    pending_requests: RwLock<HashMap<String, async_mpsc::Sender<RawMessage>>>,
 
     /// Sender for the GET SSE notification stream.
-    notification_tx: SyncSender<RawMessage>,
+    notification_tx: async_mpsc::Sender<RawMessage>,
 
     /// Receiver for GET SSE notifications — taken by first GET handler.
-    notification_rx: Mutex<Option<Receiver<RawMessage>>>,
+    notification_rx: Mutex<Option<async_mpsc::Receiver<RawMessage>>>,
 
     /// Whether the initialize response has been seen.
     init_done: AtomicBool,
@@ -118,7 +118,7 @@ impl SessionData {
         metrics: Arc<Metrics>,
     ) -> Self {
         let (notification_tx, notification_rx) =
-            mpsc::sync_channel(NOTIFICATION_CHANNEL_CAP);
+            async_mpsc::channel::<RawMessage>(NOTIFICATION_CHANNEL_CAP);
         Self {
             child,
             pending_requests: RwLock::new(HashMap::new()),
@@ -135,7 +135,7 @@ impl SessionData {
 
     /// Register a pending request id → response channel.
     #[allow(dead_code)]
-    fn register_pending(&self, id: &str, tx: SyncSender<RawMessage>) {
+    fn register_pending(&self, id: &str, tx: async_mpsc::Sender<RawMessage>) {
         self.pending_requests
             .write()
             .unwrap()
@@ -158,7 +158,7 @@ impl SessionData {
 
         match tx {
             Some(sender) => {
-                if sender.send(msg.clone()).is_err() {
+                if sender.try_send(msg.clone()).is_err() {
                     self.logger.debug("response channel closed (POST handler gone)");
                 }
                 true
@@ -187,11 +187,11 @@ impl SessionData {
 
         match self.notification_tx.try_send(msg) {
             Ok(()) => {}
-            Err(TrySendError::Full(_)) => {
+            Err(async_mpsc::SendError::Full(_)) => {
                 Metrics::inc(&self.metrics.backpressure_events);
                 self.logger.info("notification channel full, backpressure active");
             }
-            Err(TrySendError::Disconnected(_)) => {
+            Err(_) => {
                 self.logger.debug("notification channel disconnected (no GET SSE stream)");
             }
         }
@@ -221,7 +221,7 @@ impl SessionData {
     /// Send error responses to all pending POST handlers.
     #[allow(dead_code)]
     fn fail_pending_requests(&self, code: i32, message: &str) {
-        let pending: HashMap<String, SyncSender<RawMessage>> = {
+        let pending: HashMap<String, async_mpsc::Sender<RawMessage>> = {
             let mut map = self.pending_requests.write().unwrap();
             std::mem::take(&mut *map)
         };
@@ -232,13 +232,13 @@ impl SessionData {
                     serde_json::value::RawValue::from_string("null".into()).unwrap()
                 });
             let err_msg = RawMessage::error_response(Some(id_raw), code, message);
-            let _ = tx.send(err_msg);
+            let _ = tx.try_send(err_msg);
         }
     }
 
     /// Take the notification receiver (for GET SSE stream). Returns None if already taken.
     #[allow(dead_code)]
-    fn take_notification_rx(&self) -> Option<Receiver<RawMessage>> {
+    fn take_notification_rx(&self) -> Option<async_mpsc::Receiver<RawMessage>> {
         self.notification_rx.lock().unwrap().take()
     }
 }
@@ -463,7 +463,7 @@ pub struct SseStreamConnection {
     /// Response headers to write (Content-Type, Cache-Control, etc.).
     pub headers: Vec<(String, String)>,
     /// Receiver for notification messages from the child relay thread.
-    pub receiver: Receiver<RawMessage>,
+    pub receiver: async_mpsc::Receiver<RawMessage>,
     /// Access guard — holds the session access count alive for the stream's lifetime.
     /// The caller should keep this alive until the stream ends.
     pub guard: SessionAccessGuard,
@@ -884,7 +884,7 @@ impl StatefulHttpGateway {
         // The relay thread routes responses by ID through SessionData::route_response,
         // which sends to the matching sender. All senders point to the same channel,
         // so responses arrive in whatever order the child emits them.
-        let (tx, rx) = mpsc::sync_channel::<RawMessage>(RESPONSE_CHANNEL_CAP);
+        let (tx, rx) = async_mpsc::channel::<RawMessage>(RESPONSE_CHANNEL_CAP);
 
         self.with_session(session_id, |data| {
             for id_str in &request_ids {
@@ -899,32 +899,34 @@ impl StatefulHttpGateway {
             request_ids.iter().cloned().collect();
         let mut responses: HashMap<String, RawMessage> = HashMap::new();
 
-        let deadline = std::time::Instant::now() + RESPONSE_TIMEOUT;
-        while !pending.is_empty() {
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            if remaining.is_zero() {
+        let deadline = Instant::now() + RESPONSE_TIMEOUT;
+        'outer: while !pending.is_empty() {
+            if Instant::now() >= deadline {
                 self.logger.error(&format!(
                     "session {session_id}: response timeout after {RESPONSE_TIMEOUT:?}"
                 ));
                 break;
             }
-            match rx.recv_timeout(remaining) {
-                Ok(msg) => {
-                    if let Some(ref id) = msg.id {
-                        let id_str = id.get().to_string();
-                        pending.remove(&id_str);
-                        responses.insert(id_str, msg);
+            loop {
+                match rx.try_recv() {
+                    Ok(msg) => {
+                        if let Some(ref id) = msg.id {
+                            let id_str = id.get().to_string();
+                            pending.remove(&id_str);
+                            responses.insert(id_str, msg);
+                        }
+                        break; // go back to check pending is_empty
                     }
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    self.logger.error(&format!(
-                        "session {session_id}: response timeout after {RESPONSE_TIMEOUT:?}"
-                    ));
-                    break;
-                }
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    // Relay thread died (child exited)
-                    break;
+                    Err(async_mpsc::RecvError::Empty) => {
+                        if Instant::now() >= deadline {
+                            self.logger.error(&format!(
+                                "session {session_id}: response timeout after {RESPONSE_TIMEOUT:?}"
+                            ));
+                            break 'outer;
+                        }
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(_) => break 'outer, // relay thread died
                 }
             }
         }
@@ -1236,7 +1238,7 @@ fn spawn_relay_for_session(
 
 /// Run the stdio → Streamable HTTP (stateful) gateway.
 #[allow(dead_code)]
-pub async fn run(config: Config, rt_handle: RuntimeHandle) -> anyhow::Result<()> {
+pub async fn run(_cx: &asupersync::Cx, config: Config, rt_handle: RuntimeHandle) -> anyhow::Result<()> {
     let logger = Arc::new(Logger::new(config.output_transport, config.log_level));
     let metrics = Metrics::new();
 
@@ -1250,7 +1252,8 @@ pub async fn run(config: Config, rt_handle: RuntimeHandle) -> anyhow::Result<()>
     let _shutdown = crate::signal::install(&logger)?;
 
     let session_timeout = config.session_timeout.map(Duration::from_millis);
-    let _gw = StatefulHttpGateway::new(
+    let metrics_ready = metrics.clone();
+    let gw = StatefulHttpGateway::new(
         config.input_value,
         config.streamable_http_path,
         config.health_endpoints,
@@ -1261,9 +1264,108 @@ pub async fn run(config: Config, rt_handle: RuntimeHandle) -> anyhow::Result<()>
         logger,
         rt_handle,
     );
+    let gw = std::sync::Arc::new(gw);
 
-    // TODO: Wire up TCP listener + HTTP serving (upcoming bead)
-    anyhow::bail!("stdio->stateful HTTP serving not yet implemented")
+    // Bind TCP listener
+    let listener = std::net::TcpListener::bind(format!("0.0.0.0:{}", config.port))
+        .map_err(|e| anyhow::anyhow!("failed to bind port {}: {e}", config.port))?;
+
+    // Mark gateway as ready
+    metrics_ready.set_ready();
+
+    // Accept loop
+    for stream in listener.incoming() {
+        let stream = match stream {
+            Ok(s) => s,
+            Err(_) => break,
+        };
+        let gw = std::sync::Arc::clone(&gw);
+        std::thread::Builder::new()
+            .name("stateful-http-conn".into())
+            .spawn(move || {
+                handle_stateful_connection(stream, &gw);
+            })
+            .ok();
+    }
+    Ok(())
+}
+
+fn handle_stateful_connection(
+    stream: std::net::TcpStream,
+    gw: &StatefulHttpGateway,
+) {
+    use crate::serve;
+    use std::io::Write;
+
+    let req = match serve::parse_request(&stream) {
+        Some(r) => r,
+        None => return,
+    };
+
+    let gw_req = GatewayRequest {
+        method: req.method.clone(),
+        path: req.path.clone(),
+        headers: req.headers.clone(),
+        body: req.body.clone(),
+        query: req.query.split('&').filter_map(|pair| {
+            let mut kv = pair.splitn(2, '=');
+            let k = kv.next()?.to_string();
+            let v = kv.next().unwrap_or("").to_string();
+            if k.is_empty() { None } else { Some((k, v)) }
+        }).collect(),
+    };
+
+    match gw.handle_request(&gw_req) {
+        RequestResult::Response(resp) => {
+            let mut s = stream;
+            let reason = super::sse::http_reason(resp.status);
+            let _ = serve::write_response(&mut s, resp.status, reason, &resp.headers, &resp.body);
+        }
+        RequestResult::SseStream(conn) => {
+            let mut s = stream;
+            if serve::write_sse_response_headers(&mut s, &conn.headers).is_err() {
+                gw.disconnect_sse_stream(&conn.session_id);
+                return;
+            }
+
+            loop {
+                // Poll for message with keepalive timeout using try_recv + sleep spin
+                let deadline = Instant::now() + KEEPALIVE_INTERVAL;
+                let msg = loop {
+                    match conn.receiver.try_recv() {
+                        Ok(msg) => break Some(msg),
+                        Err(async_mpsc::RecvError::Empty) => {
+                            if Instant::now() >= deadline {
+                                break None; // timeout → send keepalive
+                            }
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(_) => {
+                            // channel disconnected
+                            gw.disconnect_sse_stream(&conn.session_id);
+                            return;
+                        }
+                    }
+                };
+                match msg {
+                    Some(msg) => {
+                        let event = format_sse_event(&msg);
+                        if s.write_all(event.as_bytes()).is_err() || s.flush().is_err() {
+                            break;
+                        }
+                    }
+                    None => {
+                        if s.write_all(format_sse_keepalive().as_bytes()).is_err()
+                            || s.flush().is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
+            gw.disconnect_sse_stream(&conn.session_id);
+        }
+    }
 }
 
 // ─── Tests ─────────────────────────────────────────────────────────────
@@ -1273,6 +1375,23 @@ mod tests {
     use super::*;
     use crate::cli::{LogLevel, OutputTransport};
     use serde_json::value::RawValue;
+
+    /// Blocking receive with timeout for sync unit tests (polls try_recv).
+    fn recv_timeout_blocking<T>(rx: &async_mpsc::Receiver<T>, timeout: Duration) -> Option<T> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match rx.try_recv() {
+                Ok(val) => return Some(val),
+                Err(async_mpsc::RecvError::Empty) => {
+                    if Instant::now() >= deadline {
+                        return None;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => return None,
+            }
+        }
+    }
 
     fn test_rt_handle() -> RuntimeHandle {
         static RT: std::sync::OnceLock<asupersync::runtime::Runtime> = std::sync::OnceLock::new();
@@ -1400,7 +1519,7 @@ mod tests {
         let data = SessionData::new(child, logger, metrics);
 
         // Register a pending request
-        let (tx, rx) = mpsc::sync_channel(1);
+        let (tx, rx) = async_mpsc::channel::<RawMessage>(1);
         data.register_pending("1", tx);
 
         // Route a response
@@ -1408,7 +1527,7 @@ mod tests {
         assert!(data.route_response(&resp));
 
         // Should receive on the channel
-        let received = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let received = recv_timeout_blocking(&rx, Duration::from_secs(1)).unwrap();
         assert!(received.is_response());
         assert_eq!(received.id.as_ref().unwrap().get(), "1");
 
@@ -1547,18 +1666,18 @@ mod tests {
         let child = ChildBridge::spawn("true", metrics.clone(), logger.clone()).unwrap();
         let data = SessionData::new(child, logger, metrics);
 
-        let (tx1, rx1) = mpsc::sync_channel(1);
-        let (tx2, rx2) = mpsc::sync_channel(1);
+        let (tx1, rx1) = async_mpsc::channel::<RawMessage>(1);
+        let (tx2, rx2) = async_mpsc::channel::<RawMessage>(1);
         data.register_pending("1", tx1);
         data.register_pending("\"abc\"", tx2);
 
         data.fail_pending_requests(-32603, "Child process dead");
 
-        let err1 = rx1.recv_timeout(Duration::from_secs(1)).unwrap();
+        let err1 = recv_timeout_blocking(&rx1, Duration::from_secs(1)).unwrap();
         assert!(err1.is_response());
         assert!(err1.error.is_some());
 
-        let err2 = rx2.recv_timeout(Duration::from_secs(1)).unwrap();
+        let err2 = recv_timeout_blocking(&rx2, Duration::from_secs(1)).unwrap();
         assert!(err2.is_response());
         assert!(err2.error.is_some());
 
