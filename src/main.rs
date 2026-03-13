@@ -8,7 +8,6 @@ mod gateway;
 mod health;
 mod jsonrpc;
 mod observe;
-mod serve;
 mod session;
 mod signal;
 
