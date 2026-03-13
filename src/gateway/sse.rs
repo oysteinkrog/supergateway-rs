@@ -26,11 +26,17 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
-use std::sync::Arc;
-
-use parking_lot::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+use asupersync::channel::mpsc as async_mpsc;
+use asupersync::codec::Framed;
+use asupersync::http::h1::{Http1Codec, Method as H1Method};
+use asupersync::io::AsyncWriteExt;
+use asupersync::net::TcpListener as AsyncTcpListener;
+use asupersync::runtime::{spawn_blocking, JoinHandle, RuntimeHandle};
+use asupersync::stream::StreamExt;
+use asupersync::time::{timeout, wall_now};
 
 use crate::child::ChildBridge;
 use crate::cli::{Header, LogLevel};
@@ -99,7 +105,7 @@ impl SseEvent {
 
 #[allow(dead_code)]
 struct ClientState {
-    tx: SyncSender<SseEvent>,
+    tx: async_mpsc::Sender<SseEvent>,
     /// When backpressure started (channel full). None = healthy.
     backpressure_since: Option<Instant>,
 }
@@ -157,7 +163,7 @@ pub struct SseConnection {
     /// Response headers for the SSE stream.
     pub headers: Vec<(String, String)>,
     /// Receiver for SSE events. The caller reads and writes to HTTP response.
-    pub receiver: Receiver<SseEvent>,
+    pub receiver: async_mpsc::Receiver<SseEvent>,
 }
 
 // ─── SseGateway ─────────────────────────────────────────────────────
@@ -266,7 +272,7 @@ impl SseGateway {
                             }
                         };
 
-                        let mut state = self.inner.lock();
+                        let mut state = self.inner.lock().unwrap();
 
                         if state.early_buffer.is_some() && state.clients.is_empty() {
                             // No clients yet — buffer the message
@@ -308,6 +314,71 @@ impl SseGateway {
             .expect("spawn sse-relay thread")
     }
 
+    /// Async relay loop: reads child stdout via spawn_blocking, broadcasts to clients.
+    ///
+    /// Uses `spawn_blocking` to bridge blocking child I/O to the async executor.
+    #[allow(dead_code)]
+    pub async fn run_relay_async(&self) -> Option<i32> {
+        let child = self.child.clone();
+        loop {
+            let child_clone = child.clone();
+            let result = spawn_blocking(move || child_clone.recv_message()).await;
+            let parsed = match result {
+                Ok(p) => p,
+                Err(e) => {
+                    self.logger.info(&format!("child stdout closed: {e}"));
+                    break;
+                }
+            };
+
+            let messages = match parsed {
+                Parsed::Single(msg) => vec![msg],
+                Parsed::Batch(msgs) => msgs,
+            };
+
+            for msg in messages {
+                let json = match serde_json::to_string(&msg) {
+                    Ok(j) => j,
+                    Err(e) => {
+                        self.logger
+                            .error(&format!("failed to serialize child message: {e}"));
+                        continue;
+                    }
+                };
+
+                let mut state = self.inner.lock().unwrap();
+
+                if state.early_buffer.is_some() && state.clients.is_empty() {
+                    let buf = state.early_buffer.as_mut().unwrap();
+                    if buf.len() < EARLY_BUFFER_CAP {
+                        buf.push(json);
+                    } else {
+                        self.logger.debug("early buffer full, dropping message");
+                    }
+                    continue;
+                }
+
+                Self::broadcast_locked(
+                    &mut state,
+                    &json,
+                    &self.event_counter,
+                    &self.metrics,
+                    &self.logger,
+                );
+            }
+        }
+
+        self.child.kill();
+        self.child.exit_code()
+    }
+
+    /// Spawn the async relay as a runtime task.
+    #[allow(dead_code)]
+    pub fn spawn_relay_async(&self, rt_handle: &RuntimeHandle) -> JoinHandle<Option<i32>> {
+        let gw = self.clone();
+        rt_handle.spawn(async move { gw.run_relay_async().await })
+    }
+
     /// Broadcast a JSON message to all connected clients.
     ///
     /// Handles backpressure: if a client's channel is full for >30s,
@@ -331,7 +402,7 @@ impl SseGateway {
                         logger.debug(&format!("backpressure resolved for session {id}"));
                     }
                 }
-                Err(TrySendError::Full(_)) => {
+                Err(async_mpsc::SendError::Full(_)) => {
                     let now = Instant::now();
                     match client.backpressure_since {
                         Some(since) if now.duration_since(since) >= BACKPRESSURE_TIMEOUT => {
@@ -349,7 +420,8 @@ impl SseGateway {
                         }
                     }
                 }
-                Err(TrySendError::Disconnected(_)) => {
+                Err(_) => {
+                    // Disconnected or Cancelled
                     to_remove.push(id.clone());
                 }
             }
@@ -375,9 +447,13 @@ impl SseGateway {
     ///
     /// Returns `Err(GatewayResponse)` with HTTP 503 if the client limit is reached (D-102).
     #[allow(dead_code)]
-    pub fn handle_sse_connect(&self, origin: Option<&str>) -> Result<SseConnection, GatewayResponse> {
+    pub fn handle_sse_connect(
+        &self,
+        origin: Option<&str>,
+        host: Option<&str>,
+    ) -> Result<SseConnection, GatewayResponse> {
         // Enforce max concurrent clients (D-102).
-        if self.inner.lock().clients.len() >= MAX_SSE_CLIENTS {
+        if self.inner.lock().unwrap().clients.len() >= MAX_SSE_CLIENTS {
             return Err(GatewayResponse::new(503, "Too Many Connections"));
         }
 
@@ -388,13 +464,21 @@ impl SseGateway {
         };
 
         let session_id = SessionId::new();
-        let (tx, rx) = mpsc::sync_channel(CLIENT_CHANNEL_CAP);
+        let (tx, rx) = async_mpsc::channel::<SseEvent>(CLIENT_CHANNEL_CAP);
 
         // Build endpoint URL: baseUrl + messagePath + ?sessionId=<id>
+        // When base_url is empty, derive from Host header if available (absolute URL required by MCP clients).
         // NO slash normalization (per spec)
+        let base = if !self.base_url.is_empty() {
+            self.base_url.clone()
+        } else if let Some(h) = host {
+            format!("http://{h}")
+        } else {
+            String::new()
+        };
         let endpoint_url = format!(
             "{}{}?sessionId={}",
-            self.base_url,
+            base,
             self.message_path,
             session_id.as_str()
         );
@@ -404,7 +488,7 @@ impl SseGateway {
 
         // Register client and drain early buffer
         {
-            let mut state = self.inner.lock();
+            let mut state = self.inner.lock().unwrap();
 
             if let Some(buffer) = state.early_buffer.take() {
                 for json in buffer {
@@ -452,7 +536,7 @@ impl SseGateway {
     #[allow(dead_code)]
     pub fn disconnect_client(&self, id: &SessionId) {
         let removed = {
-            let mut state = self.inner.lock();
+            let mut state = self.inner.lock().unwrap();
             state.clients.remove(id).is_some()
         };
 
@@ -496,7 +580,7 @@ impl SseGateway {
 
         // Validate session exists
         {
-            let state = self.inner.lock();
+            let state = self.inner.lock().unwrap();
             if !state
                 .clients
                 .contains_key(&SessionId::from_value(session_id_str))
@@ -631,7 +715,7 @@ impl SseGateway {
     /// Number of connected SSE clients.
     #[allow(dead_code)]
     pub fn client_count(&self) -> usize {
-        self.inner.lock().clients.len()
+        self.inner.lock().unwrap().clients.len()
     }
 
     /// Check if the child process is dead.
@@ -645,7 +729,11 @@ impl SseGateway {
 
 /// Run the stdio → SSE gateway.
 #[allow(dead_code)]
-pub async fn run(config: crate::cli::Config) -> anyhow::Result<()> {
+pub async fn run(
+    _cx: &asupersync::Cx,
+    config: crate::cli::Config,
+    rt_handle: RuntimeHandle,
+) -> anyhow::Result<()> {
     let logger = Arc::new(Logger::new(config.output_transport, config.log_level));
     let metrics = Metrics::new();
 
@@ -665,10 +753,11 @@ pub async fn run(config: crate::cli::Config) -> anyhow::Result<()> {
     )?);
 
     let cors_handler = CorsHandler::new(config.cors, false);
-    let _gw = SseGateway::new(
+    let metrics_ready = metrics.clone();
+    let gw = SseGateway::new(
         child,
         config.base_url,
-        config.message_path,
+        config.message_path.clone(),
         cors_handler,
         config.headers,
         metrics,
@@ -677,8 +766,210 @@ pub async fn run(config: crate::cli::Config) -> anyhow::Result<()> {
         config.health_endpoints,
     );
 
-    // TODO: Wire up TCP listener + HTTP serving (upcoming bead)
-    anyhow::bail!("stdio->SSE serving not yet implemented")
+    // Spawn async relay task (reads child stdout, broadcasts to SSE clients)
+    let relay_handle = gw.spawn_relay_async(&rt_handle);
+
+    // Bind async TCP listener
+    let listener = AsyncTcpListener::bind(format!("0.0.0.0:{}", config.port))
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to bind port {}: {e}", config.port))?;
+
+    // Mark gateway as ready (health endpoint returns 200 "ok")
+    metrics_ready.set_ready();
+
+    // Accept loop as async task
+    let sse_path = config.sse_path.clone();
+    let message_path = config.message_path.clone();
+    let accept_gw = gw.clone();
+    let rt_accept = rt_handle.clone();
+    rt_handle.spawn(async move {
+        loop {
+            match listener.accept().await {
+                Ok((stream, _addr)) => {
+                    let gw = accept_gw.clone();
+                    let sse_path = sse_path.clone();
+                    let message_path = message_path.clone();
+                    rt_accept
+                        .spawn(handle_sse_connection_async(stream, gw, sse_path, message_path));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    // Wait for relay to complete (child process exited)
+    let exit_code = relay_handle.await.unwrap_or(1);
+    std::process::exit(exit_code);
+}
+
+async fn handle_sse_connection_async(
+    stream: asupersync::net::TcpStream,
+    gw: SseGateway,
+    sse_path: String,
+    message_path: String,
+) {
+    let cx = match asupersync::Cx::current() {
+        Some(c) => c,
+        None => return,
+    };
+
+    let mut framed = Framed::new(stream, Http1Codec::new());
+    let req = match framed.next().await {
+        Some(Ok(r)) => r,
+        _ => return,
+    };
+
+    let uri = req.uri.clone();
+    let (path, query_str) = if let Some(pos) = uri.find('?') {
+        (&uri[..pos], &uri[pos + 1..])
+    } else {
+        (uri.as_str(), "")
+    };
+
+    let origin = req
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("origin"))
+        .map(|(_, v)| v.as_str());
+    let host = req
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("host"))
+        .map(|(_, v)| v.as_str());
+    let ac_req_headers = req
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("access-control-request-headers"))
+        .map(|(_, v)| v.as_str());
+
+    let detail = query_str.split('&').any(|pair| pair == "detail=true");
+
+    // Health endpoints
+    if let Some(resp) = gw.handle_health(path, detail, origin) {
+        let parts = framed.into_parts();
+        let mut stream = parts.inner;
+        write_sse_response_async(&mut stream, &resp).await;
+        return;
+    }
+
+    // OPTIONS (CORS preflight)
+    if req.method == H1Method::Options {
+        if let Some(resp) = gw.handle_options(origin, ac_req_headers) {
+            let parts = framed.into_parts();
+            let mut stream = parts.inner;
+            write_sse_response_async(&mut stream, &resp).await;
+        }
+        return;
+    }
+
+    // GET /sse → SSE stream
+    if req.method == H1Method::Get && path == sse_path {
+        let conn = match gw.handle_sse_connect(origin, host) {
+            Ok(c) => c,
+            Err(resp) => {
+                let parts = framed.into_parts();
+                let mut stream = parts.inner;
+                write_sse_response_async(&mut stream, &resp).await;
+                return;
+            }
+        };
+
+        let parts = framed.into_parts();
+        let mut stream = parts.inner;
+
+        // Write SSE response headers
+        let mut header_bytes: Vec<u8> = b"HTTP/1.1 200 OK\r\n".to_vec();
+        for (name, value) in &conn.headers {
+            header_bytes.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
+        }
+        header_bytes.extend_from_slice(b"\r\n");
+
+        if stream.write_all(&header_bytes).await.is_err() {
+            gw.disconnect_client(&conn.session_id);
+            return;
+        }
+
+        // Stream SSE events with keepalive
+        let mut rx = conn.receiver;
+        loop {
+            match timeout(wall_now(), KEEPALIVE_INTERVAL, rx.recv(&cx)).await {
+                Ok(Ok(event)) => {
+                    let data = event.serialize();
+                    if stream.write_all(data.as_bytes()).await.is_err() {
+                        break;
+                    }
+                }
+                Err(_elapsed) => {
+                    // Keepalive
+                    let ka = SseEvent::Keepalive.serialize();
+                    if stream.write_all(ka.as_bytes()).await.is_err() {
+                        break;
+                    }
+                }
+                Ok(Err(_recv_err)) => break, // channel closed
+            }
+        }
+        gw.disconnect_client(&conn.session_id);
+        return;
+    }
+
+    // POST /message?sessionId=...
+    if req.method == H1Method::Post && path == message_path {
+        let session_id = query_str.split('&').find_map(|pair| {
+            let mut kv = pair.splitn(2, '=');
+            if kv.next() == Some("sessionId") {
+                kv.next()
+            } else {
+                None
+            }
+        });
+        let resp = gw.handle_message(session_id, &req.body, origin);
+        let parts = framed.into_parts();
+        let mut stream = parts.inner;
+        write_sse_response_async(&mut stream, &resp).await;
+        return;
+    }
+
+    // 404 Not Found
+    let parts = framed.into_parts();
+    let mut stream = parts.inner;
+    let _ = stream
+        .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nNot Found")
+        .await;
+}
+
+async fn write_sse_response_async(
+    stream: &mut asupersync::net::TcpStream,
+    resp: &GatewayResponse,
+) {
+    let reason = http_reason(resp.status);
+    let mut buf = format!("HTTP/1.1 {} {}\r\n", resp.status, reason).into_bytes();
+    for (name, value) in &resp.headers {
+        buf.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
+    }
+    let body_bytes = resp.body.as_bytes();
+    buf.extend_from_slice(
+        format!("Content-Length: {}\r\n\r\n", body_bytes.len()).as_bytes(),
+    );
+    buf.extend_from_slice(body_bytes);
+    let _ = stream.write_all(&buf).await;
+}
+
+pub(crate) fn http_reason(status: u16) -> &'static str {
+    match status {
+        200 => "OK",
+        202 => "Accepted",
+        204 => "No Content",
+        400 => "Bad Request",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        406 => "Not Acceptable",
+        409 => "Conflict",
+        413 => "Payload Too Large",
+        500 => "Internal Server Error",
+        503 => "Service Unavailable",
+        _ => "Unknown",
+    }
 }
 
 #[cfg(test)]
@@ -686,6 +977,23 @@ mod tests {
     use super::*;
     use crate::cli::{CorsConfig, LogLevel, OutputTransport};
     use std::sync::atomic::Ordering;
+
+    /// Blocking receive with timeout for sync unit tests (polls try_recv).
+    fn recv_timeout_blocking(rx: &async_mpsc::Receiver<SseEvent>, timeout: Duration) -> Option<SseEvent> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            match rx.try_recv() {
+                Ok(val) => return Some(val),
+                Err(async_mpsc::RecvError::Empty) => {
+                    if std::time::Instant::now() >= deadline {
+                        return None;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => return None,
+            }
+        }
+    }
 
     #[allow(dead_code)]
     fn test_metrics() -> Arc<Metrics> {
@@ -753,7 +1061,7 @@ mod tests {
     #[test]
     fn connect_returns_endpoint_event() {
         let gw = make_gateway("cat");
-        let conn = gw.handle_sse_connect(None).unwrap();
+        let conn = gw.handle_sse_connect(None, None).unwrap();
 
         // First event should be endpoint
         let first = conn.receiver.try_recv().unwrap();
@@ -786,7 +1094,7 @@ mod tests {
             vec![],
         );
 
-        let conn = gw.handle_sse_connect(None).unwrap();
+        let conn = gw.handle_sse_connect(None, None).unwrap();
         let first = conn.receiver.try_recv().unwrap();
         match first {
             SseEvent::Endpoint(url) => {
@@ -799,7 +1107,7 @@ mod tests {
     #[test]
     fn connect_sse_response_headers() {
         let gw = make_gateway("cat");
-        let conn = gw.handle_sse_connect(None).unwrap();
+        let conn = gw.handle_sse_connect(None, None).unwrap();
 
         let find = |name: &str| -> Option<String> {
             conn.headers
@@ -819,7 +1127,7 @@ mod tests {
     #[test]
     fn disconnect_removes_client() {
         let gw = make_gateway("cat");
-        let conn = gw.handle_sse_connect(None).unwrap();
+        let conn = gw.handle_sse_connect(None, None).unwrap();
         assert_eq!(gw.client_count(), 1);
 
         gw.disconnect_client(&conn.session_id);
@@ -829,7 +1137,7 @@ mod tests {
     #[test]
     fn disconnect_idempotent() {
         let gw = make_gateway("cat");
-        let conn = gw.handle_sse_connect(None).unwrap();
+        let conn = gw.handle_sse_connect(None, None).unwrap();
 
         gw.disconnect_client(&conn.session_id);
         gw.disconnect_client(&conn.session_id); // no panic
@@ -866,7 +1174,7 @@ mod tests {
     #[test]
     fn message_empty_body() {
         let gw = make_gateway("cat");
-        let conn = gw.handle_sse_connect(None).unwrap();
+        let conn = gw.handle_sse_connect(None, None).unwrap();
         let resp = gw.handle_message(Some(conn.session_id.as_str()), b"", None);
         assert_eq!(resp.status, 400);
         assert_eq!(resp.body, "Empty body");
@@ -875,7 +1183,7 @@ mod tests {
     #[test]
     fn message_too_large() {
         let gw = make_gateway("cat");
-        let conn = gw.handle_sse_connect(None).unwrap();
+        let conn = gw.handle_sse_connect(None, None).unwrap();
         let big_body = vec![b'{'; MAX_BODY_SIZE + 1];
         let resp = gw.handle_message(Some(conn.session_id.as_str()), &big_body, None);
         assert_eq!(resp.status, 413);
@@ -884,7 +1192,7 @@ mod tests {
     #[test]
     fn message_malformed_json() {
         let gw = make_gateway("cat");
-        let conn = gw.handle_sse_connect(None).unwrap();
+        let conn = gw.handle_sse_connect(None, None).unwrap();
         let resp = gw.handle_message(Some(conn.session_id.as_str()), b"not json!", None);
         assert_eq!(resp.status, 400);
     }
@@ -892,7 +1200,7 @@ mod tests {
     #[test]
     fn message_invalid_utf8() {
         let gw = make_gateway("cat");
-        let conn = gw.handle_sse_connect(None).unwrap();
+        let conn = gw.handle_sse_connect(None, None).unwrap();
         let resp = gw.handle_message(Some(conn.session_id.as_str()), &[0xFF, 0xFE], None);
         assert_eq!(resp.status, 400);
         assert_eq!(resp.body, "Invalid UTF-8");
@@ -901,7 +1209,7 @@ mod tests {
     #[test]
     fn message_valid_returns_202() {
         let gw = make_gateway("cat");
-        let conn = gw.handle_sse_connect(None).unwrap();
+        let conn = gw.handle_sse_connect(None, None).unwrap();
         let body = br#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
         let resp = gw.handle_message(Some(conn.session_id.as_str()), body, None);
         assert_eq!(resp.status, 202);
@@ -911,7 +1219,7 @@ mod tests {
     #[test]
     fn message_batch_valid() {
         let gw = make_gateway("cat");
-        let conn = gw.handle_sse_connect(None).unwrap();
+        let conn = gw.handle_sse_connect(None, None).unwrap();
         let body = br#"[{"jsonrpc":"2.0","id":1,"method":"a"},{"jsonrpc":"2.0","method":"b"}]"#;
         let resp = gw.handle_message(Some(conn.session_id.as_str()), body, None);
         assert_eq!(resp.status, 202);
@@ -922,7 +1230,7 @@ mod tests {
     #[test]
     fn relay_roundtrip() {
         let (gw, child) = make_gateway_with_child("cat");
-        let conn = gw.handle_sse_connect(None).unwrap();
+        let conn = gw.handle_sse_connect(None, None).unwrap();
 
         // Consume endpoint event
         let _ = conn.receiver.try_recv().unwrap();
@@ -937,9 +1245,7 @@ mod tests {
         assert_eq!(resp.status, 202);
 
         // Receive broadcast
-        let msg = conn
-            .receiver
-            .recv_timeout(Duration::from_secs(2))
+        let msg = recv_timeout_blocking(&conn.receiver, Duration::from_secs(2))
             .expect("should receive broadcast");
         match msg {
             SseEvent::Message(json, _) => {
@@ -963,14 +1269,14 @@ mod tests {
 
         // Simulate buffered messages by manually inserting into early_buffer
         {
-            let mut state = gw.inner.lock();
+            let mut state = gw.inner.lock().unwrap();
             let buf = state.early_buffer.as_mut().unwrap();
             buf.push(r#"{"jsonrpc":"2.0","method":"notif1"}"#.to_string());
             buf.push(r#"{"jsonrpc":"2.0","method":"notif2"}"#.to_string());
         }
 
         // Connect client — should receive buffered messages
-        let conn = gw.handle_sse_connect(None).unwrap();
+        let conn = gw.handle_sse_connect(None, None).unwrap();
 
         // First: endpoint event
         let first = conn.receiver.try_recv().unwrap();
@@ -989,7 +1295,7 @@ mod tests {
         }
 
         // Early buffer should be None now
-        assert!(gw.inner.lock().early_buffer.is_none());
+        assert!(gw.inner.lock().unwrap().early_buffer.is_none());
     }
 
     // ─── Broadcast to multiple clients ──────────────────────────────
@@ -998,8 +1304,8 @@ mod tests {
     fn broadcast_to_multiple_clients() {
         let (gw, child) = make_gateway_with_child("cat");
 
-        let conn1 = gw.handle_sse_connect(None).unwrap();
-        let conn2 = gw.handle_sse_connect(None).unwrap();
+        let conn1 = gw.handle_sse_connect(None, None).unwrap();
+        let conn2 = gw.handle_sse_connect(None, None).unwrap();
         assert_eq!(gw.client_count(), 2);
 
         // Consume endpoint events
@@ -1016,14 +1322,8 @@ mod tests {
         assert_eq!(resp.status, 202);
 
         // Both clients should receive the broadcast
-        let msg1 = conn1
-            .receiver
-            .recv_timeout(Duration::from_secs(2))
-            .unwrap();
-        let msg2 = conn2
-            .receiver
-            .recv_timeout(Duration::from_secs(2))
-            .unwrap();
+        let msg1 = recv_timeout_blocking(&conn1.receiver, Duration::from_secs(2)).unwrap();
+        let msg2 = recv_timeout_blocking(&conn2.receiver, Duration::from_secs(2)).unwrap();
 
         for msg in [&msg1, &msg2] {
             match msg {
@@ -1053,7 +1353,7 @@ mod tests {
         }
         assert!(child.is_dead());
 
-        let conn = gw.handle_sse_connect(None).unwrap();
+        let conn = gw.handle_sse_connect(None, None).unwrap();
         let body = br#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
         let resp = gw.handle_message(Some(conn.session_id.as_str()), body, None);
         assert_eq!(resp.status, 502);
@@ -1105,7 +1405,7 @@ mod tests {
             vec![],
         );
 
-        let conn = gw.handle_sse_connect(Some("https://example.com")).unwrap();
+        let conn = gw.handle_sse_connect(Some("https://example.com"), None).unwrap();
         let body = br#"{"jsonrpc":"2.0","id":1,"method":"test"}"#;
         let resp = gw.handle_message(
             Some(conn.session_id.as_str()),
@@ -1176,7 +1476,7 @@ mod tests {
         );
 
         // Check on SSE connect
-        let conn = gw.handle_sse_connect(None).unwrap();
+        let conn = gw.handle_sse_connect(None, None).unwrap();
         let has_custom = conn
             .headers
             .iter()
@@ -1213,7 +1513,7 @@ mod tests {
             vec![],
         );
 
-        let conn = gw.handle_sse_connect(None).unwrap();
+        let conn = gw.handle_sse_connect(None, None).unwrap();
         assert_eq!(metrics.active_clients.load(Ordering::Relaxed), 1);
 
         gw.disconnect_client(&conn.session_id);
@@ -1239,7 +1539,7 @@ mod tests {
             vec![],
         );
 
-        let conn = gw.handle_sse_connect(None).unwrap();
+        let conn = gw.handle_sse_connect(None, None).unwrap();
         let body = br#"{"jsonrpc":"2.0","id":1,"method":"test"}"#;
         gw.handle_message(Some(conn.session_id.as_str()), body, None);
         assert_eq!(metrics.total_requests.load(Ordering::Relaxed), 1);
@@ -1257,7 +1557,7 @@ mod tests {
         let mut connections = Vec::new();
 
         for _ in 0..20 {
-            let conn = gw.handle_sse_connect(None).unwrap();
+            let conn = gw.handle_sse_connect(None, None).unwrap();
             connections.push(conn);
         }
         assert_eq!(gw.client_count(), 20);
@@ -1276,11 +1576,11 @@ mod tests {
         let gw = make_gateway("cat");
         let mut connections = Vec::new();
         for _ in 0..MAX_SSE_CLIENTS {
-            connections.push(gw.handle_sse_connect(None).unwrap());
+            connections.push(gw.handle_sse_connect(None, None).unwrap());
         }
         assert_eq!(gw.client_count(), MAX_SSE_CLIENTS);
 
-        match gw.handle_sse_connect(None) {
+        match gw.handle_sse_connect(None, None) {
             Err(resp) => assert_eq!(resp.status, 503),
             Ok(_) => panic!("expected 503, but connect succeeded"),
         }

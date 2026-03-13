@@ -37,11 +37,21 @@
 //! - D-105: Custom headers applied in WS mode (improvement over TS)
 
 use std::collections::HashMap;
-use parking_lot::Mutex;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+use asupersync::channel::mpsc as async_mpsc;
+use asupersync::channel::mpsc::RecvError;
+use asupersync::codec::{Decoder, Encoder, Framed};
+use asupersync::http::h1::{Http1Codec, Method as H1Method};
+use asupersync::io::AsyncWriteExt;
+use asupersync::net::TcpListener as AsyncTcpListener;
+use asupersync::net::websocket::{Frame, FrameCodec, ServerHandshake, HttpRequest as WsHttpRequest};
+use asupersync::runtime::{spawn_blocking, JoinHandle, RuntimeHandle};
+use asupersync::stream::StreamExt;
+use asupersync::time::{timeout, wall_now};
 
 use serde_json::value::RawValue;
 
@@ -109,7 +119,7 @@ pub enum WsEvent {
 
 #[allow(dead_code)]
 struct ClientState {
-    tx: SyncSender<WsEvent>,
+    tx: async_mpsc::Sender<WsEvent>,
     /// When backpressure started (channel full). None = healthy.
     backpressure_since: Option<Instant>,
 }
@@ -148,7 +158,7 @@ impl IdMultiplexer {
     #[allow(dead_code)]
     fn mangle(&self, client_id: &SessionId, original_id: &RawValue) -> u64 {
         let mangled = self.next_id.fetch_add(1, Ordering::Relaxed);
-        self.pending.lock().insert(
+        self.pending.lock().unwrap().insert(
             mangled,
             (client_id.clone(), original_id.to_owned()),
         );
@@ -158,14 +168,14 @@ impl IdMultiplexer {
     /// Look up and remove a mangled ID. Returns (client_id, original_id).
     #[allow(dead_code)]
     fn unmangle(&self, mangled: u64) -> Option<(SessionId, Box<RawValue>)> {
-        self.pending.lock().remove(&mangled)
+        self.pending.lock().unwrap().remove(&mangled)
     }
 
     /// Remove all pending entries for a specific client (on disconnect).
     #[allow(dead_code)]
     fn remove_client(&self, client_id: &SessionId) {
         self.pending
-            .lock()
+            .lock().unwrap()
             .retain(|_, (cid, _)| cid != client_id);
     }
 }
@@ -221,7 +231,7 @@ pub struct WsConnection {
     /// Client ID for this connection.
     pub client_id: SessionId,
     /// Receiver for outgoing WS events. The caller reads and writes to WebSocket.
-    pub receiver: Receiver<WsEvent>,
+    pub receiver: async_mpsc::Receiver<WsEvent>,
 }
 
 // ─── WsGateway ─────────────────────────────────────────────────────
@@ -343,6 +353,43 @@ impl WsGateway {
             .expect("spawn ws-relay thread")
     }
 
+    /// Async relay loop: reads child stdout via spawn_blocking, routes to clients.
+    #[allow(dead_code)]
+    pub async fn run_relay_async(&self) -> Option<i32> {
+        let child = self.child.clone();
+        loop {
+            let child_clone = child.clone();
+            let result = spawn_blocking(move || child_clone.recv_message()).await;
+            let parsed = match result {
+                Ok(p) => p,
+                Err(e) => {
+                    self.logger.info(&format!("child stdout closed: {e}"));
+                    break;
+                }
+            };
+
+            let messages = match parsed {
+                crate::jsonrpc::Parsed::Single(msg) => vec![msg],
+                crate::jsonrpc::Parsed::Batch(msgs) => msgs,
+            };
+
+            for msg in messages {
+                self.route_message(msg);
+            }
+        }
+
+        self.close_all_clients(WS_CLOSE_INTERNAL, "child process exited");
+        self.child.kill();
+        self.child.exit_code()
+    }
+
+    /// Spawn the async relay as a runtime task.
+    #[allow(dead_code)]
+    pub fn spawn_relay_async(&self, rt_handle: &RuntimeHandle) -> JoinHandle<Option<i32>> {
+        let gw = self.clone();
+        rt_handle.spawn(async move { gw.run_relay_async().await })
+    }
+
     /// Route a single child stdout message to the appropriate client(s).
     #[allow(dead_code)]
     fn route_message(&self, msg: RawMessage) {
@@ -407,7 +454,7 @@ impl WsGateway {
             }
         };
 
-        let mut state = self.inner.lock();
+        let mut state = self.inner.lock().unwrap();
         if let Some(client) = state.clients.get_mut(&client_id) {
             match client.tx.try_send(WsEvent::Message(json)) {
                 Ok(()) => {
@@ -417,10 +464,11 @@ impl WsGateway {
                         ));
                     }
                 }
-                Err(TrySendError::Full(_)) => {
+                Err(async_mpsc::SendError::Full(_)) => {
                     self.handle_backpressure(&mut state, &client_id);
                 }
-                Err(TrySendError::Disconnected(_)) => {
+                Err(_) => {
+                    // Disconnected or Cancelled
                     self.remove_client_locked(&mut state, &client_id);
                 }
             }
@@ -439,7 +487,7 @@ impl WsGateway {
             }
         };
 
-        let mut state = self.inner.lock();
+        let mut state = self.inner.lock().unwrap();
 
         if state.early_buffer.is_some() && state.clients.is_empty() {
             // No clients yet — buffer the message
@@ -464,7 +512,7 @@ impl WsGateway {
                             .debug(&format!("backpressure resolved for client {id}"));
                     }
                 }
-                Err(TrySendError::Full(_)) => {
+                Err(async_mpsc::SendError::Full(_)) => {
                     let now = Instant::now();
                     match client.backpressure_since {
                         Some(since)
@@ -485,7 +533,8 @@ impl WsGateway {
                         }
                     }
                 }
-                Err(TrySendError::Disconnected(_)) => {
+                Err(_) => {
+                    // Disconnected or Cancelled
                     to_remove.push(id.clone());
                 }
             }
@@ -539,7 +588,7 @@ impl WsGateway {
     /// Close all connected clients with a close frame (D-007).
     #[allow(dead_code)]
     fn close_all_clients(&self, code: u16, reason: &str) {
-        let mut state = self.inner.lock();
+        let mut state = self.inner.lock().unwrap();
         let client_ids: Vec<SessionId> = state.clients.keys().cloned().collect();
 
         for id in &client_ids {
@@ -575,16 +624,16 @@ impl WsGateway {
     #[allow(dead_code)]
     pub fn handle_ws_connect(&self) -> Result<WsConnection, GatewayResponse> {
         // Enforce max concurrent clients (D-102).
-        if self.inner.lock().clients.len() >= MAX_WS_CLIENTS {
+        if self.inner.lock().unwrap().clients.len() >= MAX_WS_CLIENTS {
             return Err(GatewayResponse::new(503, "Too Many Connections"));
         }
 
         let client_id = SessionId::new();
-        let (tx, rx) = mpsc::sync_channel(CLIENT_CHANNEL_CAP);
+        let (tx, rx) = async_mpsc::channel::<WsEvent>(CLIENT_CHANNEL_CAP);
 
         // Register client and drain early buffer
         {
-            let mut state = self.inner.lock();
+            let mut state = self.inner.lock().unwrap();
 
             if let Some(buffer) = state.early_buffer.take() {
                 // Send buffered messages to this first client
@@ -680,7 +729,7 @@ impl WsGateway {
     #[allow(dead_code)]
     pub fn disconnect_client(&self, client_id: &SessionId) {
         let removed = {
-            let mut state = self.inner.lock();
+            let mut state = self.inner.lock().unwrap();
             state.clients.remove(client_id).is_some()
         };
 
@@ -747,7 +796,7 @@ impl WsGateway {
     /// Number of connected WebSocket clients.
     #[allow(dead_code)]
     pub fn client_count(&self) -> usize {
-        self.inner.lock().clients.len()
+        self.inner.lock().unwrap().clients.len()
     }
 
     /// Check if the child process is dead.
@@ -770,7 +819,11 @@ impl WsGateway {
 
 /// Run the stdio → WebSocket gateway.
 #[allow(dead_code)]
-pub async fn run(config: crate::cli::Config) -> anyhow::Result<()> {
+pub async fn run(
+    _cx: &asupersync::Cx,
+    config: crate::cli::Config,
+    rt_handle: RuntimeHandle,
+) -> anyhow::Result<()> {
     let logger = Arc::new(Logger::new(config.output_transport, config.log_level));
     let metrics = Metrics::new();
 
@@ -790,7 +843,8 @@ pub async fn run(config: crate::cli::Config) -> anyhow::Result<()> {
     )?);
 
     let cors_handler = CorsHandler::new(config.cors, false);
-    let _gw = WsGateway::new(
+    let metrics_ready = metrics.clone();
+    let gw = WsGateway::new(
         child,
         cors_handler,
         config.headers,
@@ -800,8 +854,308 @@ pub async fn run(config: crate::cli::Config) -> anyhow::Result<()> {
         config.health_endpoints,
     );
 
-    // TODO: Wire up TCP listener + WebSocket serving (upcoming bead)
-    anyhow::bail!("stdio->WS serving not yet implemented")
+    // Spawn async relay task
+    let relay_handle = gw.spawn_relay_async(&rt_handle);
+
+    // Bind async TCP listener
+    let listener = AsyncTcpListener::bind(format!("0.0.0.0:{}", config.port))
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to bind port {}: {e}", config.port))?;
+
+    // Mark gateway as ready
+    metrics_ready.set_ready();
+
+    // Accept loop as async task
+    let accept_gw = gw.clone();
+    let rt_accept = rt_handle.clone();
+    rt_handle.spawn(async move {
+        loop {
+            match listener.accept().await {
+                Ok((stream, _addr)) => {
+                    let gw = accept_gw.clone();
+                    rt_accept.spawn(handle_ws_connection_async(stream, gw));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    // Wait for relay to complete (child exited)
+    let exit_code = relay_handle.await.unwrap_or(1);
+    std::process::exit(exit_code);
+}
+
+/// Poll interval for draining the relay channel in the WS connection task.
+const WS_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+async fn handle_ws_connection_async(
+    stream: asupersync::net::TcpStream,
+    gw: WsGateway,
+) {
+    let cx = match asupersync::Cx::current() {
+        Some(c) => c,
+        None => return,
+    };
+
+    // Parse initial HTTP request
+    let mut framed = Framed::new(stream, Http1Codec::new());
+    let req = match framed.next().await {
+        Some(Ok(r)) => r,
+        _ => return,
+    };
+
+    let uri = req.uri.clone();
+    let (path, query_str) = if let Some(pos) = uri.find('?') {
+        (&uri[..pos], &uri[pos + 1..])
+    } else {
+        (uri.as_str(), "")
+    };
+
+    let origin = req
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("origin"))
+        .map(|(_, v)| v.as_str());
+    let ac_req_headers = req
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("access-control-request-headers"))
+        .map(|(_, v)| v.as_str());
+    let detail = query_str.split('&').any(|pair| pair == "detail=true");
+
+    // Get raw stream
+    let parts = framed.into_parts();
+    let mut stream = parts.inner;
+
+    // Health endpoints
+    if let Some(resp) = gw.handle_health(path, detail, origin) {
+        write_ws_http_response(&mut stream, &resp).await;
+        return;
+    }
+
+    // OPTIONS (CORS preflight)
+    if req.method == H1Method::Options {
+        if let Some(resp) = gw.handle_options(origin, ac_req_headers) {
+            write_ws_http_response(&mut stream, &resp).await;
+        }
+        return;
+    }
+
+    // Only GET is valid for WS upgrade
+    if req.method != H1Method::Get {
+        let _ = stream
+            .write_all(b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n")
+            .await;
+        return;
+    }
+
+    // Build raw request string for ServerHandshake
+    let mut raw_req = format!("GET {} HTTP/1.1\r\n", req.uri);
+    for (k, v) in &req.headers {
+        raw_req.push_str(&format!("{k}: {v}\r\n"));
+    }
+    raw_req.push_str("\r\n");
+
+    let ws_req = match WsHttpRequest::parse(raw_req.as_bytes()) {
+        Ok(r) => r,
+        Err(_) => {
+            let _ = stream
+                .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
+                .await;
+            return;
+        }
+    };
+
+    let accept = match ServerHandshake::new().accept(&ws_req) {
+        Ok(a) => a,
+        Err(_) => {
+            let _ = stream
+                .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
+                .await;
+            return;
+        }
+    };
+
+    // Check client limit BEFORE sending 101 (so we can still return a proper HTTP error)
+    let conn = match gw.handle_ws_connect() {
+        Ok(c) => c,
+        Err(resp) => {
+            write_ws_http_response(&mut stream, &resp).await;
+            return;
+        }
+    };
+
+    // Write HTTP 101 Switching Protocols with custom headers (D-105)
+    let mut resp_bytes = accept.response_bytes();
+    // AcceptResponse::response_bytes() ends with \r\n\r\n; insert custom headers before final \r\n
+    if resp_bytes.ends_with(b"\r\n\r\n") {
+        resp_bytes.truncate(resp_bytes.len() - 2);
+        for h in gw.custom_headers() {
+            resp_bytes.extend_from_slice(format!("{}: {}\r\n", h.name, h.value).as_bytes());
+        }
+        resp_bytes.extend_from_slice(b"\r\n");
+    }
+    if stream.write_all(&resp_bytes).await.is_err() {
+        gw.disconnect_client(&conn.client_id);
+        return;
+    }
+
+    // WS frame loop: use FrameCodec directly on split stream halves
+    // Split into read/write so we can do concurrent send (relay channel) and recv (client)
+    let (mut read_half, mut write_half) = stream.into_split();
+    let mut enc = FrameCodec::server();
+    let mut dec = FrameCodec::server();
+    let mut read_buf = asupersync::bytes::BytesMut::with_capacity(8192);
+    let mut write_buf = asupersync::bytes::BytesMut::with_capacity(8192);
+    let mut rx = conn.receiver;
+    let client_id = conn.client_id.clone();
+
+    // Spawn WS send task: reads from relay channel, writes WS frames to write_half
+    // This task owns write_half and relay receiver
+    let send_cx = cx.clone();
+    let send_gw = gw.clone();
+    let send_client_id = client_id.clone();
+    // Shared flag: signal send task to close when recv task finishes
+    // We route close via the WsEvent channel (WsEvent::Close) from relay side,
+    // or drop the channel (Disconnected/Cancelled) when recv task ends
+    let _ = (send_cx, send_gw, send_client_id); // suppress unused warnings for now
+
+    // ─── Recv loop (this task) ──────────────────────────────────────────
+    // Interleave: short timeout on WS read + drain relay channel
+    loop {
+        // Drain relay channel (non-blocking)
+        'drain: loop {
+            match rx.try_recv() {
+                Ok(WsEvent::Message(json)) => {
+                    let frame = Frame::text(json.into_bytes());
+                    if enc.encode(frame, &mut write_buf).is_err() {
+                        break 'drain;
+                    }
+                    let data: Vec<u8> = write_buf.to_vec();
+                    write_buf.clear();
+                    if write_half.write_all(&data).await.is_err() {
+                        gw.disconnect_client(&client_id);
+                        return;
+                    }
+                }
+                Ok(WsEvent::Close(code, reason)) => {
+                    let frame = Frame::close(Some(code), Some(&reason));
+                    if enc.encode(frame, &mut write_buf).is_ok() {
+                        let data: Vec<u8> = write_buf.to_vec();
+                        write_buf.clear();
+                        let _ = write_half.write_all(&data).await;
+                    }
+                    gw.disconnect_client(&client_id);
+                    return;
+                }
+                Err(RecvError::Empty) => break 'drain,
+                Err(_) => {
+                    // Channel disconnected or cancelled — exit
+                    gw.disconnect_client(&client_id);
+                    return;
+                }
+            }
+        }
+
+        // Wait for WS frame with a short timeout to keep relay channel responsive
+        let recv_result =
+            timeout(wall_now(), WS_POLL_INTERVAL, read_ws_frame(&mut read_half, &mut dec, &mut read_buf)).await;
+
+        match recv_result {
+            Ok(Ok(Some(frame))) => match frame.opcode {
+                asupersync::net::websocket::Opcode::Text => {
+                    let text = match std::str::from_utf8(&frame.payload) {
+                        Ok(t) => t,
+                        Err(_) => {
+                            let close_frame = Frame::close(Some(WS_CLOSE_POLICY), Some("invalid UTF-8"));
+                            if enc.encode(close_frame, &mut write_buf).is_ok() {
+                                let data: Vec<u8> = write_buf.to_vec();
+                                write_buf.clear();
+                                let _ = write_half.write_all(&data).await;
+                            }
+                            break;
+                        }
+                    };
+                    if let Err((code, reason)) = gw.handle_ws_message(&client_id, text) {
+                        let close_frame = Frame::close(Some(code), Some(&reason));
+                        if enc.encode(close_frame, &mut write_buf).is_ok() {
+                            let data: Vec<u8> = write_buf.to_vec();
+                            write_buf.clear();
+                            let _ = write_half.write_all(&data).await;
+                        }
+                        break;
+                    }
+                }
+                asupersync::net::websocket::Opcode::Ping => {
+                    // RFC 6455: server MUST send pong in response to ping
+                    let pong_frame = Frame::pong(frame.payload);
+                    if enc.encode(pong_frame, &mut write_buf).is_ok() {
+                        let data: Vec<u8> = write_buf.to_vec();
+                        write_buf.clear();
+                        let _ = write_half.write_all(&data).await;
+                    }
+                }
+                asupersync::net::websocket::Opcode::Close => {
+                    // Echo close frame back
+                    let close_frame = Frame::close(Some(WS_CLOSE_NORMAL), None);
+                    if enc.encode(close_frame, &mut write_buf).is_ok() {
+                        let data: Vec<u8> = write_buf.to_vec();
+                        write_buf.clear();
+                        let _ = write_half.write_all(&data).await;
+                    }
+                    break;
+                }
+                _ => {} // binary/continuation/pong: ignore
+            },
+            Ok(Ok(None)) => break, // EOF
+            Ok(Err(_)) => break,   // protocol error
+            Err(_elapsed) => {}    // timeout — loop back to drain relay channel
+        }
+    }
+
+    gw.disconnect_client(&client_id);
+}
+
+/// Read one complete WebSocket frame from `read_half` into `buf`, decode with `codec`.
+async fn read_ws_frame(
+    read_half: &mut asupersync::net::OwnedReadHalf,
+    codec: &mut FrameCodec,
+    buf: &mut asupersync::bytes::BytesMut,
+) -> Result<Option<Frame>, asupersync::net::websocket::WsError> {
+    use asupersync::io::AsyncReadExt;
+    loop {
+        // Try to decode from existing buffer
+        if let Some(frame) = codec.decode(buf)? {
+            return Ok(Some(frame));
+        }
+        // Need more data
+        let mut tmp = [0u8; 4096];
+        let n = read_half
+            .read(&mut tmp)
+            .await
+            .map_err(asupersync::net::websocket::WsError::Io)?;
+        if n == 0 {
+            return Ok(None); // EOF
+        }
+        buf.extend_from_slice(&tmp[..n]);
+    }
+}
+
+async fn write_ws_http_response(
+    stream: &mut asupersync::net::TcpStream,
+    resp: &GatewayResponse,
+) {
+    let reason = super::sse::http_reason(resp.status);
+    let mut buf = format!("HTTP/1.1 {} {}\r\n", resp.status, reason).into_bytes();
+    for (name, value) in &resp.headers {
+        buf.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
+    }
+    let body_bytes = resp.body.as_bytes();
+    buf.extend_from_slice(
+        format!("Content-Length: {}\r\n\r\n", body_bytes.len()).as_bytes(),
+    );
+    buf.extend_from_slice(body_bytes);
+    let _ = stream.write_all(&buf).await;
 }
 
 #[cfg(test)]
@@ -809,6 +1163,23 @@ mod tests {
     use super::*;
     use crate::cli::{CorsConfig, Header, LogLevel, OutputTransport};
     use std::sync::atomic::Ordering;
+
+    /// Blocking receive with timeout for sync unit tests (polls try_recv).
+    fn recv_timeout_blocking(rx: &async_mpsc::Receiver<WsEvent>, timeout: Duration) -> Option<WsEvent> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            match rx.try_recv() {
+                Ok(val) => return Some(val),
+                Err(async_mpsc::RecvError::Empty) => {
+                    if std::time::Instant::now() >= deadline {
+                        return None;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => return None,
+            }
+        }
+    }
 
     #[allow(dead_code)]
     fn test_metrics() -> Arc<Metrics> {
@@ -891,10 +1262,10 @@ mod tests {
         // Simulate a request being mangled
         let raw_id = RawValue::from_string("42".into()).unwrap();
         let mangled = gw.mux.mangle(&conn.client_id, &raw_id);
-        assert!(gw.mux.pending.lock().contains_key(&mangled));
+        assert!(gw.mux.pending.lock().unwrap().contains_key(&mangled));
 
         gw.disconnect_client(&conn.client_id);
-        assert!(gw.mux.pending.lock().is_empty());
+        assert!(gw.mux.pending.lock().unwrap().is_empty());
     }
 
     // ─── ID Multiplexer (D-001) ───────────────────────────────────
@@ -969,7 +1340,7 @@ mod tests {
 
         mux.remove_client(&client_a);
         // client_a's entries removed, client_b's remain
-        assert_eq!(mux.pending.lock().len(), 1);
+        assert_eq!(mux.pending.lock().unwrap().len(), 1);
         assert!(mux.unmangle(mb).is_some());
     }
 
@@ -1076,9 +1447,7 @@ mod tests {
         assert!(result.is_ok());
 
         // The echoed message has id + method → broadcast (server-initiated request)
-        let msg = conn
-            .receiver
-            .recv_timeout(Duration::from_secs(2))
+        let msg = recv_timeout_blocking(&conn.receiver, Duration::from_secs(2))
             .expect("should receive message");
         match msg {
             WsEvent::Message(json) => {
@@ -1100,7 +1469,7 @@ mod tests {
 
         // Manually insert buffered messages
         {
-            let mut state = gw.inner.lock();
+            let mut state = gw.inner.lock().unwrap();
             let buf = state.early_buffer.as_mut().unwrap();
             let msg1: RawMessage =
                 serde_json::from_str(r#"{"jsonrpc":"2.0","method":"notif1"}"#).unwrap();
@@ -1124,7 +1493,7 @@ mod tests {
         }
 
         // Early buffer should be None now
-        assert!(gw.inner.lock().early_buffer.is_none());
+        assert!(gw.inner.lock().unwrap().early_buffer.is_none());
     }
 
     // ─── Broadcast to multiple clients ────────────────────────────
@@ -1149,14 +1518,8 @@ mod tests {
         assert!(result.is_ok());
 
         // Both clients should receive the broadcast
-        let msg1 = conn1
-            .receiver
-            .recv_timeout(Duration::from_secs(2))
-            .unwrap();
-        let msg2 = conn2
-            .receiver
-            .recv_timeout(Duration::from_secs(2))
-            .unwrap();
+        let msg1 = recv_timeout_blocking(&conn1.receiver, Duration::from_secs(2)).unwrap();
+        let msg2 = recv_timeout_blocking(&conn2.receiver, Duration::from_secs(2)).unwrap();
 
         for msg in [&msg1, &msg2] {
             match msg {
