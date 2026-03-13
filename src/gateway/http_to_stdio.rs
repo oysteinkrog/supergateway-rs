@@ -34,11 +34,7 @@ use crate::gateway::sse_to_stdio::{
 use crate::jsonrpc::{self, Parsed, RawMessage};
 use crate::observe::{Logger, Metrics};
 
-// Re-export utilities needed by the calling code.
-pub use crate::gateway::sse_to_stdio::{
-    extract_error_code, make_error_response, write_stdout, CLIENT_ERROR_CODE,
-    CLIENT_ERROR_MESSAGE,
-};
+pub use crate::gateway::sse_to_stdio::write_stdout;
 
 // ─── Init Phase ───────────────────────────────────────────────────
 
@@ -385,7 +381,7 @@ pub fn handle_client_error(err: &crate::client::http::HttpClientError, logger: &
 
 /// Run the Streamable HTTP → stdio client gateway.
 #[allow(dead_code)]
-pub async fn run(config: crate::cli::Config) -> anyhow::Result<()> {
+pub async fn run(_cx: &asupersync::Cx, config: crate::cli::Config) -> anyhow::Result<()> {
     let logger = Arc::new(Logger::new(config.output_transport, config.log_level));
     let metrics = Metrics::new();
 
@@ -398,25 +394,178 @@ pub async fn run(config: crate::cli::Config) -> anyhow::Result<()> {
 
     let shutdown = crate::signal::install(&logger)?;
 
-    let _gw = HttpToStdioGateway::new(
-        config.input_value,
+    let gw = Arc::new(HttpToStdioGateway::new(
+        config.input_value.clone(),
         config.protocol_version,
-        config.headers,
+        config.headers.clone(),
         logger.clone(),
         metrics,
-    );
+    ));
 
-    // TODO: Wire up HTTP client + stdin/stdout bridge (upcoming bead)
-    // The event loop should:
-    //   1. Read stdin, POST to remote, parse response, write to stdout
-    //   2. On EOF/connection-reset → handle_client_error (exits with code 1)
-    //   3. On transport errors → handle_client_error (logs, allows retry)
-    //   4. On signal → falls through to clean exit(0) below
+    let custom_headers: Vec<(String, String)> = config.headers.iter()
+        .map(|h| (h.name.clone(), h.value.clone()))
+        .collect();
+
+    // Track Mcp-Session-Id for stateful sessions
+    let session_id: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+
+    // Stdin reader loop: read JSON-RPC, POST to remote, write responses to stdout
+    use std::io::BufRead;
+    let stdin_handle = {
+        let gw = Arc::clone(&gw);
+        let session_id = Arc::clone(&session_id);
+        let custom_headers = custom_headers.clone();
+        let url = config.input_value.clone();
+
+        std::thread::Builder::new()
+            .name("http-stdin-reader".into())
+            .spawn(move || {
+                let stdin = std::io::stdin();
+                for line in stdin.lock().lines() {
+                    let line = match line {
+                        Ok(l) => l,
+                        Err(_) => break,
+                    };
+                    let line = line.trim().to_string();
+                    if line.is_empty() {
+                        continue;
+                    }
+
+                    let msg = match crate::jsonrpc::parse_line(&line) {
+                        Ok(crate::jsonrpc::Parsed::Single(m)) => m,
+                        Ok(crate::jsonrpc::Parsed::Batch(_)) => continue,
+                        Err(_) => continue,
+                    };
+
+                    let to_post = match gw.handle_stdin_message(msg) {
+                        StdinAction::Post(msgs) => msgs,
+                        StdinAction::PostInit(msg) => vec![msg],
+                        StdinAction::Buffered => continue,
+                    };
+
+                    // Build headers including session ID if available
+                    let mut req_headers = custom_headers.clone();
+                    if let Some(ref sid) = *session_id.lock().unwrap() {
+                        req_headers.push(("Mcp-Session-Id".to_string(), sid.clone()));
+                    }
+
+                    for msg in to_post {
+                        let body = match serde_json::to_vec(&msg) {
+                            Ok(b) => b,
+                            Err(_) => continue,
+                        };
+
+                        match crate::serve::http_post(&url, &req_headers, &body) {
+                            Ok(resp) => {
+                                // Track Mcp-Session-Id from response
+                                if let Some(sid) = resp.header("mcp-session-id") {
+                                    *session_id.lock().unwrap() = Some(sid.to_string());
+                                    // Update req_headers for this batch
+                                    let sid = sid.to_string();
+                                    req_headers.retain(|(k, _)| k.to_lowercase() != "mcp-session-id");
+                                    req_headers.push(("Mcp-Session-Id".to_string(), sid));
+                                }
+
+                                // Parse response body into messages
+                                let ct = resp.header("content-type").unwrap_or("").to_string();
+                                let response_type = classify_content_type(Some(&ct));
+
+                                let messages = match response_type {
+                                    ResponseType::Json => gw.parse_json_response(&resp.body),
+                                    ResponseType::Sse => {
+                                        // Parse SSE events from body
+                                        let text = match std::str::from_utf8(&resp.body) {
+                                            Ok(s) => s.to_string(),
+                                            Err(_) => continue,
+                                        };
+                                        let mut parser = crate::client::sse::SseParser::new();
+                                        let events = parser.feed(&text);
+                                        let mut msgs = Vec::new();
+                                        for event in &events {
+                                            msgs.extend(gw.parse_sse_event_data(
+                                                &event.event_type,
+                                                &event.data,
+                                            ));
+                                        }
+                                        msgs
+                                    }
+                                    ResponseType::Unknown(_) => {
+                                        if resp.status == 202 || resp.status == 204 {
+                                            // Accepted notification — no response body expected
+                                            Vec::new()
+                                        } else {
+                                            gw.parse_json_response(&resp.body)
+                                        }
+                                    }
+                                };
+
+                                let result = gw.handle_response_messages(messages);
+                                for out_msg in result.stdout {
+                                    let _ = write_stdout(&out_msg);
+                                }
+
+                                // Follow-up POSTs (initialized + pending)
+                                for follow_up in result.post {
+                                    let body = match serde_json::to_vec(&follow_up) {
+                                        Ok(b) => b,
+                                        Err(_) => continue,
+                                    };
+                                    match crate::serve::http_post(&url, &req_headers, &body) {
+                                        Ok(resp2) => {
+                                            let ct2 = resp2.header("content-type").unwrap_or("").to_string();
+                                            let rt2 = classify_content_type(Some(&ct2));
+                                            let msgs2 = match rt2 {
+                                                ResponseType::Json => gw.parse_json_response(&resp2.body),
+                                                ResponseType::Sse => {
+                                                    let text = match std::str::from_utf8(&resp2.body) {
+                                                        Ok(s) => s.to_string(),
+                                                        Err(_) => String::new(),
+                                                    };
+                                                    let mut parser2 = crate::client::sse::SseParser::new();
+                                                    let events2 = parser2.feed(&text);
+                                                    let mut m2 = Vec::new();
+                                                    for ev in &events2 {
+                                                        m2.extend(gw.parse_sse_event_data(&ev.event_type, &ev.data));
+                                                    }
+                                                    m2
+                                                }
+                                                _ => Vec::new(),
+                                            };
+                                            let r2 = gw.handle_response_messages(msgs2);
+                                            for out_msg in r2.stdout {
+                                                let _ = write_stdout(&out_msg);
+                                            }
+                                        }
+                                        Err(e) => {
+                                            handle_client_error(&crate::client::http::HttpClientError::Io(e.to_string()), &gw.logger);
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                handle_client_error(&crate::client::http::HttpClientError::Io(e.to_string()), &gw.logger);
+                            }
+                        }
+                    }
+                }
+            })
+            .expect("spawn http-stdin-reader thread")
+    };
 
     // Block until signal (SIGINT/SIGTERM/SIGHUP)
     let sig = shutdown.wait();
     logger.info(&format!("received {}, shutting down", crate::signal::signal_name(sig)));
-    // Signal → exit code 0, DELETE session if tracked
+
+    // D-016: exit code 0 on signal
+    // Optionally send DELETE to close session
+    if let Some(sid) = session_id.lock().unwrap().clone() {
+        let mut del_headers = custom_headers.clone();
+        del_headers.push(("Mcp-Session-Id".to_string(), sid));
+        // Send DELETE (best effort)
+        let _ = crate::serve::http_delete(&config.input_value, &del_headers);
+    }
+
+    drop(stdin_handle);
     std::process::exit(0);
 }
 
@@ -426,6 +575,7 @@ pub async fn run(config: crate::cli::Config) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use crate::cli::{LogLevel, OutputTransport};
+    use crate::gateway::sse_to_stdio::{extract_error_code, make_error_response, CLIENT_ERROR_CODE, CLIENT_ERROR_MESSAGE};
     use serde_json::value::RawValue;
 
     #[allow(dead_code)]
@@ -536,7 +686,8 @@ mod tests {
             }
             _ => panic!("expected Post action"),
         }
-        match &*gw.init_phase.lock().unwrap() {
+        let phase = gw.init_phase.lock().unwrap();
+        match &*phase {
             InitPhase::WaitingPassthroughInit { init_id } => {
                 assert_eq!(init_id, "0");
             }

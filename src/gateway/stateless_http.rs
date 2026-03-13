@@ -25,11 +25,14 @@
 //! 6. Collect and return responses as SSE event stream
 //! 7. Kill child
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use serde_json::value::RawValue;
+
+use asupersync::http::h1::{Http1Listener, Request as H1Request, Response as H1Response};
+use asupersync::runtime::RuntimeHandle;
 
 use crate::child::ChildBridge;
 use crate::cli::{CorsConfig, Header};
@@ -440,7 +443,16 @@ impl StatelessHttpGateway {
             Parsed::Batch(msgs) => msgs,
         };
 
-        // 6. Spawn child process
+        // 6. Short-circuit: if all messages are notifications, return 202 immediately.
+        //    Pure notifications require no response and no child interaction — spawning
+        //    a child and running the full auto-init exchange just to discard it wastes
+        //    ~130ms per call (one full process spawn + two child roundtrips).
+        let all_notifications = messages.iter().all(|m| m.is_notification());
+        if all_notifications {
+            return Ok(response_accepted());
+        }
+
+        // 7. Spawn child process
         let child =
             ChildBridge::spawn(&self.cmd, self.metrics.clone(), self.logger.clone()).map_err(
                 |e| {
@@ -449,7 +461,7 @@ impl StatelessHttpGateway {
                 },
             )?;
 
-        // 7. Determine path: direct initialize (Case 1) or auto-init (Case 2)
+        // 8. Determine path: direct initialize (Case 1) or auto-init (Case 2)
         let has_initialize = messages.iter().any(|m| m.is_initialize_request());
         let result = if has_initialize {
             self.forward_direct(&child, messages)
@@ -457,7 +469,7 @@ impl StatelessHttpGateway {
             self.auto_init_and_forward(&child, messages)
         };
 
-        // 8. Kill child (always, regardless of success/failure)
+        // 9. Kill child (always, regardless of success/failure)
         child.kill();
 
         result
@@ -583,9 +595,49 @@ impl StatelessHttpGateway {
 
 // ─── Entry point ────────────────────────────────────────────────────────
 
+/// Convert an asupersync HTTP/1.1 request to a gateway request.
+fn convert_h1_request(req: H1Request) -> GatewayRequest {
+    let uri = req.uri.clone();
+    let (path, query_str) = if let Some(pos) = uri.find('?') {
+        (&uri[..pos], &uri[pos + 1..])
+    } else {
+        (uri.as_str(), "")
+    };
+    let headers: HashMap<String, String> = req.headers.into_iter().collect();
+    let query: HashMap<String, String> = query_str
+        .split('&')
+        .filter_map(|pair| {
+            if pair.is_empty() {
+                return None;
+            }
+            let mut kv = pair.splitn(2, '=');
+            let k = kv.next()?.to_string();
+            let v = kv.next().unwrap_or("").to_string();
+            if k.is_empty() { None } else { Some((k, v)) }
+        })
+        .collect();
+    GatewayRequest {
+        method: req.method.as_str().to_string(),
+        path: path.to_string(),
+        headers,
+        body: req.body,
+        query,
+    }
+}
+
+/// Convert a gateway response to an asupersync HTTP/1.1 response.
+fn convert_gateway_response(resp: GatewayResponse) -> H1Response {
+    let reason = super::sse::http_reason(resp.status);
+    let mut r = H1Response::new(resp.status, reason, resp.body);
+    for (name, value) in resp.headers {
+        r = r.with_header(name, value);
+    }
+    r
+}
+
 /// Run the stdio → Streamable HTTP (stateless) gateway.
 #[allow(dead_code)]
-pub async fn run(config: crate::cli::Config) -> anyhow::Result<()> {
+pub async fn run(_cx: &asupersync::Cx, config: crate::cli::Config, rt_handle: RuntimeHandle) -> anyhow::Result<()> {
     let logger = Arc::new(crate::observe::Logger::new(
         config.output_transport,
         config.log_level,
@@ -601,7 +653,8 @@ pub async fn run(config: crate::cli::Config) -> anyhow::Result<()> {
 
     let _shutdown = crate::signal::install(&logger)?;
 
-    let _gw = StatelessHttpGateway::new(
+    let metrics_ready = metrics.clone();
+    let gw = StatelessHttpGateway::new(
         config.input_value,
         config.streamable_http_path,
         config.health_endpoints,
@@ -611,9 +664,30 @@ pub async fn run(config: crate::cli::Config) -> anyhow::Result<()> {
         metrics,
         logger,
     );
+    let gw = Arc::new(gw);
 
-    // TODO: Wire up TCP listener + HTTP serving (upcoming bead)
-    anyhow::bail!("stdio->stateless HTTP serving not yet implemented")
+    // Bind async HTTP listener
+    let gw_handler = gw.clone();
+    let listener = Http1Listener::bind(
+        format!("0.0.0.0:{}", config.port),
+        move |req: H1Request| {
+            let gw = gw_handler.clone();
+            async move {
+                let gw_req = convert_h1_request(req);
+                let resp = gw.handle_request(&gw_req);
+                convert_gateway_response(resp)
+            }
+        },
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("failed to bind port {}: {e}", config.port))?;
+
+    // Mark gateway as ready
+    metrics_ready.set_ready();
+
+    // Run accept loop until shutdown
+    listener.run(&rt_handle).await?;
+    Ok(())
 }
 
 // ─── Tests ─────────────────────────────────────────────────────────────
@@ -622,6 +696,7 @@ pub async fn run(config: crate::cli::Config) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use serde_json::value::RawValue;
     use crate::cli::{LogLevel, OutputTransport};
 
     #[allow(dead_code)]

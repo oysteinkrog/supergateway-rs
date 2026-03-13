@@ -534,7 +534,7 @@ pub fn handle_client_error(err: &crate::client::sse::SseClientError, logger: &Lo
 
 /// Run the SSE → stdio client gateway.
 #[allow(dead_code)]
-pub async fn run(config: crate::cli::Config) -> anyhow::Result<()> {
+pub async fn run(_cx: &asupersync::Cx, config: crate::cli::Config) -> anyhow::Result<()> {
     let logger = Arc::new(Logger::new(config.output_transport, config.log_level));
     let metrics = Metrics::new();
 
@@ -547,23 +547,130 @@ pub async fn run(config: crate::cli::Config) -> anyhow::Result<()> {
 
     let shutdown = crate::signal::install(&logger)?;
 
-    let _gw = SseToStdioGateway::new(
-        config.input_value,
+    let gw = std::sync::Arc::new(SseToStdioGateway::new(
+        config.input_value.clone(),
         config.protocol_version,
-        config.headers,
+        config.headers.clone(),
         logger.clone(),
         metrics,
-    );
+    ));
 
-    // TODO: Wire up SSE client connection + stdin/stdout bridge (upcoming bead)
-    // The event loop should:
-    //   1. Connect via http_client.get_stream(url, "text/event-stream",
-    //      Some(parser.last_event_id()).filter(|id| !id.is_empty()))
-    //      — pass Last-Event-ID on reconnect so the server can resume the stream (D-013)
-    //   2. Feed chunks to SseParser::feed(), dispatch events via handle_sse_event
-    //   3. On SseClientError::StreamEnded → handle_client_error (exits with code 1)
-    //   4. On transport errors → handle_client_error (logs), backoff via ReconnectState, reconnect
-    //   5. On signal → falls through to clean exit(0) below
+    let custom_headers: Vec<(String, String)> = config.headers.iter()
+        .map(|h| (h.name.clone(), h.value.clone()))
+        .collect();
+
+    // Connect to remote SSE server
+    let (sse_stream, status, _resp_headers) =
+        crate::serve::http_get_sse(&config.input_value, &custom_headers, None)
+            .map_err(|e| anyhow::anyhow!("failed to connect to SSE server: {e}"))?;
+
+    if status != 200 {
+        anyhow::bail!("SSE server returned status {status}");
+    }
+
+    // Spawn SSE reader thread: reads events, writes to stdout, POSTs follow-ups
+    let gw_sse = std::sync::Arc::clone(&gw);
+    let custom_headers_sse = custom_headers.clone();
+    std::thread::Builder::new()
+        .name("sse-client-reader".into())
+        .spawn(move || {
+            use std::io::{BufRead, BufReader};
+            let mut reader = BufReader::new(sse_stream);
+            let mut parser = crate::client::sse::SseParser::new();
+            loop {
+                let mut line = String::new();
+                match reader.read_line(&mut line) {
+                    Ok(0) => {
+                        // EOF = stream ended
+                        handle_client_error(
+                            &crate::client::sse::SseClientError::StreamEnded,
+                            &gw_sse.logger,
+                        );
+                        break;
+                    }
+                    Ok(_) => {
+                        let events = parser.feed(&line);
+                        for event in &events {
+                            let result = gw_sse.handle_sse_event(event);
+                            for msg in result.stdout {
+                                let _ = write_stdout(&msg);
+                            }
+                            for msg in result.post {
+                                if let Some(url) = gw_sse.endpoint_url() {
+                                    let body = serde_json::to_vec(&msg).unwrap_or_default();
+                                    let _ = crate::serve::http_post(
+                                        &url,
+                                        &custom_headers_sse,
+                                        &body,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        gw_sse.logger.error(&format!("SSE stream read error: {e}"));
+                        break;
+                    }
+                }
+            }
+        })
+        .expect("spawn sse-client-reader thread");
+
+    // Stdin reader loop: read JSON-RPC from stdin, POST to endpoint
+    use std::io::BufRead;
+    let stdin = std::io::stdin();
+    for line in stdin.lock().lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => break,
+        };
+        let line = line.trim().to_string();
+        if line.is_empty() {
+            continue;
+        }
+
+        let msg = match crate::jsonrpc::parse_line(&line) {
+            Ok(crate::jsonrpc::Parsed::Single(m)) => m,
+            Ok(crate::jsonrpc::Parsed::Batch(_)) => continue,
+            Err(_) => continue,
+        };
+
+        let to_post = match gw.handle_stdin_message(msg) {
+            StdinAction::Post(msgs) => msgs,
+            StdinAction::PostInit(msg) => vec![msg],
+            StdinAction::Buffered => continue,
+        };
+
+        // Wait for endpoint URL (up to ~2 seconds)
+        let url = {
+            let mut attempts = 0u32;
+            loop {
+                if let Some(url) = gw.endpoint_url() {
+                    break url;
+                }
+                if attempts >= 200 {
+                    gw.logger.error("endpoint URL not discovered, dropping message");
+                    break String::new();
+                }
+                attempts += 1;
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+
+        if url.is_empty() {
+            continue;
+        }
+
+        for msg in to_post {
+            let body = match serde_json::to_vec(&msg) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            if let Err(e) = crate::serve::http_post(&url, &custom_headers, &body) {
+                gw.logger.error(&format!("POST to endpoint failed: {e}"));
+            }
+        }
+    }
 
     // Block until signal (SIGINT/SIGTERM/SIGHUP)
     let sig = shutdown.wait();
@@ -1052,7 +1159,8 @@ mod tests {
             }
             _ => panic!("expected Post action"),
         }
-        match &*gw.init_phase.lock().unwrap() {
+        let phase = gw.init_phase.lock().unwrap();
+        match &*phase {
             InitPhase::WaitingPassthroughInit { init_id } => {
                 assert_eq!(init_id, "0");
             }

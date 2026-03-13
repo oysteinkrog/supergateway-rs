@@ -1007,7 +1007,7 @@ async fn handle_ws_connection_async(
     let mut dec = FrameCodec::server();
     let mut read_buf = asupersync::bytes::BytesMut::with_capacity(8192);
     let mut write_buf = asupersync::bytes::BytesMut::with_capacity(8192);
-    let mut rx = conn.receiver;
+    let rx = conn.receiver;
     let client_id = conn.client_id.clone();
 
     // Spawn WS send task: reads from relay channel, writes WS frames to write_half
