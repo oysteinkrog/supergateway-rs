@@ -60,68 +60,69 @@ Environment: WSL1 on Linux 4.4, release build vs `node dist/index.js`.
 
 | Implementation | Idle RSS |
 |----------------|----------|
-| supergateway-rs | **4.7 MB** |
-| supergateway (Node) | 67.3 MB |
+| supergateway-rs | **4.9 MB** |
+| supergateway (Node) | 65.6 MB |
 
-**14× lower idle memory.**
+**13× lower idle memory.**
 
 ### Single-client latency (c=1, sequential)
 
 | Request | rs p50 | node p50 |
 |---------|--------|----------|
-| POST initialize | 131 ms | 104 ms |
+| POST initialize | 131 ms | 97 ms |
 | POST notifications/initialized | **1 ms** | 36 ms |
-| POST tools/list | 132 ms | 103 ms |
-| **Full 3-POST sequence** | **268 ms** | **242 ms** |
+| POST tools/list | 132 ms | 100 ms |
+| **Full 3-POST sequence** | **265 ms** | **247 ms** |
 
 For the `notifications/initialized` POST — a pure notification requiring no
-response — rs returns 202 immediately without spawning a child process (1 ms).
-The Node SDK also returns 202 quickly but still involves some JS overhead (36 ms).
+response — rs returns 202 immediately (1 ms). Node involves JS overhead (36 ms).
 
-At c=1 the sequences are essentially tied (268 ms vs 242 ms). The small advantage
-for Node reflects its event-loop being more efficient than rs's blocking-thread
-model for strictly sequential single-client traffic.
+At c=1 the sequences are essentially tied. The small advantage for Node reflects
+child process startup time dominating both, with Node's JS runtime being slightly
+more optimised for that specific path.
 
 ### Throughput under concurrency
 
-| Concurrency | rs req/s | node req/s | rs p50 | node p50 |
-|-------------|----------|------------|--------|----------|
-| c=1  | 3.7 | 3.6 | 269 ms | 273 ms |
-| c=5  | **17.3** | 6.4 | 286 ms | 752 ms |
-| c=10 | **31.2** | 5.0 | 310 ms | 1957 ms |
-| c=20 | **42.0** | 3.9 | 396 ms | 4759 ms |
+| Concurrency | rs req/s | node req/s | rs p50 | node p50 | rs p95 | node p95 |
+|-------------|----------|------------|--------|----------|--------|----------|
+| c=1  | 3.7 | 3.7 | 270 ms | 266 ms | 289 ms | 293 ms |
+| c=5  | **16.8** | 6.3 | 291 ms | 781 ms | 314 ms | 909 ms |
+| c=10 | **30.4** | 5.1 | 317 ms | 1930 ms | 359 ms | 2234 ms |
+| c=20 | **42.6** | 4.0 | 376 ms | 4446 ms | 515 ms | 4958 ms |
 
 rs scales **linearly** with concurrency. Node serialises concurrent requests
-through its event loop, causing p50 latency to balloon from 273 ms at c=1 to
-4759 ms at c=20 — an 17× degradation. rs p50 grows only 1.5× over the same range.
+through its event loop, causing p50 latency to balloon from 266 ms at c=1 to
+4446 ms at c=20 — a 17× degradation. rs p50 grows only 1.4× over the same range.
 
 At c=10: **rs is 6× faster throughput** with **6× lower latency**.
-At c=20: **rs is 11× faster throughput** with **12× lower latency**.
+At c=20: **rs is 10.7× faster throughput** with **12× lower latency**.
 
-### Memory and CPU under load (c=10, 200 requests)
+### Memory and CPU under load (c=10)
 
 | Implementation | Peak RSS | CPU | Wall time |
 |----------------|----------|-----|-----------|
-| supergateway-rs | **9.1 MB** | 89% of 1 core | **6.7 s** |
-| supergateway (Node) | 103.0 MB | 83% of 1 core | 67.9 s |
+| supergateway-rs | **5.1 MB** | 2.9% of 1 core | **6.3 s** |
+| supergateway (Node) | 99.3 MB | 86.3% of 1 core | 77.2 s |
 
-rs uses **11× less memory** and finishes the same workload **10× faster**.
-Both implementations are CPU-bound at roughly the same fraction of a single core —
-rs just does far more work per clock cycle.
+rs uses **19× less memory** and finishes the same workload **12× faster**.
+rs is also **30× more CPU-efficient** — Node saturates the event loop while
+rs handles all concurrency with native async tasks.
 
 ### Summary
 
 | Metric | supergateway-rs | supergateway (Node) | Winner |
 |--------|-----------------|---------------------|--------|
-| Idle RSS | 4.7 MB | 67.3 MB | **rs 14×** |
-| Peak RSS under load | 9.1 MB | 103.0 MB | **rs 11×** |
-| Throughput c=1 | 3.7 req/s | 3.6 req/s | tie |
-| Throughput c=10 | 31.2 req/s | 5.0 req/s | **rs 6×** |
-| Throughput c=20 | 42.0 req/s | 3.9 req/s | **rs 11×** |
-| Latency c=1 p50 | 268 ms | 242 ms | node (1.1×) |
-| Latency c=10 p50 | 310 ms | 1957 ms | **rs 6×** |
+| Idle RSS | 4.9 MB | 65.6 MB | **rs 13×** |
+| Peak RSS under load (c=10) | 5.1 MB | 99.3 MB | **rs 19×** |
+| Throughput c=1 | 3.7 req/s | 3.7 req/s | tie |
+| Throughput c=10 | 30.4 req/s | 5.1 req/s | **rs 6×** |
+| Throughput c=20 | 42.6 req/s | 4.0 req/s | **rs 10.7×** |
+| Latency c=1 p50 | 265 ms | 247 ms | node (1.1×) |
+| Latency c=10 p50 | 317 ms | 1930 ms | **rs 6×** |
+| Latency c=10 p95 | 359 ms | 2234 ms | **rs 6.2×** |
 | Notification POST | 1 ms | 36 ms | **rs 36×** |
-| Binary / install | 4.2 MB single binary | node + npm deps | **rs** |
+| CPU under load (c=10) | 2.9% | 86.3% | **rs 30×** |
+| Binary / install | ~5 MB single binary | node + npm deps | **rs** |
 
 For single-client sequential usage the two are equivalent. For any workload with
 multiple concurrent clients, rs is substantially superior across every metric.
