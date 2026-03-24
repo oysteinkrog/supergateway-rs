@@ -40,6 +40,8 @@ use crate::cors::{self, CorsHandler, CorsResult};
 use crate::error::{self, GatewayError};
 use crate::health;
 use crate::jsonrpc::{Parsed, RawMessage};
+use crate::cli::OAuth2ServerConfig;
+use crate::oauth2::{OAuth2Handler, OAuth2Result};
 use crate::observe::{Logger, Metrics};
 
 use super::stateful_http::GatewayRequest;
@@ -274,6 +276,7 @@ impl Drop for RequestPermit<'_> {
 pub struct StatelessHttpGateway {
     cmd: String,
     cors: CorsHandler,
+    oauth2: Option<Arc<OAuth2Handler>>,
     custom_headers: Vec<Header>,
     mcp_path: String,
     health_endpoints: Vec<String>,
@@ -294,12 +297,14 @@ impl StatelessHttpGateway {
         cors_config: CorsConfig,
         custom_headers: Vec<Header>,
         protocol_version: String,
+        oauth2_config: Option<OAuth2ServerConfig>,
         metrics: Arc<Metrics>,
         logger: Arc<Logger>,
     ) -> Self {
         Self {
             cmd,
             cors: CorsHandler::new(cors_config, false), // no Mcp-Session-Id to expose
+            oauth2: oauth2_config.map(|c| Arc::new(OAuth2Handler::new(c))),
             custom_headers,
             mcp_path,
             health_endpoints,
@@ -331,7 +336,7 @@ impl StatelessHttpGateway {
             CorsResult::ResponseHeaders(_) => {} // applied after handler
         }
 
-        // Health endpoints
+        // Health endpoints (no auth required)
         for health_path in &self.health_endpoints {
             if req.path == *health_path {
                 let detail = req
@@ -353,6 +358,43 @@ impl StatelessHttpGateway {
                 cors::apply_custom_headers(&mut h, &self.custom_headers);
                 resp.headers.extend(h);
                 return self.apply_cors(resp, &cors_result);
+            }
+        }
+
+        // OAuth2 server handling (after CORS preflight and health, before MCP dispatch)
+        if let Some(ref oauth2) = self.oauth2 {
+            let result = oauth2.process(
+                &req.method,
+                &req.path,
+                &req.headers,
+                &req.body,
+                &req.query,
+            );
+            match result {
+                OAuth2Result::EndpointResponse(resp) => {
+                    let mut gw_resp = GatewayResponse {
+                        status: resp.status,
+                        headers: resp.headers,
+                        body: resp.body,
+                    };
+                    if let CorsResult::ResponseHeaders(ref h) = cors_result {
+                        gw_resp.headers.extend(h.iter().cloned());
+                    }
+                    return gw_resp;
+                }
+                OAuth2Result::Passthrough(Ok(())) => {} // token valid, continue
+                OAuth2Result::Passthrough(Err(ref e)) => {
+                    let resp = crate::oauth2::unauthorized_response(e);
+                    let mut gw_resp = GatewayResponse {
+                        status: resp.status,
+                        headers: resp.headers,
+                        body: resp.body,
+                    };
+                    if let CorsResult::ResponseHeaders(ref h) = cors_result {
+                        gw_resp.headers.extend(h.iter().cloned());
+                    }
+                    return gw_resp;
+                }
             }
         }
 
@@ -661,6 +703,7 @@ pub async fn run(_cx: &asupersync::Cx, config: crate::cli::Config, rt_handle: Ru
         config.cors,
         config.headers,
         config.protocol_version,
+        config.oauth2_server,
         metrics,
         logger,
     );
@@ -741,6 +784,7 @@ mod tests {
             CorsConfig::Disabled,
             vec![],
             "2024-11-05".into(),
+            None, // no OAuth2
             test_metrics(),
             test_logger(),
         )
@@ -755,6 +799,7 @@ mod tests {
             CorsConfig::Wildcard,
             vec![],
             "2024-11-05".into(),
+            None, // no OAuth2
             test_metrics(),
             test_logger(),
         )
@@ -1063,6 +1108,7 @@ mod tests {
             CorsConfig::Disabled,
             vec![],
             "2024-11-05".into(),
+            None, // no OAuth2
             test_metrics(),
             test_logger(),
         );
@@ -1100,6 +1146,7 @@ mod tests {
             CorsConfig::Disabled,
             vec![],
             "2024-11-05".into(),
+            None, // no OAuth2
             test_metrics(),
             test_logger(),
         );
@@ -1125,6 +1172,7 @@ mod tests {
             CorsConfig::Disabled,
             vec![],
             "2024-11-05".into(),
+            None, // no OAuth2
             test_metrics(),
             test_logger(),
         );
@@ -1148,6 +1196,7 @@ mod tests {
             CorsConfig::Disabled,
             vec![],
             "2024-11-05".into(),
+            None, // no OAuth2
             test_metrics(),
             test_logger(),
         );
@@ -1173,6 +1222,7 @@ mod tests {
             CorsConfig::Disabled,
             vec![],
             "2024-11-05".into(),
+            None, // no OAuth2
             test_metrics(),
             test_logger(),
         );
@@ -1200,6 +1250,7 @@ mod tests {
             CorsConfig::Disabled,
             vec![],
             "2024-11-05".into(),
+            None, // no OAuth2
             test_metrics(),
             test_logger(),
         );

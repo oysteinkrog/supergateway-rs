@@ -7,6 +7,7 @@ mod error;
 mod gateway;
 mod health;
 mod jsonrpc;
+mod oauth2;
 mod observe;
 mod session;
 mod signal;

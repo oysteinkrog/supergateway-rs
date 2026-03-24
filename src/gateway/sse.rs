@@ -44,6 +44,8 @@ use crate::cors::{self, CorsHandler, CorsResult};
 use crate::error::GatewayError;
 use crate::health;
 use crate::jsonrpc::Parsed;
+use crate::cli::OAuth2ServerConfig;
+use crate::oauth2::{OAuth2Handler, OAuth2Result};
 use crate::observe::{Logger, Metrics};
 use crate::session::SessionId;
 
@@ -178,6 +180,7 @@ pub struct SseGateway {
     base_url: String,
     message_path: String,
     cors: Arc<CorsHandler>,
+    oauth2: Option<Arc<OAuth2Handler>>,
     custom_headers: Arc<Vec<Header>>,
     metrics: Arc<Metrics>,
     logger: Arc<Logger>,
@@ -197,6 +200,7 @@ impl Clone for SseGateway {
             base_url: self.base_url.clone(),
             message_path: self.message_path.clone(),
             cors: Arc::clone(&self.cors),
+            oauth2: self.oauth2.as_ref().map(Arc::clone),
             custom_headers: Arc::clone(&self.custom_headers),
             metrics: Arc::clone(&self.metrics),
             logger: Arc::clone(&self.logger),
@@ -220,6 +224,7 @@ impl SseGateway {
         message_path: String,
         cors: CorsHandler,
         custom_headers: Vec<Header>,
+        oauth2_config: Option<OAuth2ServerConfig>,
         metrics: Arc<Metrics>,
         logger: Arc<Logger>,
         log_level: LogLevel,
@@ -234,6 +239,7 @@ impl SseGateway {
             base_url,
             message_path,
             cors: Arc::new(cors),
+            oauth2: oauth2_config.map(|c| Arc::new(OAuth2Handler::new(c))),
             custom_headers: Arc::new(custom_headers),
             metrics,
             logger,
@@ -772,6 +778,7 @@ pub async fn run(
         config.message_path.clone(),
         cors_handler,
         config.headers,
+        config.oauth2_server,
         metrics,
         logger,
         config.log_level,
@@ -872,6 +879,58 @@ async fn handle_sse_connection_async(
             write_sse_response_async(&mut stream, &resp).await;
         }
         return;
+    }
+
+    // OAuth2 server handling (after CORS preflight and health, before MCP endpoints)
+    if let Some(ref oauth2) = gw.oauth2 {
+        // Build headers HashMap for OAuth2 processing
+        let headers_map: std::collections::HashMap<String, String> = req
+            .headers
+            .iter()
+            .map(|(k, v)| (k.to_ascii_lowercase(), v.clone()))
+            .collect();
+        // Parse query params
+        let query_map: std::collections::HashMap<String, String> = query_str
+            .split('&')
+            .filter_map(|pair| {
+                if pair.is_empty() {
+                    return None;
+                }
+                let mut kv = pair.splitn(2, '=');
+                let k = kv.next()?.to_string();
+                let v = kv.next().unwrap_or("").to_string();
+                if k.is_empty() { None } else { Some((k, v)) }
+            })
+            .collect();
+        let result = oauth2.process(
+            req.method.as_str(),
+            path,
+            &headers_map,
+            &req.body,
+            &query_map,
+        );
+        match result {
+            OAuth2Result::EndpointResponse(resp) => {
+                let mut gw_resp = GatewayResponse::new(resp.status, "")
+                    .with_headers(resp.headers);
+                gw_resp.body = String::from_utf8_lossy(&resp.body).into_owned();
+                let parts = framed.into_parts();
+                let mut stream = parts.inner;
+                write_sse_response_async(&mut stream, &gw_resp).await;
+                return;
+            }
+            OAuth2Result::Passthrough(Ok(())) => {} // token valid, continue
+            OAuth2Result::Passthrough(Err(ref e)) => {
+                let resp = crate::oauth2::unauthorized_response(e);
+                let mut gw_resp = GatewayResponse::new(resp.status, "")
+                    .with_headers(resp.headers);
+                gw_resp.body = String::from_utf8_lossy(&resp.body).into_owned();
+                let parts = framed.into_parts();
+                let mut stream = parts.inner;
+                write_sse_response_async(&mut stream, &gw_resp).await;
+                return;
+            }
+        }
     }
 
     // GET /sse → SSE stream
@@ -1030,6 +1089,7 @@ mod tests {
             "/message".to_string(),
             CorsHandler::new(CorsConfig::Disabled, false),
             vec![],
+            None, // no OAuth2
             metrics,
             logger,
             LogLevel::Debug,
@@ -1100,6 +1160,7 @@ mod tests {
             "/message".to_string(),
             CorsHandler::new(CorsConfig::Disabled, false),
             vec![],
+            None, // no OAuth2
             metrics,
             logger,
             LogLevel::Debug,
@@ -1411,6 +1472,7 @@ mod tests {
             "/message".to_string(),
             CorsHandler::new(CorsConfig::Wildcard, false),
             vec![],
+            None, // no OAuth2
             metrics,
             logger,
             LogLevel::Debug,
@@ -1445,6 +1507,7 @@ mod tests {
             "/message".to_string(),
             CorsHandler::new(CorsConfig::Wildcard, false),
             vec![],
+            None, // no OAuth2
             metrics,
             logger,
             LogLevel::Debug,
@@ -1481,6 +1544,7 @@ mod tests {
             "/message".to_string(),
             CorsHandler::new(CorsConfig::Disabled, false),
             custom,
+            None, // no OAuth2
             metrics,
             logger,
             LogLevel::Debug,
@@ -1519,6 +1583,7 @@ mod tests {
             "/message".to_string(),
             CorsHandler::new(CorsConfig::Disabled, false),
             vec![],
+            None, // no OAuth2
             metrics.clone(),
             logger,
             LogLevel::Debug,
@@ -1545,6 +1610,7 @@ mod tests {
             "/message".to_string(),
             CorsHandler::new(CorsConfig::Disabled, false),
             vec![],
+            None, // no OAuth2
             metrics.clone(),
             logger,
             LogLevel::Debug,

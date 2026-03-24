@@ -1327,6 +1327,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "asupersync",
+ "base64",
  "clap",
  "criterion",
  "libc",
@@ -1334,6 +1335,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror",
  "uuid",
 ]

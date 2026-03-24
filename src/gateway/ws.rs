@@ -60,6 +60,8 @@ use crate::cli::{Header, LogLevel};
 use crate::cors::{self, CorsHandler, CorsResult};
 use crate::health;
 use crate::jsonrpc::{Parsed, RawMessage};
+use crate::cli::OAuth2ServerConfig;
+use crate::oauth2::{OAuth2Handler, OAuth2Result};
 use crate::observe::{Logger, Metrics};
 use crate::session::SessionId;
 
@@ -245,6 +247,7 @@ pub struct WsGateway {
     inner: Arc<Mutex<Inner>>,
     mux: Arc<IdMultiplexer>,
     cors: Arc<CorsHandler>,
+    oauth2: Option<Arc<OAuth2Handler>>,
     custom_headers: Arc<Vec<Header>>,
     metrics: Arc<Metrics>,
     logger: Arc<Logger>,
@@ -261,6 +264,7 @@ impl Clone for WsGateway {
             inner: Arc::clone(&self.inner),
             mux: Arc::clone(&self.mux),
             cors: Arc::clone(&self.cors),
+            oauth2: self.oauth2.as_ref().map(Arc::clone),
             custom_headers: Arc::clone(&self.custom_headers),
             metrics: Arc::clone(&self.metrics),
             logger: Arc::clone(&self.logger),
@@ -283,6 +287,7 @@ impl WsGateway {
         child: Arc<ChildBridge>,
         cors: CorsHandler,
         custom_headers: Vec<Header>,
+        oauth2_config: Option<OAuth2ServerConfig>,
         metrics: Arc<Metrics>,
         logger: Arc<Logger>,
         log_level: LogLevel,
@@ -296,6 +301,7 @@ impl WsGateway {
             })),
             mux: Arc::new(IdMultiplexer::new()),
             cors: Arc::new(cors),
+            oauth2: oauth2_config.map(|c| Arc::new(OAuth2Handler::new(c))),
             custom_headers: Arc::new(custom_headers),
             metrics,
             logger,
@@ -862,6 +868,7 @@ pub async fn run(
         child,
         cors_handler,
         config.headers,
+        config.oauth2_server,
         metrics,
         logger,
         config.log_level,
@@ -953,6 +960,52 @@ async fn handle_ws_connection_async(
             write_ws_http_response(&mut stream, &resp).await;
         }
         return;
+    }
+
+    // OAuth2 server handling (after CORS preflight and health, before WS upgrade)
+    if let Some(ref oauth2) = gw.oauth2 {
+        let headers_map: std::collections::HashMap<String, String> = req
+            .headers
+            .iter()
+            .map(|(k, v)| (k.to_ascii_lowercase(), v.clone()))
+            .collect();
+        let query_map: std::collections::HashMap<String, String> = query_str
+            .split('&')
+            .filter_map(|pair| {
+                if pair.is_empty() {
+                    return None;
+                }
+                let mut kv = pair.splitn(2, '=');
+                let k = kv.next()?.to_string();
+                let v = kv.next().unwrap_or("").to_string();
+                if k.is_empty() { None } else { Some((k, v)) }
+            })
+            .collect();
+        let result = oauth2.process(
+            req.method.as_str(),
+            path,
+            &headers_map,
+            &req.body,
+            &query_map,
+        );
+        match result {
+            OAuth2Result::EndpointResponse(resp) => {
+                let mut gw_resp = GatewayResponse::new(resp.status, "")
+                    .with_headers(resp.headers);
+                gw_resp.body = String::from_utf8_lossy(&resp.body).into_owned();
+                write_ws_http_response(&mut stream, &gw_resp).await;
+                return;
+            }
+            OAuth2Result::Passthrough(Ok(())) => {} // token valid, continue
+            OAuth2Result::Passthrough(Err(ref e)) => {
+                let resp = crate::oauth2::unauthorized_response(e);
+                let mut gw_resp = GatewayResponse::new(resp.status, "")
+                    .with_headers(resp.headers);
+                gw_resp.body = String::from_utf8_lossy(&resp.body).into_owned();
+                write_ws_http_response(&mut stream, &gw_resp).await;
+                return;
+            }
+        }
     }
 
     // Only GET is valid for WS upgrade
@@ -1215,6 +1268,7 @@ mod tests {
             Arc::clone(&child),
             CorsHandler::new(CorsConfig::Disabled, false),
             vec![],
+            None, // no OAuth2
             metrics,
             logger,
             LogLevel::Debug,
@@ -1589,6 +1643,7 @@ mod tests {
                 Header { name: "X-Custom".into(), value: "hello".into() },
                 Header { name: "X-Other".into(), value: "world".into() },
             ],
+            None, // no OAuth2
             metrics,
             logger,
             LogLevel::Debug,
@@ -1613,6 +1668,7 @@ mod tests {
             child,
             CorsHandler::new(CorsConfig::Disabled, false),
             vec![],
+            None, // no OAuth2
             metrics.clone(),
             logger,
             LogLevel::Debug,

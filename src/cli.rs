@@ -107,6 +107,16 @@ pub enum CorsOrigin {
     Regex(Regex),
 }
 
+/// OAuth2 server configuration from CLI flags.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct OAuth2ServerConfig {
+    pub client_id: String,
+    pub client_secret: String,
+    pub token_expiry_secs: u64,
+    pub issuer: Option<String>,
+}
+
 /// Three-state CORS configuration.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -185,6 +195,22 @@ struct RawArgs {
     #[arg(long = "oauth2Bearer")]
     oauth2_bearer: Option<String>,
 
+    /// OAuth2 server: client ID (enables OAuth2 server mode)
+    #[arg(long = "oauth2-server-client-id")]
+    oauth2_server_client_id: Option<String>,
+
+    /// OAuth2 server: client secret (required with --oauth2-server-client-id)
+    #[arg(long = "oauth2-server-client-secret")]
+    oauth2_server_client_secret: Option<String>,
+
+    /// OAuth2 server: token expiry in seconds (default 3600)
+    #[arg(long = "oauth2-token-expiry", default_value = "3600")]
+    oauth2_token_expiry: u64,
+
+    /// OAuth2 server: issuer URL for metadata (default: auto from Host header)
+    #[arg(long = "oauth2-issuer")]
+    oauth2_issuer: Option<String>,
+
     /// Use stateful sessions (stdio->Streamable HTTP only)
     #[arg(long)]
     stateful: bool,
@@ -217,6 +243,7 @@ pub struct Config {
     pub stateful: bool,
     pub session_timeout: Option<u64>,
     pub protocol_version: String,
+    pub oauth2_server: Option<OAuth2ServerConfig>,
 }
 
 #[allow(dead_code)]
@@ -332,6 +359,23 @@ impl Config {
             None => Vec::new(),
         };
 
+        // Parse OAuth2 server config.
+        let oauth2_server = match raw.oauth2_server_client_id {
+            Some(client_id) => {
+                let client_secret = raw.oauth2_server_client_secret.ok_or(
+                    "--oauth2-server-client-secret is required when --oauth2-server-client-id is set"
+                        .to_string(),
+                )?;
+                Some(OAuth2ServerConfig {
+                    client_id,
+                    client_secret,
+                    token_expiry_secs: raw.oauth2_token_expiry,
+                    issuer: raw.oauth2_issuer,
+                })
+            }
+            None => None,
+        };
+
         Ok(Self {
             input_mode,
             input_value,
@@ -348,6 +392,7 @@ impl Config {
             stateful: raw.stateful,
             session_timeout,
             protocol_version: raw.protocol_version,
+            oauth2_server,
         })
     }
 }
@@ -500,6 +545,10 @@ mod tests {
             health_endpoint: None,
             header: vec![],
             oauth2_bearer: None,
+            oauth2_server_client_id: None,
+            oauth2_server_client_secret: None,
+            oauth2_token_expiry: 3600,
+            oauth2_issuer: None,
             stateful: false,
             session_timeout: None,
             protocol_version: "2024-11-05".into(),

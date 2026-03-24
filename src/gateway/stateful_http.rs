@@ -40,6 +40,8 @@ use crate::cors::{self, CorsHandler, CorsResult};
 use crate::error::GatewayError;
 use crate::health;
 use crate::jsonrpc::{Parsed, RawMessage};
+use crate::cli::OAuth2ServerConfig;
+use crate::oauth2::{OAuth2Handler, OAuth2Result};
 use crate::observe::{Logger, Metrics};
 use crate::session::{
     SessionAccessGuard, SessionError, SessionId, SessionManager, SessionManagerConfig,
@@ -521,6 +523,7 @@ pub struct StatefulHttpGateway {
     sessions: SessionManager<SessionData>,
     cmd: String,
     cors: CorsHandler,
+    oauth2: Option<Arc<OAuth2Handler>>,
     custom_headers: Vec<Header>,
     mcp_path: String,
     health_endpoints: Vec<String>,
@@ -540,6 +543,7 @@ impl StatefulHttpGateway {
         cors_config: CorsConfig,
         custom_headers: Vec<Header>,
         session_timeout: Option<Duration>,
+        oauth2_config: Option<OAuth2ServerConfig>,
         metrics: Arc<Metrics>,
         logger: Arc<Logger>,
         rt: RuntimeHandle,
@@ -563,6 +567,7 @@ impl StatefulHttpGateway {
             sessions,
             cmd,
             cors: CorsHandler::new(cors_config, true), // expose Mcp-Session-Id
+            oauth2: oauth2_config.map(|c| Arc::new(OAuth2Handler::new(c))),
             custom_headers,
             mcp_path,
             health_endpoints,
@@ -602,7 +607,7 @@ impl StatefulHttpGateway {
             CorsResult::ResponseHeaders(_) => {} // applied after handler
         }
 
-        // Health endpoints
+        // Health endpoints (no auth required)
         for health_path in &self.health_endpoints {
             if req.path == *health_path {
                 let detail = req.query.get("detail").map(|v| v == "true").unwrap_or(false);
@@ -615,6 +620,39 @@ impl StatefulHttpGateway {
                 cors::apply_custom_headers(&mut h, &self.custom_headers);
                 resp.headers.extend(h);
                 return self.apply_cors(resp, &cors_result).into();
+            }
+        }
+
+        // OAuth2 server handling (after CORS preflight and health, before MCP dispatch)
+        if let Some(ref oauth2) = self.oauth2 {
+            let result = oauth2.process(
+                &req.method,
+                &req.path,
+                &req.headers,
+                &req.body,
+                &req.query,
+            );
+            match result {
+                OAuth2Result::EndpointResponse(resp) => {
+                    let mut gw_resp = GatewayResponse::new(resp.status);
+                    gw_resp.headers = resp.headers;
+                    gw_resp.body = resp.body;
+                    if let CorsResult::ResponseHeaders(ref h) = cors_result {
+                        gw_resp.headers.extend(h.iter().cloned());
+                    }
+                    return gw_resp.into();
+                }
+                OAuth2Result::Passthrough(Ok(())) => {} // token valid, continue
+                OAuth2Result::Passthrough(Err(ref e)) => {
+                    let resp = crate::oauth2::unauthorized_response(e);
+                    let mut gw_resp = GatewayResponse::new(resp.status);
+                    gw_resp.headers = resp.headers;
+                    gw_resp.body = resp.body;
+                    if let CorsResult::ResponseHeaders(ref h) = cors_result {
+                        gw_resp.headers.extend(h.iter().cloned());
+                    }
+                    return gw_resp.into();
+                }
             }
         }
 
@@ -1265,6 +1303,7 @@ pub async fn run(_cx: &asupersync::Cx, config: Config, rt_handle: RuntimeHandle)
         config.cors,
         config.headers,
         session_timeout,
+        config.oauth2_server,
         metrics,
         logger,
         rt_handle2,
@@ -2157,7 +2196,8 @@ mod tests {
             vec!["/healthz".into()],
             CorsConfig::Disabled,
             vec![],
-            None,
+            None, // session_timeout
+            None, // no OAuth2
             test_metrics(),
             test_logger(),
             test_rt_handle(),
@@ -2172,7 +2212,8 @@ mod tests {
             vec!["/healthz".into()],
             CorsConfig::Wildcard,
             vec![],
-            None,
+            None, // session_timeout
+            None, // no OAuth2
             test_metrics(),
             test_logger(),
             test_rt_handle(),
@@ -2194,6 +2235,7 @@ mod tests {
             sessions,
             cmd: "cat".into(),
             cors: CorsHandler::new(CorsConfig::Disabled, true),
+            oauth2: None,
             custom_headers: vec![],
             mcp_path: "/mcp".into(),
             health_endpoints: vec!["/healthz".into()],
