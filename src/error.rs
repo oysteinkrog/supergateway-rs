@@ -467,7 +467,7 @@ mod tests {
     #[test]
     fn io_error_maps_to_500() {
         let e: GatewayError =
-            std::io::Error::new(std::io::ErrorKind::Other, "disk full").into();
+            std::io::Error::other("disk full").into();
         assert_eq!(e.status_code(), 500);
         assert_eq!(e.json_rpc_code(), Some(codes::INTERNAL_ERROR));
     }

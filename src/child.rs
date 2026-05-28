@@ -117,7 +117,7 @@ impl ChildBridge {
                 .stderr(Stdio::piped())
                 .pre_exec(|| {
                     if libc::setsid() == -1 {
-                        return Err(io::Error::new(io::ErrorKind::Other, "setsid failed"));
+                        return Err(io::Error::other("setsid failed"));
                     }
                     Ok(())
                 })
