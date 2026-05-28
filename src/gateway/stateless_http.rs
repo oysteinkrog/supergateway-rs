@@ -31,11 +31,15 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 
+use asupersync::channel::mpsc as async_mpsc;
 use asupersync::http::h1::{Http1Listener, Request as H1Request, Response as H1Response};
 use asupersync::runtime::RuntimeHandle;
+use asupersync::time::{timeout, wall_now};
+use asupersync::Cx;
 
 use crate::child::ChildBridge;
 use crate::cli::{CorsConfig, Header};
+use crate::codec::CodecError;
 use crate::cors::{self, CorsHandler, CorsResult};
 use crate::error::{self, GatewayError};
 use crate::health;
@@ -168,13 +172,14 @@ fn format_sse_event(msg: &RawMessage) -> String {
 /// are stored in `buffered` for later forwarding. Returns `Err` on timeout or
 /// child death.
 #[allow(dead_code)]
-fn wait_for_init_response(
-    child: &ChildBridge,
+async fn wait_for_init_response(
+    cx: &Cx,
+    rx: &mut async_mpsc::Receiver<Result<Parsed, CodecError>>,
     init_id: &str,
-    timeout: Duration,
+    total_timeout: Duration,
     buffered: &mut Vec<RawMessage>,
 ) -> Result<(), GatewayError> {
-    let deadline = Instant::now() + timeout;
+    let deadline = Instant::now() + total_timeout;
 
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -182,30 +187,35 @@ fn wait_for_init_response(
             return Err(GatewayError::AutoInitTimeout);
         }
 
-        match child.recv_message_timeout(remaining) {
-            Ok(parsed) => {
-                let msgs = match parsed {
-                    Parsed::Single(m) => vec![m],
-                    Parsed::Batch(ms) => ms,
-                };
-                for msg in msgs {
-                    if msg.is_response() {
-                        if let Some(ref id) = msg.id {
-                            // id.get() is the raw JSON value, e.g. "\"init_12345_abc\""
-                            let trimmed = id.get().trim_matches('"');
-                            if trimmed == init_id {
-                                // Init response received — suppress (don't forward)
-                                return Ok(());
-                            }
-                        }
+        let recv_result = timeout(wall_now(), remaining, rx.recv(cx)).await;
+        let parsed = match recv_result {
+            Ok(Ok(Ok(p))) => p,
+            Ok(Ok(Err(codec_err))) => {
+                return Err(GatewayError::Child(crate::child::ChildError::Codec(
+                    codec_err,
+                )));
+            }
+            Ok(Err(_)) => return Err(GatewayError::ChildDead),
+            Err(_elapsed) => return Err(GatewayError::AutoInitTimeout),
+        };
+
+        let msgs = match parsed {
+            Parsed::Single(m) => vec![m],
+            Parsed::Batch(ms) => ms,
+        };
+        for msg in msgs {
+            if msg.is_response() {
+                if let Some(ref id) = msg.id {
+                    // id.get() is the raw JSON value, e.g. "\"init_12345_abc\""
+                    let trimmed = id.get().trim_matches('"');
+                    if trimmed == init_id {
+                        // Init response received — suppress (don't forward)
+                        return Ok(());
                     }
-                    // Buffer everything else (notifications, unexpected responses)
-                    buffered.push(msg);
                 }
             }
-            Err(crate::child::ChildError::Timeout) => return Err(GatewayError::AutoInitTimeout),
-            Err(crate::child::ChildError::StdoutClosed) => return Err(GatewayError::ChildDead),
-            Err(e) => return Err(GatewayError::Child(e)),
+            // Buffer everything else (notifications, unexpected responses)
+            buffered.push(msg);
         }
     }
 }
@@ -215,12 +225,13 @@ fn wait_for_init_response(
 /// Returns all collected messages (responses + notifications) and whether
 /// all expected responses were received.
 #[allow(dead_code)]
-fn collect_responses(
-    child: &ChildBridge,
+async fn collect_responses(
+    cx: &Cx,
+    rx: &mut async_mpsc::Receiver<Result<Parsed, CodecError>>,
     expected: usize,
-    timeout: Duration,
+    total_timeout: Duration,
 ) -> (Vec<RawMessage>, bool) {
-    let deadline = Instant::now() + timeout;
+    let deadline = Instant::now() + total_timeout;
     let mut collected: Vec<RawMessage> = Vec::new();
     let mut response_count = 0;
 
@@ -230,20 +241,23 @@ fn collect_responses(
             break;
         }
 
-        match child.recv_message_timeout(remaining) {
-            Ok(parsed) => {
-                let msgs = match parsed {
-                    Parsed::Single(m) => vec![m],
-                    Parsed::Batch(ms) => ms,
-                };
-                for msg in msgs {
-                    if msg.is_response() {
-                        response_count += 1;
-                    }
-                    collected.push(msg);
-                }
+        let recv_result = timeout(wall_now(), remaining, rx.recv(cx)).await;
+        let parsed = match recv_result {
+            Ok(Ok(Ok(p))) => p,
+            // Codec error or channel closed: stop collecting; caller checks
+            // child.is_dead() to distinguish death from a clean stop.
+            _ => break,
+        };
+
+        let msgs = match parsed {
+            Parsed::Single(m) => vec![m],
+            Parsed::Batch(ms) => ms,
+        };
+        for msg in msgs {
+            if msg.is_response() {
+                response_count += 1;
             }
-            Err(_) => break,
+            collected.push(msg);
         }
     }
 
@@ -314,7 +328,7 @@ impl StatelessHttpGateway {
 
     /// Handle an incoming HTTP request. Returns a response.
     #[allow(dead_code)]
-    pub fn handle_request(&self, req: &GatewayRequest) -> GatewayResponse {
+    pub async fn handle_request(&self, cx: &Cx, req: &GatewayRequest) -> GatewayResponse {
         // CORS handling
         let cors_result = self.cors.process(
             &req.method,
@@ -360,7 +374,7 @@ impl StatelessHttpGateway {
         if req.path == self.mcp_path {
             Metrics::inc(&self.metrics.total_requests);
             let resp = match req.method.as_str() {
-                "POST" => self.handle_post(req),
+                "POST" => self.handle_post(cx, req).await,
                 // All non-POST methods return 405 in stateless mode
                 _ => response_method_not_allowed(),
             };
@@ -381,28 +395,26 @@ impl StatelessHttpGateway {
 
     // ─── POST handler ──────────────────────────────────────────────
 
+    /// Top-level POST dispatch. Panics in the async body propagate to the
+    /// asupersync task supervisor, which isolates them from the listener loop;
+    /// the client sees a connection abort rather than a JSON 500. This is a
+    /// documented divergence from the previous sync handler.
     #[allow(dead_code)]
-    fn handle_post(&self, req: &GatewayRequest) -> GatewayResponse {
-        // Outer catch-all: panics → 500 + JSON-RPC -32603
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.handle_post_inner(req)
-        })) {
-            Ok(Ok(resp)) => resp,
-            Ok(Err(e)) => {
+    async fn handle_post(&self, cx: &Cx, req: &GatewayRequest) -> GatewayResponse {
+        match self.handle_post_inner(cx, req).await {
+            Ok(resp) => resp,
+            Err(e) => {
                 self.logger
                     .error(&format!("stateless POST error: {e}"));
                 response_from_error(&e)
-            }
-            Err(_) => {
-                self.logger.error("stateless POST: unexpected panic");
-                response_internal_error()
             }
         }
     }
 
     #[allow(dead_code)]
-    fn handle_post_inner(
+    async fn handle_post_inner(
         &self,
+        cx: &Cx,
         req: &GatewayRequest,
     ) -> Result<GatewayResponse, GatewayError> {
         // 1. Acquire request permit (1024 max concurrent)
@@ -461,12 +473,19 @@ impl StatelessHttpGateway {
                 },
             )?;
 
+        // Take exclusive ownership of the child's stdout receiver for async
+        // await-driven reads. This per-request child is the sole consumer, so
+        // `None` here would indicate a programming error.
+        let mut rx = child
+            .take_stdout_rx()
+            .ok_or_else(|| GatewayError::Internal("stdout receiver missing".into()))?;
+
         // 8. Determine path: direct initialize (Case 1) or auto-init (Case 2)
         let has_initialize = messages.iter().any(|m| m.is_initialize_request());
         let result = if has_initialize {
-            self.forward_direct(&child, messages)
+            self.forward_direct(cx, &child, &mut rx, messages).await
         } else {
-            self.auto_init_and_forward(&child, messages)
+            self.auto_init_and_forward(cx, &child, &mut rx, messages).await
         };
 
         // 9. Kill child (always, regardless of success/failure)
@@ -493,9 +512,11 @@ impl StatelessHttpGateway {
     // ─── Case 1: Direct forward (initialize request) ──────────────
 
     #[allow(dead_code)]
-    fn forward_direct(
+    async fn forward_direct(
         &self,
+        cx: &Cx,
         child: &ChildBridge,
+        rx: &mut async_mpsc::Receiver<Result<Parsed, CodecError>>,
         messages: Vec<RawMessage>,
     ) -> Result<GatewayResponse, GatewayError> {
         let expected_responses = messages.iter().filter(|m| m.is_request()).count();
@@ -512,7 +533,7 @@ impl StatelessHttpGateway {
 
         // Collect responses
         let (collected, _complete) =
-            collect_responses(child, expected_responses, RESPONSE_TIMEOUT);
+            collect_responses(cx, rx, expected_responses, RESPONSE_TIMEOUT).await;
 
         if collected.is_empty() {
             if child.is_dead() {
@@ -533,9 +554,11 @@ impl StatelessHttpGateway {
     // ─── Case 2: Auto-init + forward ──────────────────────────────
 
     #[allow(dead_code)]
-    fn auto_init_and_forward(
+    async fn auto_init_and_forward(
         &self,
+        cx: &Cx,
         child: &ChildBridge,
+        rx: &mut async_mpsc::Receiver<Result<Parsed, CodecError>>,
         messages: Vec<RawMessage>,
     ) -> Result<GatewayResponse, GatewayError> {
         // 1. Generate and send synthetic initialize request
@@ -546,11 +569,13 @@ impl StatelessHttpGateway {
         // 2. Wait for initialize response (buffer notifications, D-005)
         let mut buffered_notifications: Vec<RawMessage> = Vec::new();
         wait_for_init_response(
-            child,
+            cx,
+            rx,
             &init_id,
             AUTO_INIT_TIMEOUT,
             &mut buffered_notifications,
-        )?;
+        )
+        .await?;
 
         // 3. Send notifications/initialized
         let initialized_notif = build_initialized_notification();
@@ -571,7 +596,7 @@ impl StatelessHttpGateway {
 
         // 7. Collect responses
         let (collected, _complete) =
-            collect_responses(child, expected_responses, RESPONSE_TIMEOUT);
+            collect_responses(cx, rx, expected_responses, RESPONSE_TIMEOUT).await;
 
         if collected.is_empty() && expected_responses > 0 {
             if child.is_dead() {
@@ -674,7 +699,8 @@ pub async fn run(_cx: &asupersync::Cx, config: crate::cli::Config, rt_handle: Ru
             let gw = gw_handler.clone();
             async move {
                 let gw_req = convert_h1_request(req);
-                let resp = gw.handle_request(&gw_req);
+                let cx = Cx::current().expect("request handler runs in task context");
+                let resp = gw.handle_request(&cx, &gw_req).await;
                 convert_gateway_response(resp)
             }
         },
@@ -698,6 +724,34 @@ mod tests {
     use std::collections::HashMap;
     use serde_json::value::RawValue;
     use crate::cli::{LogLevel, OutputTransport};
+
+    /// Shared runtime for async test bridging. Spawning tasks on this runtime
+    /// gives them a real `Cx`, which `handle_request` needs to drive the
+    /// async stdout receiver and timer wheel.
+    fn test_runtime() -> &'static asupersync::runtime::Runtime {
+        static RT: std::sync::OnceLock<asupersync::runtime::Runtime> = std::sync::OnceLock::new();
+        RT.get_or_init(|| {
+            asupersync::runtime::RuntimeBuilder::new()
+                .build()
+                .expect("test runtime")
+        })
+    }
+
+    /// Spawn `gw.handle_request(cx, req)` on the test runtime and block the
+    /// test thread until it completes. Bridges the runtime task back to the
+    /// sync `#[test]` harness via std::sync::mpsc.
+    fn run_handler(
+        gw: Arc<StatelessHttpGateway>,
+        req: GatewayRequest,
+    ) -> GatewayResponse {
+        let (tx, rx) = std::sync::mpsc::channel();
+        test_runtime().handle().spawn(async move {
+            let cx = Cx::current().expect("spawn task has context");
+            let resp = gw.handle_request(&cx, &req).await;
+            let _ = tx.send(resp);
+        });
+        rx.recv().expect("handler task completed")
+    }
 
     #[allow(dead_code)]
     fn test_logger() -> Arc<Logger> {
@@ -733,8 +787,8 @@ mod tests {
     }
 
     #[allow(dead_code)]
-    fn make_test_gateway() -> StatelessHttpGateway {
-        StatelessHttpGateway::new(
+    fn make_test_gateway() -> Arc<StatelessHttpGateway> {
+        Arc::new(StatelessHttpGateway::new(
             "cat".into(),
             "/mcp".into(),
             vec!["/healthz".into()],
@@ -743,12 +797,12 @@ mod tests {
             "2024-11-05".into(),
             test_metrics(),
             test_logger(),
-        )
+        ))
     }
 
     #[allow(dead_code)]
-    fn make_test_gateway_with_cors() -> StatelessHttpGateway {
-        StatelessHttpGateway::new(
+    fn make_test_gateway_with_cors() -> Arc<StatelessHttpGateway> {
+        Arc::new(StatelessHttpGateway::new(
             "cat".into(),
             "/mcp".into(),
             vec!["/healthz".into()],
@@ -757,7 +811,7 @@ mod tests {
             "2024-11-05".into(),
             test_metrics(),
             test_logger(),
-        )
+        ))
     }
 
     /// Mock MCP server: responds to initialize with init result,
@@ -815,7 +869,7 @@ mod tests {
     fn get_returns_405() {
         let gw = make_test_gateway();
         let req = make_gateway_request("GET", "/mcp", "", vec![]);
-        let resp = gw.handle_request(&req);
+        let resp = run_handler(gw.clone(), req);
         assert_eq!(resp.status, 405);
         // No Content-Type header per TS behavior
         let ct = resp
@@ -835,7 +889,7 @@ mod tests {
     fn delete_returns_405() {
         let gw = make_test_gateway();
         let req = make_gateway_request("DELETE", "/mcp", "", vec![]);
-        let resp = gw.handle_request(&req);
+        let resp = run_handler(gw.clone(), req);
         assert_eq!(resp.status, 405);
     }
 
@@ -843,7 +897,7 @@ mod tests {
     fn put_returns_405() {
         let gw = make_test_gateway();
         let req = make_gateway_request("PUT", "/mcp", "", vec![]);
-        let resp = gw.handle_request(&req);
+        let resp = run_handler(gw.clone(), req);
         assert_eq!(resp.status, 405);
     }
 
@@ -861,7 +915,7 @@ mod tests {
                 ("accept", "application/json, text/event-stream"),
             ],
         );
-        let resp = gw.handle_request(&req);
+        let resp = run_handler(gw.clone(), req);
         assert_eq!(resp.status, 415);
     }
 
@@ -874,7 +928,7 @@ mod tests {
             "{}",
             vec![("content-type", "application/json")],
         );
-        let resp = gw.handle_request(&req);
+        let resp = run_handler(gw.clone(), req);
         assert_eq!(resp.status, 406);
     }
 
@@ -883,7 +937,7 @@ mod tests {
         let gw = make_test_gateway();
         let big_body = "x".repeat(MAX_BODY_SIZE + 1);
         let req = make_gateway_request("POST", "/mcp", &big_body, post_headers());
-        let resp = gw.handle_request(&req);
+        let resp = run_handler(gw.clone(), req);
         assert_eq!(resp.status, 413);
     }
 
@@ -891,7 +945,7 @@ mod tests {
     fn post_malformed_json_returns_400() {
         let gw = make_test_gateway();
         let req = make_gateway_request("POST", "/mcp", "not json", post_headers());
-        let resp = gw.handle_request(&req);
+        let resp = run_handler(gw.clone(), req);
         assert_eq!(resp.status, 400);
     }
 
@@ -964,7 +1018,7 @@ mod tests {
             .store(MAX_CONCURRENT_REQUESTS, Ordering::Release);
         let body = r#"{"jsonrpc":"2.0","id":1,"method":"test"}"#;
         let req = make_gateway_request("POST", "/mcp", body, post_headers());
-        let resp = gw.handle_request(&req);
+        let resp = run_handler(gw.clone(), req);
         assert_eq!(resp.status, 503);
     }
 
@@ -974,7 +1028,7 @@ mod tests {
     fn health_endpoint_returns_503_before_ready() {
         let gw = make_test_gateway();
         let req = make_gateway_request("GET", "/healthz", "", vec![]);
-        let resp = gw.handle_request(&req);
+        let resp = run_handler(gw.clone(), req);
         assert_eq!(resp.status, 503);
     }
 
@@ -983,7 +1037,7 @@ mod tests {
         let gw = make_test_gateway();
         gw.metrics.set_ready();
         let req = make_gateway_request("GET", "/healthz", "", vec![]);
-        let resp = gw.handle_request(&req);
+        let resp = run_handler(gw.clone(), req);
         assert_eq!(resp.status, 200);
         assert_eq!(String::from_utf8_lossy(&resp.body), "ok");
     }
@@ -999,7 +1053,7 @@ mod tests {
             "",
             vec![("origin", "https://example.com")],
         );
-        let resp = gw.handle_request(&req);
+        let resp = run_handler(gw.clone(), req);
         assert_eq!(resp.status, 204);
         let acao = resp
             .headers
@@ -1017,7 +1071,7 @@ mod tests {
             "",
             vec![("origin", "https://example.com")],
         );
-        let resp = gw.handle_request(&req);
+        let resp = run_handler(gw.clone(), req);
         let expose = resp
             .headers
             .iter()
@@ -1034,7 +1088,7 @@ mod tests {
     fn unknown_path_returns_404() {
         let gw = make_test_gateway();
         let req = make_gateway_request("GET", "/unknown", "", vec![]);
-        let resp = gw.handle_request(&req);
+        let resp = run_handler(gw.clone(), req);
         assert_eq!(resp.status, 404);
     }
 
@@ -1044,7 +1098,7 @@ mod tests {
     fn no_session_id_in_405() {
         let gw = make_test_gateway();
         let req = make_gateway_request("GET", "/mcp", "", vec![]);
-        let resp = gw.handle_request(&req);
+        let resp = run_handler(gw.clone(), req);
         let sid = resp
             .headers
             .iter()
@@ -1056,7 +1110,7 @@ mod tests {
 
     #[test]
     fn post_initialize_passthrough() {
-        let gw = StatelessHttpGateway::new(
+        let gw = Arc::new(StatelessHttpGateway::new(
             MOCK_MCP_SERVER.into(),
             "/mcp".into(),
             vec![],
@@ -1065,12 +1119,12 @@ mod tests {
             "2024-11-05".into(),
             test_metrics(),
             test_logger(),
-        );
+        ));
 
         let body =
             r#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"capabilities":{}}}"#;
         let req = make_gateway_request("POST", "/mcp", body, post_headers());
-        let resp = gw.handle_request(&req);
+        let resp = run_handler(gw.clone(), req);
 
         assert_eq!(resp.status, 200);
         let ct = resp
@@ -1093,7 +1147,7 @@ mod tests {
 
     #[test]
     fn post_auto_init_tool_call() {
-        let gw = StatelessHttpGateway::new(
+        let gw = Arc::new(StatelessHttpGateway::new(
             MOCK_MCP_SERVER.into(),
             "/mcp".into(),
             vec![],
@@ -1102,11 +1156,11 @@ mod tests {
             "2024-11-05".into(),
             test_metrics(),
             test_logger(),
-        );
+        ));
 
         let body = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"echo","arguments":{"text":"hello"}}}"#;
         let req = make_gateway_request("POST", "/mcp", body, post_headers());
-        let resp = gw.handle_request(&req);
+        let resp = run_handler(gw.clone(), req);
 
         assert_eq!(resp.status, 200);
         let body_str = String::from_utf8_lossy(&resp.body);
@@ -1118,7 +1172,7 @@ mod tests {
 
     #[test]
     fn post_notification_returns_202() {
-        let gw = StatelessHttpGateway::new(
+        let gw = Arc::new(StatelessHttpGateway::new(
             MOCK_MCP_SERVER.into(),
             "/mcp".into(),
             vec![],
@@ -1127,11 +1181,11 @@ mod tests {
             "2024-11-05".into(),
             test_metrics(),
             test_logger(),
-        );
+        ));
 
         let body = r#"{"jsonrpc":"2.0","method":"notifications/progress","params":{"token":"x"}}"#;
         let req = make_gateway_request("POST", "/mcp", body, post_headers());
-        let resp = gw.handle_request(&req);
+        let resp = run_handler(gw.clone(), req);
 
         assert_eq!(resp.status, 202);
     }
@@ -1141,7 +1195,7 @@ mod tests {
     #[test]
     fn auto_init_timeout_returns_502() {
         // Child never responds → auto-init times out after 5s
-        let gw = StatelessHttpGateway::new(
+        let gw = Arc::new(StatelessHttpGateway::new(
             "sleep 999".into(),
             "/mcp".into(),
             vec![],
@@ -1150,11 +1204,11 @@ mod tests {
             "2024-11-05".into(),
             test_metrics(),
             test_logger(),
-        );
+        ));
 
         let body = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
         let req = make_gateway_request("POST", "/mcp", body, post_headers());
-        let resp = gw.handle_request(&req);
+        let resp = run_handler(gw.clone(), req);
 
         assert_eq!(resp.status, 502);
         let body_str = String::from_utf8_lossy(&resp.body);
@@ -1166,7 +1220,7 @@ mod tests {
 
     #[test]
     fn post_batch_request() {
-        let gw = StatelessHttpGateway::new(
+        let gw = Arc::new(StatelessHttpGateway::new(
             MOCK_MCP_SERVER.into(),
             "/mcp".into(),
             vec![],
@@ -1175,11 +1229,11 @@ mod tests {
             "2024-11-05".into(),
             test_metrics(),
             test_logger(),
-        );
+        ));
 
         let body = r#"[{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{}},{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{}}]"#;
         let req = make_gateway_request("POST", "/mcp", body, post_headers());
-        let resp = gw.handle_request(&req);
+        let resp = run_handler(gw.clone(), req);
 
         assert_eq!(resp.status, 200);
         let body_str = String::from_utf8_lossy(&resp.body);
@@ -1192,7 +1246,7 @@ mod tests {
 
     #[test]
     fn child_death_returns_502() {
-        let gw = StatelessHttpGateway::new(
+        let gw = Arc::new(StatelessHttpGateway::new(
             // Child exits immediately
             "true".into(),
             "/mcp".into(),
@@ -1202,11 +1256,11 @@ mod tests {
             "2024-11-05".into(),
             test_metrics(),
             test_logger(),
-        );
+        ));
 
         let body = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
         let req = make_gateway_request("POST", "/mcp", body, post_headers());
-        let resp = gw.handle_request(&req);
+        let resp = run_handler(gw.clone(), req);
 
         // Child dies during auto-init → either 502 (ChildDead) or 502 (AutoInitTimeout)
         assert!(

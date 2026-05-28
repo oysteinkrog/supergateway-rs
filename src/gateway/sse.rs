@@ -247,11 +247,9 @@ impl SseGateway {
 
     /// Run the relay loop (blocking). Returns the child's exit code.
     ///
-    /// Reads child stdout and broadcasts every message to all connected SSE
-    /// clients. Messages before the first client are buffered (up to 256).
-    ///
-    /// Returns when the child exits. The caller MUST exit the process with
-    /// the returned code (or 1 if None) so pm2/systemd can restart.
+    /// Test-only — production uses `run_relay_async` / `spawn_relay_async`.
+    /// Retained for unit tests that need a sync relay without a runtime.
+    #[cfg(test)]
     #[allow(dead_code)]
     pub fn run_relay(&self) -> Option<i32> {
         loop {
@@ -301,10 +299,8 @@ impl SseGateway {
         self.child.exit_code()
     }
 
-    /// Convenience: spawn the relay in a background thread.
-    ///
-    /// When the child exits the thread returns the exit code. The caller
-    /// should join and call `process::exit(code.unwrap_or(1))`.
+    /// Convenience: spawn the relay in a background thread. Test-only.
+    #[cfg(test)]
     #[allow(dead_code)]
     pub fn spawn_relay(&self) -> std::thread::JoinHandle<Option<i32>> {
         let gw = self.clone();

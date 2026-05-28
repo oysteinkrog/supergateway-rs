@@ -208,11 +208,10 @@ impl ChildBridge {
 
     /// Receive the next message from child stdout (blocking spin-poll).
     ///
-    /// Prefer `take_stdout_rx()` + `rx.recv(cx).await` for async callers.
-    /// This method is for sync contexts (stateful_http, stateless_http relay threads).
-    ///
-    /// Returns `Err(StdoutClosed)` on EOF or if rx was already taken.
-    /// Returns `Err(Codec(e))` on fatal codec errors (InvalidUtf8, BufferOverflow).
+    /// Test-only. Production callers must use `take_stdout_rx()` +
+    /// `rx.recv(cx).await` — the spin-poll burns CPU proportional to the
+    /// number of idle sessions.
+    #[cfg(test)]
     #[allow(dead_code)]
     pub fn recv_message(&self) -> Result<Parsed, ChildError> {
         loop {
@@ -230,9 +229,8 @@ impl ChildBridge {
         }
     }
 
-    /// Try to receive a message without blocking.
-    ///
-    /// Returns `Ok(None)` if no message is available yet.
+    /// Try to receive a message without blocking. Test-only.
+    #[cfg(test)]
     #[allow(dead_code)]
     pub fn try_recv_message(&self) -> Result<Option<Parsed>, ChildError> {
         let guard = self.stdout_rx.lock().unwrap();
@@ -247,8 +245,9 @@ impl ChildBridge {
 
     /// Receive the next message from child stdout, blocking up to `timeout`.
     ///
-    /// Returns `Err(Timeout)` if no message arrives within `timeout`.
-    /// Returns `Err(StdoutClosed)` on EOF or if rx was already taken.
+    /// Test-only — see `recv_message` for the rationale. Production paths
+    /// wrap `rx.recv(cx)` in `asupersync::time::timeout(...)`.
+    #[cfg(test)]
     #[allow(dead_code)]
     pub fn recv_message_timeout(&self, timeout: Duration) -> Result<Parsed, ChildError> {
         let deadline = Instant::now() + timeout;

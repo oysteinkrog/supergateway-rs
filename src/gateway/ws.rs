@@ -308,12 +308,8 @@ impl WsGateway {
 
     /// Run the relay loop (blocking). Returns the child's exit code.
     ///
-    /// Reads child stdout and routes each message:
-    /// - Responses → specific client via mangled ID lookup
-    /// - Requests/notifications → broadcast to all clients
-    ///
-    /// Returns when the child exits. The caller MUST exit the process with
-    /// the returned code (or 1 if None) so pm2/systemd can restart.
+    /// Test-only — production uses `run_relay_async` / `spawn_relay_async`.
+    #[cfg(test)]
     #[allow(dead_code)]
     pub fn run_relay(&self) -> Option<i32> {
         loop {
@@ -343,7 +339,8 @@ impl WsGateway {
         self.child.exit_code()
     }
 
-    /// Convenience: spawn the relay in a background thread.
+    /// Convenience: spawn the relay in a background thread. Test-only.
+    #[cfg(test)]
     #[allow(dead_code)]
     pub fn spawn_relay(&self) -> std::thread::JoinHandle<Option<i32>> {
         let gw = self.clone();

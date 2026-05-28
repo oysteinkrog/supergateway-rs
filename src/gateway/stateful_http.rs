@@ -247,45 +247,55 @@ impl SessionData {
     }
 }
 
-// ─── Child relay thread ────────────────────────────────────────────────
+// ─── Child relay (async task) ──────────────────────────────────────────
 
-/// Spawn a relay thread that reads child stdout and routes messages.
+/// Async relay task: reads child stdout via the async receiver and routes messages.
 ///
 /// - Responses (has id): routed to matching pending POST handler
 /// - Notifications (no id): buffered during init, then sent to GET SSE stream
 /// - Initialize response: triggers init_done + flushes buffer
 ///
 /// On child exit/error: marks child_failed, sends error to all pending requests,
-/// then exits.
+/// then exits. Replaces the previous spin-polling OS thread which burned CPU
+/// proportional to the number of live sessions (see commit log for context).
 #[allow(dead_code)]
-fn spawn_relay_thread(
+async fn relay_task(
     session_id: SessionId,
     data: Arc<SessionData>,
-    weak_mgr: WeakSessionManager<SessionData>,
+    _weak_mgr: WeakSessionManager<SessionData>,
+    mut rx: async_mpsc::Receiver<Result<Parsed, crate::codec::CodecError>>,
 ) {
-    let sid = session_id.to_string();
-    std::thread::Builder::new()
-        .name(format!("relay-{}", &sid[..8]))
-        .spawn(move || {
-            relay_loop(&session_id, &data, &weak_mgr);
-        })
-        .expect("spawn relay thread");
-}
+    let cx = match asupersync::Cx::current() {
+        Some(c) => c,
+        None => {
+            data.logger
+                .error("relay_task spawned outside async context; bailing");
+            data.child_failed.store(true, Ordering::Release);
+            data.fail_pending_requests(
+                crate::error::codes::INTERNAL_ERROR,
+                "Internal: relay context unavailable",
+            );
+            return;
+        }
+    };
 
-#[allow(dead_code)]
-fn relay_loop(
-    session_id: &SessionId,
-    data: &SessionData,
-    _weak_mgr: &WeakSessionManager<SessionData>,
-) {
     loop {
-        let parsed = match data.child.recv_message() {
-            Ok(p) => p,
-            Err(e) => {
+        let parsed = match rx.recv(&cx).await {
+            Ok(Ok(p)) => p,
+            Ok(Err(codec_err)) => {
                 data.logger.info(&format!(
-                    "session {} child stdout closed: {e}",
-                    session_id
+                    "session {session_id} child codec error: {codec_err}"
                 ));
+                data.child_failed.store(true, Ordering::Release);
+                data.fail_pending_requests(
+                    crate::error::codes::INTERNAL_ERROR,
+                    "Child process dead",
+                );
+                return;
+            }
+            Err(_) => {
+                data.logger
+                    .info(&format!("session {session_id} child stdout closed"));
                 data.child_failed.store(true, Ordering::Release);
                 data.fail_pending_requests(
                     crate::error::codes::INTERNAL_ERROR,
@@ -296,10 +306,10 @@ fn relay_loop(
         };
 
         match parsed {
-            Parsed::Single(msg) => route_single_message(session_id, data, msg),
+            Parsed::Single(msg) => route_single_message(&session_id, &data, msg),
             Parsed::Batch(msgs) => {
                 for msg in msgs {
-                    route_single_message(session_id, data, msg);
+                    route_single_message(&session_id, &data, msg);
                 }
             }
         }
@@ -339,6 +349,7 @@ fn route_single_message(session_id: &SessionId, data: &SessionData, msg: RawMess
 
 /// Parsed HTTP request for handler dispatch.
 #[allow(dead_code)]
+#[derive(Clone)]
 pub struct GatewayRequest {
     pub method: String,
     pub path: String,
@@ -585,7 +596,7 @@ impl StatefulHttpGateway {
     /// Returns [`RequestResult::Response`] for most methods, or
     /// [`RequestResult::SseStream`] for a successful GET SSE connection.
     #[allow(dead_code)]
-    pub fn handle_request(&self, req: &GatewayRequest) -> RequestResult {
+    pub async fn handle_request(&self, cx: &asupersync::Cx, req: &GatewayRequest) -> RequestResult {
         // CORS handling
         let cors_result = self.cors.process(
             &req.method,
@@ -622,7 +633,9 @@ impl StatefulHttpGateway {
         if req.path == self.mcp_path {
             Metrics::inc(&self.metrics.total_requests);
             return match req.method.as_str() {
-                "POST" => self.apply_cors(self.handle_post(req), &cors_result).into(),
+                "POST" => self
+                    .apply_cors(self.handle_post(cx, req).await, &cors_result)
+                    .into(),
                 "GET" => self.handle_get(req, &cors_result),
                 "DELETE" => self
                     .apply_cors(self.handle_delete(req), &cors_result)
@@ -655,7 +668,7 @@ impl StatefulHttpGateway {
     // ─── POST handler ──────────────────────────────────────────────
 
     #[allow(dead_code)]
-    fn handle_post(&self, req: &GatewayRequest) -> GatewayResponse {
+    async fn handle_post(&self, cx: &asupersync::Cx, req: &GatewayRequest) -> GatewayResponse {
         // 1. Validate Content-Type
         let content_type = req.header("content-type").unwrap_or("");
         if !content_type.contains("application/json") {
@@ -709,7 +722,7 @@ impl StatefulHttpGateway {
             None => {
                 // No session ID: must be initialize request
                 if messages.len() == 1 && messages[0].is_initialize_request() {
-                    self.handle_post_initialize(req, messages)
+                    self.handle_post_initialize(cx, req, messages).await
                 } else {
                     GatewayResponse::from_error(
                         &GatewayError::bad_request(
@@ -720,15 +733,16 @@ impl StatefulHttpGateway {
             }
             Some(sid_str) => {
                 let sid = SessionId::from_value(sid_str);
-                self.handle_post_existing(req, &sid, messages)
+                self.handle_post_existing(cx, req, &sid, messages).await
             }
         }
     }
 
     /// Handle POST initialize: create new session.
     #[allow(dead_code)]
-    fn handle_post_initialize(
+    async fn handle_post_initialize(
         &self,
+        cx: &asupersync::Cx,
         _req: &GatewayRequest,
         messages: Vec<RawMessage>,
     ) -> GatewayResponse {
@@ -781,12 +795,13 @@ impl StatefulHttpGateway {
             }
         };
 
-        // Spawn relay thread — needs access to session data via the manager
-        // The relay thread gets a weak reference to avoid preventing shutdown.
-        spawn_relay_for_session(&self.sessions, &session_id, self.logger.clone());
+        // Spawn relay as an async task on the runtime. The relay holds a weak
+        // reference to the session manager so it doesn't prevent shutdown, and
+        // takes ownership of the child's stdout receiver for await-driven reads.
+        spawn_relay_for_session(&self.rt, &self.sessions, &session_id, self.logger.clone());
 
         // Forward messages and collect responses
-        let resp = self.forward_and_respond(&session_id, messages);
+        let resp = self.forward_and_respond(cx, &session_id, messages).await;
 
         // Drop guard before spawning idle timer (count must reflect this drop)
         drop(guard);
@@ -803,8 +818,9 @@ impl StatefulHttpGateway {
 
     /// Handle POST to existing session.
     #[allow(dead_code)]
-    fn handle_post_existing(
+    async fn handle_post_existing(
         &self,
+        cx: &asupersync::Cx,
         _req: &GatewayRequest,
         session_id: &SessionId,
         messages: Vec<RawMessage>,
@@ -818,7 +834,7 @@ impl StatefulHttpGateway {
             }
         };
 
-        let resp = self.forward_and_respond(session_id, messages);
+        let resp = self.forward_and_respond(cx, session_id, messages).await;
 
         // Drop guard before checking idle timer (count must reflect this drop)
         drop(guard);
@@ -829,8 +845,9 @@ impl StatefulHttpGateway {
 
     /// Forward messages to child and collect responses.
     #[allow(dead_code)]
-    fn forward_and_respond(
+    async fn forward_and_respond(
         &self,
+        cx: &asupersync::Cx,
         session_id: &SessionId,
         messages: Vec<RawMessage>,
     ) -> GatewayResponse {
@@ -885,10 +902,10 @@ impl StatefulHttpGateway {
         }
 
         // Register a single shared response channel for all pending request IDs.
-        // The relay thread routes responses by ID through SessionData::route_response,
+        // The relay task routes responses by ID through SessionData::route_response,
         // which sends to the matching sender. All senders point to the same channel,
         // so responses arrive in whatever order the child emits them.
-        let (tx, rx) = async_mpsc::channel::<RawMessage>(RESPONSE_CHANNEL_CAP);
+        let (tx, mut rx) = async_mpsc::channel::<RawMessage>(RESPONSE_CHANNEL_CAP);
 
         self.with_session(session_id, |data| {
             for id_str in &request_ids {
@@ -898,39 +915,36 @@ impl StatefulHttpGateway {
         // Drop our copy so the channel disconnects when all relay senders are done
         drop(tx);
 
-        // Collect responses by ID, allowing out-of-order arrival
+        // Collect responses by ID, allowing out-of-order arrival.
+        // Replaces the previous 1ms try_recv spin-poll with an await on the
+        // bounded channel — idle handlers cost ~0 CPU.
         let mut pending: std::collections::HashSet<String> =
             request_ids.iter().cloned().collect();
         let mut responses: HashMap<String, RawMessage> = HashMap::new();
 
         let deadline = Instant::now() + RESPONSE_TIMEOUT;
-        'outer: while !pending.is_empty() {
-            if Instant::now() >= deadline {
+        while !pending.is_empty() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
                 self.logger.error(&format!(
                     "session {session_id}: response timeout after {RESPONSE_TIMEOUT:?}"
                 ));
                 break;
             }
-            loop {
-                match rx.try_recv() {
-                    Ok(msg) => {
-                        if let Some(ref id) = msg.id {
-                            let id_str = id.get().to_string();
-                            pending.remove(&id_str);
-                            responses.insert(id_str, msg);
-                        }
-                        break; // go back to check pending is_empty
+            match timeout(wall_now(), remaining, rx.recv(cx)).await {
+                Ok(Ok(msg)) => {
+                    if let Some(ref id) = msg.id {
+                        let id_str = id.get().to_string();
+                        pending.remove(&id_str);
+                        responses.insert(id_str, msg);
                     }
-                    Err(async_mpsc::RecvError::Empty) => {
-                        if Instant::now() >= deadline {
-                            self.logger.error(&format!(
-                                "session {session_id}: response timeout after {RESPONSE_TIMEOUT:?}"
-                            ));
-                            break 'outer;
-                        }
-                        std::thread::sleep(Duration::from_millis(1));
-                    }
-                    Err(_) => break 'outer, // relay thread died
+                }
+                Ok(Err(_)) => break, // relay task closed channel (child died)
+                Err(_elapsed) => {
+                    self.logger.error(&format!(
+                        "session {session_id}: response timeout after {RESPONSE_TIMEOUT:?}"
+                    ));
+                    break;
                 }
             }
         }
@@ -1214,12 +1228,15 @@ impl StatefulHttpGateway {
 
 // ─── Relay spawning ────────────────────────────────────────────────────
 
-/// Spawn the relay thread for a session. This is called after session creation.
+/// Spawn the relay task for a session as an async task on the runtime.
 ///
-/// Gets an `Arc<SessionData>` from the session manager so the relay thread can
-/// hold a long-lived reference independent of the session map's lock.
+/// Gets an `Arc<SessionData>` from the session manager so the relay can hold
+/// a long-lived reference independent of the session map's lock. Takes the
+/// child's async stdout receiver once so the relay awaits messages instead of
+/// spin-polling.
 #[allow(dead_code)]
 fn spawn_relay_for_session(
+    rt: &RuntimeHandle,
     mgr: &SessionManager<SessionData>,
     session_id: &SessionId,
     logger: Arc<Logger>,
@@ -1234,8 +1251,22 @@ fn spawn_relay_for_session(
         }
     };
 
+    let rx = match data.child.take_stdout_rx() {
+        Some(rx) => rx,
+        None => {
+            logger.error(&format!(
+                "session {session_id}: stdout receiver already taken; cannot spawn relay"
+            ));
+            data.child_failed.store(true, Ordering::Release);
+            return;
+        }
+    };
+
     let weak = mgr.downgrade();
-    spawn_relay_thread(session_id.clone(), data, weak);
+    let sid = session_id.clone();
+    rt.spawn(async move {
+        relay_task(sid, data, weak, rx).await;
+    });
 }
 
 // ─── Entry point ────────────────────────────────────────────────────────
@@ -1344,14 +1375,9 @@ async fn handle_stateful_connection_async(
             .collect(),
     };
 
-    // Run handle_request on a blocking thread: POST handler spins up to RESPONSE_TIMEOUT
-    // waiting for child responses — must not block the async executor.
-    let result = asupersync::runtime::spawn_blocking({
-        let gw = gw.clone();
-        let gw_req = gw_req;
-        move || gw.handle_request(&gw_req)
-    })
-    .await;
+    // handle_request awaits child responses via async channel — no executor
+    // blocking, so it runs directly on the connection task.
+    let result = gw.handle_request(&cx, &gw_req).await;
 
     match result {
         RequestResult::Response(resp) => {
@@ -1453,6 +1479,22 @@ mod tests {
                 .expect("test runtime")
         })
         .handle()
+    }
+
+    /// Spawn `gw.handle_request(cx, req)` on the test runtime and block the
+    /// test thread until it completes. Bridges the runtime task back to the
+    /// sync `#[test]` harness via std::sync::mpsc.
+    fn run_handler(
+        gw: Arc<StatefulHttpGateway>,
+        req: GatewayRequest,
+    ) -> RequestResult {
+        let (tx, rx) = std::sync::mpsc::channel();
+        test_rt_handle().spawn(async move {
+            let cx = asupersync::Cx::current().expect("spawn task has context");
+            let result = gw.handle_request(&cx, &req).await;
+            let _ = tx.send(result);
+        });
+        rx.recv().expect("handler task completed")
     }
 
     #[allow(dead_code)]
@@ -1769,7 +1811,7 @@ mod tests {
                 ("accept", "application/json, text/event-stream"),
             ],
         );
-        let resp = expect_response(gw.handle_request(&req));
+        let resp = expect_response(run_handler(gw.clone(), req));
         assert_eq!(resp.status, 415);
     }
 
@@ -1782,7 +1824,7 @@ mod tests {
             "{}",
             vec![("content-type", "application/json")],
         );
-        let resp = expect_response(gw.handle_request(&req));
+        let resp = expect_response(run_handler(gw.clone(), req));
         assert_eq!(resp.status, 406);
     }
 
@@ -1799,7 +1841,7 @@ mod tests {
                 ("accept", "application/json, text/event-stream"),
             ],
         );
-        let resp = expect_response(gw.handle_request(&req));
+        let resp = expect_response(run_handler(gw.clone(), req));
         assert_eq!(resp.status, 413);
     }
 
@@ -1815,7 +1857,7 @@ mod tests {
                 ("accept", "application/json, text/event-stream"),
             ],
         );
-        let resp = expect_response(gw.handle_request(&req));
+        let resp = expect_response(run_handler(gw.clone(), req));
         assert_eq!(resp.status, 400);
     }
 
@@ -1832,7 +1874,7 @@ mod tests {
                 ("accept", "application/json, text/event-stream"),
             ],
         );
-        let resp = expect_response(gw.handle_request(&req));
+        let resp = expect_response(run_handler(gw.clone(), req));
         assert_eq!(resp.status, 400);
     }
 
@@ -1850,7 +1892,7 @@ mod tests {
                 ("mcp-session-id", "nonexistent-session"),
             ],
         );
-        let resp = expect_response(gw.handle_request(&req));
+        let resp = expect_response(run_handler(gw.clone(), req));
         assert_eq!(resp.status, 404);
     }
 
@@ -1860,7 +1902,7 @@ mod tests {
     fn get_missing_accept_returns_406() {
         let gw = make_test_gateway();
         let req = make_gateway_request("GET", "/mcp", "", vec![]);
-        let resp = expect_response(gw.handle_request(&req));
+        let resp = expect_response(run_handler(gw.clone(), req));
         assert_eq!(resp.status, 406);
     }
 
@@ -1873,7 +1915,7 @@ mod tests {
             "",
             vec![("accept", "text/event-stream")],
         );
-        let resp = expect_response(gw.handle_request(&req));
+        let resp = expect_response(run_handler(gw.clone(), req));
         assert_eq!(resp.status, 400);
     }
 
@@ -1889,7 +1931,7 @@ mod tests {
                 ("mcp-session-id", "nonexistent"),
             ],
         );
-        let resp = expect_response(gw.handle_request(&req));
+        let resp = expect_response(run_handler(gw.clone(), req));
         assert_eq!(resp.status, 404);
     }
 
@@ -1899,7 +1941,7 @@ mod tests {
     fn delete_missing_session_id_returns_400() {
         let gw = make_test_gateway();
         let req = make_gateway_request("DELETE", "/mcp", "", vec![]);
-        let resp = expect_response(gw.handle_request(&req));
+        let resp = expect_response(run_handler(gw.clone(), req));
         assert_eq!(resp.status, 400);
     }
 
@@ -1912,7 +1954,7 @@ mod tests {
             "",
             vec![("mcp-session-id", "nonexistent")],
         );
-        let resp = expect_response(gw.handle_request(&req));
+        let resp = expect_response(run_handler(gw.clone(), req));
         assert_eq!(resp.status, 404);
     }
 
@@ -1922,7 +1964,7 @@ mod tests {
     fn put_returns_405_json_rpc() {
         let gw = make_test_gateway();
         let req = make_gateway_request("PUT", "/mcp", "", vec![]);
-        let resp = expect_response(gw.handle_request(&req));
+        let resp = expect_response(run_handler(gw.clone(), req));
         assert_eq!(resp.status, 405);
         let body = String::from_utf8_lossy(&resp.body);
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -1935,7 +1977,7 @@ mod tests {
     fn health_endpoint_returns_503_before_ready() {
         let gw = make_test_gateway();
         let req = make_gateway_request("GET", "/healthz", "", vec![]);
-        let resp = expect_response(gw.handle_request(&req));
+        let resp = expect_response(run_handler(gw.clone(), req));
         assert_eq!(resp.status, 503);
     }
 
@@ -1944,7 +1986,7 @@ mod tests {
         let gw = make_test_gateway();
         gw.metrics.set_ready();
         let req = make_gateway_request("GET", "/healthz", "", vec![]);
-        let resp = expect_response(gw.handle_request(&req));
+        let resp = expect_response(run_handler(gw.clone(), req));
         assert_eq!(resp.status, 200);
         assert_eq!(String::from_utf8_lossy(&resp.body), "ok");
     }
@@ -1960,7 +2002,7 @@ mod tests {
             "",
             vec![("origin", "https://example.com")],
         );
-        let resp = expect_response(gw.handle_request(&req));
+        let resp = expect_response(run_handler(gw.clone(), req));
         assert_eq!(resp.status, 204);
         let acao = resp
             .headers
@@ -1981,7 +2023,7 @@ mod tests {
                 ("mcp-session-id", "test"),
             ],
         );
-        let resp = expect_response(gw.handle_request(&req));
+        let resp = expect_response(run_handler(gw.clone(), req));
         let expose = resp
             .headers
             .iter()
@@ -1996,7 +2038,7 @@ mod tests {
     fn unknown_path_returns_404() {
         let gw = make_test_gateway();
         let req = make_gateway_request("GET", "/unknown", "", vec![]);
-        let resp = expect_response(gw.handle_request(&req));
+        let resp = expect_response(run_handler(gw.clone(), req));
         assert_eq!(resp.status, 404);
     }
 
@@ -2015,7 +2057,7 @@ mod tests {
                 ("accept", "application/json, text/event-stream"),
             ],
         );
-        let resp = expect_response(gw.handle_request(&req));
+        let resp = expect_response(run_handler(gw.clone(), req));
 
         // Should succeed (either SSE response or error from child timeout)
         // The key assertion is that the session was created
@@ -2053,7 +2095,7 @@ mod tests {
                 ("mcp-session-id", sid.as_str()),
             ],
         );
-        let resp = expect_response(gw.handle_request(&req));
+        let resp = expect_response(run_handler(gw.clone(), req));
         assert_eq!(resp.status, 202);
     }
 
@@ -2068,7 +2110,7 @@ mod tests {
             "",
             vec![("mcp-session-id", sid.as_str())],
         );
-        let resp = expect_response(gw.handle_request(&req));
+        let resp = expect_response(run_handler(gw.clone(), req));
         assert_eq!(resp.status, 200);
     }
 
@@ -2084,11 +2126,11 @@ mod tests {
             "",
             vec![("mcp-session-id", sid.as_str())],
         );
-        let resp1 = expect_response(gw.handle_request(&req));
+        let resp1 = expect_response(run_handler(gw.clone(), req.clone()));
         assert_eq!(resp1.status, 200);
 
         // Second DELETE (idempotent)
-        let resp2 = expect_response(gw.handle_request(&req));
+        let resp2 = expect_response(run_handler(gw.clone(), req));
         assert_eq!(resp2.status, 200);
     }
 
@@ -2097,6 +2139,12 @@ mod tests {
         let gw = make_test_gateway();
         let sid = create_test_session(&gw);
 
+        // Hold an access guard so the drain task's try_drain_close can't
+        // succeed (access_count > 0). This pins the session in Closing state
+        // for the duration of the POST below — otherwise the drain races
+        // ahead and the POST sees 404 instead of 503.
+        let _pin = gw.sessions.acquire(&sid).expect("acquire fresh session");
+
         // DELETE to start closing
         let del_req = make_gateway_request(
             "DELETE",
@@ -2104,7 +2152,7 @@ mod tests {
             "",
             vec![("mcp-session-id", sid.as_str())],
         );
-        expect_response(gw.handle_request(&del_req));
+        expect_response(run_handler(gw.clone(), del_req));
 
         // POST to closing session
         let body = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
@@ -2118,7 +2166,7 @@ mod tests {
                 ("mcp-session-id", sid.as_str()),
             ],
         );
-        let resp = expect_response(gw.handle_request(&req));
+        let resp = expect_response(run_handler(gw.clone(), req));
         assert_eq!(resp.status, 503);
     }
 
@@ -2143,15 +2191,15 @@ mod tests {
                 ("accept", "application/json, text/event-stream"),
             ],
         );
-        let resp = expect_response(gw.handle_request(&req));
+        let resp = expect_response(run_handler(gw.clone(), req));
         assert_eq!(resp.status, 503);
     }
 
     // ─── Test helpers ──────────────────────────────────────────────
 
     #[allow(dead_code)]
-    fn make_test_gateway() -> StatefulHttpGateway {
-        StatefulHttpGateway::new(
+    fn make_test_gateway() -> Arc<StatefulHttpGateway> {
+        Arc::new(StatefulHttpGateway::new(
             "cat".into(),
             "/mcp".into(),
             vec!["/healthz".into()],
@@ -2161,12 +2209,12 @@ mod tests {
             test_metrics(),
             test_logger(),
             test_rt_handle(),
-        )
+        ))
     }
 
     #[allow(dead_code)]
-    fn make_test_gateway_with_cors() -> StatefulHttpGateway {
-        StatefulHttpGateway::new(
+    fn make_test_gateway_with_cors() -> Arc<StatefulHttpGateway> {
+        Arc::new(StatefulHttpGateway::new(
             "cat".into(),
             "/mcp".into(),
             vec!["/healthz".into()],
@@ -2176,11 +2224,11 @@ mod tests {
             test_metrics(),
             test_logger(),
             test_rt_handle(),
-        )
+        ))
     }
 
     #[allow(dead_code)]
-    fn make_test_gateway_max_sessions(max: usize) -> StatefulHttpGateway {
+    fn make_test_gateway_max_sessions(max: usize) -> Arc<StatefulHttpGateway> {
         let metrics = test_metrics();
         let logger = test_logger();
         let session_config = SessionManagerConfig {
@@ -2190,7 +2238,7 @@ mod tests {
         };
         let sessions = SessionManager::new(session_config, metrics.clone(), None);
 
-        StatefulHttpGateway {
+        Arc::new(StatefulHttpGateway {
             sessions,
             cmd: "cat".into(),
             cors: CorsHandler::new(CorsConfig::Disabled, true),
@@ -2200,7 +2248,7 @@ mod tests {
             metrics,
             logger,
             rt: test_rt_handle(),
-        }
+        })
     }
 
     /// Create a test session by directly using the session manager,
