@@ -644,6 +644,8 @@ mod tests {
     fn test_session_timeout_positive() {
         let mut raw = make_raw(Some("echo hi"), None, None);
         raw.session_timeout = Some(5000);
+        raw.stateful = true;
+        raw.output_transport = Some(OutputTransport::StreamableHttp);
         let config = Config::validate(raw).unwrap();
         assert_eq!(config.session_timeout, Some(5000));
     }
