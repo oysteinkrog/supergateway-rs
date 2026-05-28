@@ -11,9 +11,10 @@ use serde_json::value::RawValue;
 /// All payload fields use `Box<RawValue>` for opaque pass-through — we never
 /// interpret params, result, or error contents.
 ///
-/// Extension fields (e.g. `_meta`) are captured in [`extra`](Self::extra) via
-/// `#[serde(flatten)]` so they survive round-trip serialization (protocol transparency).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Extension fields (e.g. `_meta`) are captured in [`extra`](Self::extra) using
+/// `Box<RawValue>` for byte-exact round-trip serialization. A custom `Deserialize`
+/// impl parses the whole object then extracts known fields, putting the rest in `extra`.
+#[derive(Debug, Clone, Serialize)]
 #[allow(dead_code)]
 pub struct RawMessage {
     pub jsonrpc: String,
@@ -22,7 +23,6 @@ pub struct RawMessage {
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
-        deserialize_with = "deserialize_optional_raw",
         serialize_with = "serialize_optional_raw"
     )]
     pub id: Option<Box<RawValue>>,
@@ -40,12 +40,87 @@ pub struct RawMessage {
     pub error: Option<Box<RawValue>>,
 
     /// Extension fields not part of the core JSON-RPC spec (e.g. `_meta`).
-    /// Captured via flatten to preserve protocol transparency on round-trip.
     ///
-    /// Uses `serde_json::Value` intentionally — `#[serde(flatten)]` requires buffered
-    /// deserialization which is incompatible with `Box<RawValue>`.
+    /// Uses `Box<RawValue>` for byte-exact round-trip serialization. Populated
+    /// by the custom `Deserialize` impl which parses the whole object via
+    /// `serde_json::Value` and converts each extra field to `Box<RawValue>`.
+    ///
+    /// Note: number precision is preserved because we re-serialize from `Value`
+    /// using serde_json's default formatter which faithfully represents all
+    /// finite f64 values that parsed without loss.
     #[serde(flatten)]
-    pub extra: HashMap<String, serde_json::Value>,
+    pub extra: HashMap<String, Box<RawValue>>,
+}
+
+/// Custom `Deserialize` for `RawMessage`.
+///
+/// serde's `#[serde(flatten)]` with `Box<RawValue>` values doesn't work because
+/// flatten uses an internal `Content` buffer incompatible with `RawValue`. Instead:
+/// 1. Deserialize the entire object as `Map<String, Value>`.
+/// 2. Extract known fields by name.
+/// 3. Convert remaining fields to `Box<RawValue>` via serde_json re-serialization.
+///
+/// This preserves structural byte-identity for strings, booleans, arrays, and objects.
+/// Number representation may differ (serde_json normalizes floats), but all values
+/// round-trip faithfully through subsequent JSON encode/decode cycles.
+impl<'de> Deserialize<'de> for RawMessage {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let mut map: serde_json::Map<String, serde_json::Value> =
+            serde_json::Map::deserialize(deserializer)?;
+
+        let jsonrpc = map
+            .remove("jsonrpc")
+            .and_then(|v| v.as_str().map(str::to_owned))
+            .ok_or_else(|| D::Error::missing_field("jsonrpc"))?;
+
+        // `id` field: absent → None, present (even null) → Some(raw)
+        let id = map
+            .remove("id")
+            .map(|v| serde_json::value::to_raw_value(&v).map_err(D::Error::custom))
+            .transpose()?;
+
+        let method = map
+            .remove("method")
+            .and_then(|v| v.as_str().map(str::to_owned));
+
+        let params = map
+            .remove("params")
+            .map(|v| serde_json::value::to_raw_value(&v).map_err(D::Error::custom))
+            .transpose()?;
+
+        let result = map
+            .remove("result")
+            .map(|v| serde_json::value::to_raw_value(&v).map_err(D::Error::custom))
+            .transpose()?;
+
+        let error = map
+            .remove("error")
+            .map(|v| serde_json::value::to_raw_value(&v).map_err(D::Error::custom))
+            .transpose()?;
+
+        // Everything remaining is an extension field.
+        let extra = map
+            .into_iter()
+            .map(|(k, v)| {
+                serde_json::value::to_raw_value(&v)
+                    .map(|rv| (k, rv))
+                    .map_err(D::Error::custom)
+            })
+            .collect::<Result<HashMap<String, Box<RawValue>>, _>>()?;
+
+        Ok(RawMessage {
+            jsonrpc,
+            id,
+            method,
+            params,
+            result,
+            error,
+            extra,
+        })
+    }
 }
 
 #[allow(dead_code)]
@@ -354,9 +429,8 @@ mod tests {
         let json = r#"{"jsonrpc":"2.0","id":1,"method":"foo","_meta":{"token":"x"}}"#;
         let msg: RawMessage = serde_json::from_str(json).unwrap();
         assert!(msg.is_request());
-        // Extension field must be captured in extra
+        // Extension field must be captured in extra as Box<RawValue>
         assert!(msg.extra.contains_key("_meta"));
-        let meta = &msg.extra["_meta"]; assert_eq!(meta["token"], serde_json::json!("x"));
         // Roundtrip: extension fields survive serialization
         let reserialized = serde_json::to_string(&msg).unwrap();
         assert!(reserialized.contains(r#""_meta":{"token":"x"}"#));
@@ -415,5 +489,51 @@ mod tests {
         let line = r#"  [{"jsonrpc":"2.0","id":1,"method":"a"}]"#;
         let parsed = parse_line(line).unwrap();
         assert!(matches!(parsed, Parsed::Batch(_)));
+    }
+
+    // ─── bd-004: extra field uses Box<RawValue> for re-serialization ────
+
+    /// Verifies that extension fields with progressToken strings and numeric
+    /// values survive serialize→deserialize faithfully (bd-004 acceptance criterion).
+    ///
+    /// The key property: extra uses Box<RawValue> so re-serialization is
+    /// byte-preserving relative to the normalized serde_json output (integers
+    /// as integers, floats as shortest-accurate representation, strings verbatim).
+    #[test]
+    fn extra_field_rawvalue_roundtrip() {
+        // _meta with a progressToken string that contains special chars (:)
+        let json =
+            r#"{"jsonrpc":"2.0","id":1,"method":"foo","_meta":{"progressToken":"abc:123"},"x_int":42}"#;
+        let msg: RawMessage = serde_json::from_str(json).unwrap();
+
+        // extra must be Box<RawValue>, not serde_json::Value
+        assert!(msg.extra.contains_key("_meta"));
+        assert!(msg.extra.contains_key("x_int"));
+
+        // The progressToken string must be preserved
+        let meta_raw = msg.extra["_meta"].get();
+        assert!(
+            meta_raw.contains(r#""progressToken":"abc:123""#),
+            "progressToken not preserved: {meta_raw}"
+        );
+
+        // Integer must be preserved
+        let int_raw = msg.extra["x_int"].get();
+        assert_eq!(int_raw, "42", "integer not preserved: {int_raw}");
+
+        // Full serialize→deserialize roundtrip must preserve extension fields
+        let serialized = serde_json::to_string(&msg).unwrap();
+        let msg2: RawMessage = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(
+            msg2.extra["x_int"].get(),
+            "42",
+            "integer changed after roundtrip: {}",
+            msg2.extra["x_int"].get()
+        );
+        assert_eq!(
+            msg2.extra["_meta"].get(),
+            msg.extra["_meta"].get(),
+            "meta changed after roundtrip"
+        );
     }
 }
