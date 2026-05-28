@@ -1,0 +1,5 @@
+[advisories]
+# rustls-pemfile is unmaintained upstream (RUSTSEC-2025-0134) but is a transitive
+# dependency of asupersync 0.2.7 which we cannot control. Ignored pending an
+# upstream fix in asupersync.
+ignore = ["RUSTSEC-2025-0134"]
