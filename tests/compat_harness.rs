@@ -23,8 +23,10 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 /// TypeScript supergateway reference commit for baseline testing.
-pub const TS_REFERENCE_COMMIT: &str = "a453931ba5ffba4e5e3af7e0c49fcf28a90e8233";
-pub const TS_REFERENCE_REPO: &str = "https://github.com/nicepkg/supergateway";
+// Phase 3 gauntlet: nicepkg/supergateway was transferred to supercorp-ai; commit a453931 does not
+// exist in the new repo. Pinned to supercorp-ai/supergateway@v3.4.3 (973c459).
+pub const TS_REFERENCE_COMMIT: &str = "973c4595250dcd59da83c12c4f11ff653b6cd4f0";
+pub const TS_REFERENCE_REPO: &str = "https://github.com/supercorp-ai/supergateway";
 
 /// Failure classification for compatibility tests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
