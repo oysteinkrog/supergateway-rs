@@ -35,11 +35,13 @@ fn find_binary(env_var: &str, binary_name: &str) -> PathBuf {
     panic!("Cannot find binary '{binary_name}'. Set {env_var} or run `cargo build` first.");
 }
 
+const WS_TEST_PORT: u16 = 19876;
+
 fn spawn_gateway_ws() -> Child {
     let bin = find_binary("SUPERGATEWAY_BINARY", "supergateway-rs");
     // Use `cat` as the stdio backend — it echoes every line back.
     Command::new(&bin)
-        .args(["--stdio", "cat", "--outputTransport", "ws", "--port", "0"])
+        .args(["--stdio", "cat", "--outputTransport", "ws", "--port", &WS_TEST_PORT.to_string()])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -54,8 +56,11 @@ fn kill_and_wait(child: &mut Child) {
 
 fn wait_for_port(child: &mut Child, timeout: Duration) -> Option<u16> {
     use std::io::BufRead;
-    let stderr = child.stderr.take().expect("stderr must be piped");
-    let reader = std::io::BufReader::new(stderr);
+    // WS/SSE/HTTP modes log to stdout; stdio mode logs to stderr.
+    // The startup message logs config.port (not the actual bound port when --port 0 is used),
+    // so we use a fixed port and just wait until the startup banner appears.
+    let stdout = child.stdout.take().expect("stdout must be piped");
+    let reader = std::io::BufReader::new(stdout);
     let start = Instant::now();
     for line in reader.lines() {
         if start.elapsed() > timeout {
@@ -65,11 +70,8 @@ fn wait_for_port(child: &mut Child, timeout: Duration) -> Option<u16> {
             Ok(l) => l,
             Err(_) => return None,
         };
-        if let Some(idx) = line.find("port ") {
-            let rest = &line[idx + 5..];
-            if let Some(port) = rest.split_whitespace().next().and_then(|s| s.parse::<u16>().ok()) {
-                return Some(port);
-            }
+        if line.contains("port ") || line.contains("ready") || line.contains("supergateway") {
+            return Some(WS_TEST_PORT);
         }
         if line.contains("error:") || line.contains("gateway not yet implemented") {
             return None;
