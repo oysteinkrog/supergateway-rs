@@ -43,7 +43,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use asupersync::channel::mpsc as async_mpsc;
-use asupersync::channel::mpsc::RecvError;
 use asupersync::codec::{Decoder, Encoder, Framed};
 use asupersync::http::h1::{Http1Codec, Method as H1Method};
 use asupersync::io::AsyncWriteExt;
@@ -51,7 +50,6 @@ use asupersync::net::TcpListener as AsyncTcpListener;
 use asupersync::net::websocket::{Frame, FrameCodec, ServerHandshake, HttpRequest as WsHttpRequest};
 use asupersync::runtime::{JoinHandle, RuntimeHandle};
 use asupersync::stream::StreamExt;
-use asupersync::time::{timeout, wall_now};
 
 use serde_json::value::RawValue;
 
@@ -113,6 +111,8 @@ pub enum WsEvent {
     Message(String),
     /// Close the connection with a specific code and reason.
     Close(u16, String),
+    /// RFC 6455 Pong frame payload (injected by the recv task on Ping receipt).
+    Pong(Vec<u8>),
 }
 
 // ─── Internal client state ─────────────────────────────────────────
@@ -232,6 +232,8 @@ pub struct WsConnection {
     pub client_id: SessionId,
     /// Receiver for outgoing WS events. The caller reads and writes to WebSocket.
     pub receiver: async_mpsc::Receiver<WsEvent>,
+    /// Sender used by the recv task to inject Pong frames (and other control frames).
+    pub pong_tx: async_mpsc::Sender<WsEvent>,
 }
 
 // ─── WsGateway ─────────────────────────────────────────────────────
@@ -641,6 +643,9 @@ impl WsGateway {
 
         let client_id = SessionId::new();
         let (tx, rx) = async_mpsc::channel::<WsEvent>(CLIENT_CHANNEL_CAP);
+        // pong_tx is a clone of tx so the recv task can inject Pong frames through
+        // the same channel without needing a separate send path.
+        let pong_tx = tx.clone();
 
         // Register client and drain early buffer
         {
@@ -673,6 +678,7 @@ impl WsGateway {
         Ok(WsConnection {
             client_id,
             receiver: rx,
+            pong_tx,
         })
     }
 
@@ -884,7 +890,8 @@ pub async fn run(
             match listener.accept().await {
                 Ok((stream, _addr)) => {
                     let gw = accept_gw.clone();
-                    rt_accept.spawn(handle_ws_connection_async(stream, gw));
+                    let rt_conn = rt_accept.clone();
+                    rt_accept.spawn(handle_ws_connection_async(stream, gw, rt_conn));
                 }
                 Err(_) => break,
             }
@@ -896,18 +903,11 @@ pub async fn run(
     std::process::exit(exit_code);
 }
 
-/// Poll interval for draining the relay channel in the WS connection task.
-const WS_POLL_INTERVAL: Duration = Duration::from_millis(50);
-
 async fn handle_ws_connection_async(
     stream: asupersync::net::TcpStream,
     gw: WsGateway,
+    rt_handle: RuntimeHandle,
 ) {
-    let cx = match asupersync::Cx::current() {
-        Some(c) => c,
-        None => return,
-    };
-
     // Parse initial HTTP request
     let mut framed = Framed::new(stream, Http1Codec::new());
     let req = match framed.next().await {
@@ -1011,119 +1011,104 @@ async fn handle_ws_connection_async(
         return;
     }
 
-    // WS frame loop: use FrameCodec directly on split stream halves
-    // Split into read/write so we can do concurrent send (relay channel) and recv (client)
-    let (mut read_half, mut write_half) = stream.into_split();
-    let mut enc = FrameCodec::server();
+    // Split into read/write so send and recv run concurrently without interleaving.
+    let (mut read_half, write_half) = stream.into_split();
     let mut dec = FrameCodec::server();
     let mut read_buf = asupersync::bytes::BytesMut::with_capacity(8192);
-    let mut write_buf = asupersync::bytes::BytesMut::with_capacity(8192);
-    let rx = conn.receiver;
+    let mut rx = conn.receiver;
+    let pong_tx = conn.pong_tx;
     let client_id = conn.client_id.clone();
 
-    // Spawn WS send task: reads from relay channel, writes WS frames to write_half
-    // This task owns write_half and relay receiver
-    let send_cx = cx.clone();
+    // ─── Send task: owns write_half + rx ───────────────────────────────
+    // Exits when the channel closes (all tx senders dropped after disconnect).
     let send_gw = gw.clone();
     let send_client_id = client_id.clone();
-    // Shared flag: signal send task to close when recv task finishes
-    // We route close via the WsEvent channel (WsEvent::Close) from relay side,
-    // or drop the channel (Disconnected/Cancelled) when recv task ends
-    let _ = (send_cx, send_gw, send_client_id); // suppress unused warnings for now
-
-    // ─── Recv loop (this task) ──────────────────────────────────────────
-    // Interleave: short timeout on WS read + drain relay channel
-    loop {
-        // Drain relay channel (non-blocking)
-        'drain: loop {
-            match rx.try_recv() {
-                Ok(WsEvent::Message(json)) => {
+    rt_handle.spawn(async move {
+        let send_cx = match asupersync::Cx::current() {
+            Some(c) => c,
+            None => return,
+        };
+        let mut write_half = write_half;
+        let mut enc = FrameCodec::server();
+        let mut write_buf = asupersync::bytes::BytesMut::with_capacity(8192);
+        loop {
+            let event = match rx.recv(&send_cx).await {
+                Ok(e) => e,
+                Err(_) => break, // channel closed or cancelled — exit cleanly
+            };
+            match event {
+                WsEvent::Message(json) => {
                     let frame = Frame::text(json.into_bytes());
                     if enc.encode(frame, &mut write_buf).is_err() {
-                        break 'drain;
+                        break;
                     }
                     let data: Vec<u8> = write_buf.to_vec();
                     write_buf.clear();
                     if write_half.write_all(&data).await.is_err() {
-                        gw.disconnect_client(&client_id);
+                        send_gw.disconnect_client(&send_client_id);
                         return;
                     }
                 }
-                Ok(WsEvent::Close(code, reason)) => {
+                WsEvent::Close(code, reason) => {
                     let frame = Frame::close(Some(code), Some(&reason));
                     if enc.encode(frame, &mut write_buf).is_ok() {
                         let data: Vec<u8> = write_buf.to_vec();
                         write_buf.clear();
                         let _ = write_half.write_all(&data).await;
                     }
-                    gw.disconnect_client(&client_id);
+                    send_gw.disconnect_client(&send_client_id);
                     return;
                 }
-                Err(RecvError::Empty) => break 'drain,
-                Err(_) => {
-                    // Channel disconnected or cancelled — exit
-                    gw.disconnect_client(&client_id);
-                    return;
+                WsEvent::Pong(payload) => {
+                    let frame = Frame::pong(payload);
+                    if enc.encode(frame, &mut write_buf).is_ok() {
+                        let data: Vec<u8> = write_buf.to_vec();
+                        write_buf.clear();
+                        let _ = write_half.write_all(&data).await;
+                    }
                 }
             }
         }
+        // Channel closed — write_half is dropped here, closing the TCP write side.
+    });
 
-        // Wait for WS frame with a short timeout to keep relay channel responsive
-        let recv_result =
-            timeout(wall_now(), WS_POLL_INTERVAL, read_ws_frame(&mut read_half, &mut dec, &mut read_buf)).await;
-
-        match recv_result {
-            Ok(Ok(Some(frame))) => match frame.opcode {
+    // ─── Recv loop (this task): reads WS frames, no spin-poll ──────────
+    loop {
+        match read_ws_frame(&mut read_half, &mut dec, &mut read_buf).await {
+            Ok(Some(frame)) => match frame.opcode {
                 asupersync::net::websocket::Opcode::Text => {
                     let text = match std::str::from_utf8(&frame.payload) {
                         Ok(t) => t,
                         Err(_) => {
-                            let close_frame = Frame::close(Some(WS_CLOSE_POLICY), Some("invalid UTF-8"));
-                            if enc.encode(close_frame, &mut write_buf).is_ok() {
-                                let data: Vec<u8> = write_buf.to_vec();
-                                write_buf.clear();
-                                let _ = write_half.write_all(&data).await;
-                            }
+                            // Send close via pong_tx (send task will write it)
+                            let _ = pong_tx.try_send(WsEvent::Close(WS_CLOSE_POLICY, "invalid UTF-8".into()));
                             break;
                         }
                     };
                     if let Err((code, reason)) = gw.handle_ws_message(&client_id, text) {
-                        let close_frame = Frame::close(Some(code), Some(&reason));
-                        if enc.encode(close_frame, &mut write_buf).is_ok() {
-                            let data: Vec<u8> = write_buf.to_vec();
-                            write_buf.clear();
-                            let _ = write_half.write_all(&data).await;
-                        }
+                        let _ = pong_tx.try_send(WsEvent::Close(code, reason));
                         break;
                     }
                 }
                 asupersync::net::websocket::Opcode::Ping => {
-                    // RFC 6455: server MUST send pong in response to ping
-                    let pong_frame = Frame::pong(frame.payload);
-                    if enc.encode(pong_frame, &mut write_buf).is_ok() {
-                        let data: Vec<u8> = write_buf.to_vec();
-                        write_buf.clear();
-                        let _ = write_half.write_all(&data).await;
-                    }
+                    // RFC 6455: server MUST send pong in response to ping.
+                    // Route through pong_tx so send task writes it without racing.
+                    let _ = pong_tx.try_send(WsEvent::Pong(frame.payload.to_vec()));
                 }
                 asupersync::net::websocket::Opcode::Close => {
-                    // Echo close frame back
-                    let close_frame = Frame::close(Some(WS_CLOSE_NORMAL), None);
-                    if enc.encode(close_frame, &mut write_buf).is_ok() {
-                        let data: Vec<u8> = write_buf.to_vec();
-                        write_buf.clear();
-                        let _ = write_half.write_all(&data).await;
-                    }
+                    // Echo close frame back via pong_tx then exit.
+                    let _ = pong_tx.try_send(WsEvent::Close(WS_CLOSE_NORMAL, String::new()));
                     break;
                 }
                 _ => {} // binary/continuation/pong: ignore
             },
-            Ok(Ok(None)) => break, // EOF
-            Ok(Err(_)) => break,   // protocol error
-            Err(_elapsed) => {}    // timeout — loop back to drain relay channel
+            Ok(None) => break, // EOF
+            Err(_) => break,   // protocol error
         }
     }
 
+    // Drop pong_tx so the send task sees channel close (once relay tx is also dropped).
+    drop(pong_tx);
     gw.disconnect_client(&client_id);
 }
 
