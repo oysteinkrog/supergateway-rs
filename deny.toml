@@ -1,0 +1,59 @@
+[graph]
+# Only check the default feature set
+all-features = false
+
+[licenses]
+# Allow common open-source licenses used by our dependency tree.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "ISC",
+    "Unlicense",
+    "Unicode-3.0",
+    "Zlib",
+    "CDLA-Permissive-2.0",
+    "LGPL-2.1-or-later",
+    # Custom expression for asupersync and its internal crates (franken-*).
+    # These carry a modified MIT license (MIT with OpenAI/Anthropic Rider) that
+    # cargo-deny cannot auto-classify; clarify entries below assign this label.
+    "LicenseRef-asupersync-mit",
+]
+
+# Teach cargo-deny the hash of the asupersync modified-MIT license file so it
+# can resolve the license expression for crates that share this exact file.
+[[licenses.clarify]]
+name = "asupersync"
+expression = "LicenseRef-asupersync-mit"
+license-files = [{ path = "LICENSE", hash = 0x3e2e0c66 }]
+
+[[licenses.clarify]]
+name = "franken-decision"
+expression = "LicenseRef-asupersync-mit"
+license-files = [{ path = "LICENSE", hash = 0x3e2e0c66 }]
+
+[[licenses.clarify]]
+name = "franken-evidence"
+expression = "LicenseRef-asupersync-mit"
+license-files = [{ path = "LICENSE", hash = 0x3e2e0c66 }]
+
+[[licenses.clarify]]
+name = "franken-kernel"
+expression = "LicenseRef-asupersync-mit"
+license-files = [{ path = "LICENSE", hash = 0x3e2e0c66 }]
+
+[bans]
+# Do not restrict duplicates by default; let the dependency tree be flexible.
+multiple-versions = "warn"
+
+[advisories]
+# Advisory DB checks are handled separately (bd-001 addressed RUSTSEC vulns).
+version = 2
+ignore = []
+
+[sources]
+unknown-registry = "warn"
+unknown-git = "warn"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

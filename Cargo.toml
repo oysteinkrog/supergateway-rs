@@ -3,6 +3,7 @@ name = "supergateway-rs"
 version = "0.1.0"
 edition = "2021"
 description = "MCP transport bridge — stdio/SSE/WebSocket/Streamable HTTP"
+license = "MIT"
 autobenches = false
 autotests = false
 
