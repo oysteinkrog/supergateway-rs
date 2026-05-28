@@ -1214,6 +1214,7 @@ mod tests {
             logger,
             LogLevel::Debug,
             vec!["/health".to_string()],
+            "/message".to_string(),
         );
         (gw, child)
     }
@@ -1588,6 +1589,7 @@ mod tests {
             logger,
             LogLevel::Debug,
             vec!["/health".to_string()],
+            "/message".to_string(),
         );
 
         gw.metrics.set_ready();
@@ -1612,6 +1614,7 @@ mod tests {
             logger,
             LogLevel::Debug,
             vec![],
+            "/message".to_string(),
         );
 
         let conn = gw.handle_ws_connect().unwrap();
