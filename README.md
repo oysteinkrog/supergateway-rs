@@ -90,9 +90,15 @@ more optimised for that specific path.
 | c=10 | **30.4** | 5.1 | 317 ms | 1930 ms | 359 ms | 2234 ms |
 | c=20 | **42.6** | 4.0 | 376 ms | 4446 ms | 515 ms | 4958 ms |
 
-rs scales **linearly** with concurrency. Node serialises concurrent requests
-through its event loop, causing p50 latency to balloon from 266 ms at c=1 to
-4446 ms at c=20 — a 17× degradation. rs p50 grows only 1.4× over the same range.
+rs throughput scales with concurrency, but the growth is **sublinear above c≥10**
+due to MCP child saturation: c=1→5 = 4.5× growth, c=5→10 = 1.8× growth,
+c=10→20 = 1.4× growth. Node serialises concurrent requests through its event
+loop, causing p50 latency to balloon from 266 ms at c=1 to 4446 ms at c=20 —
+a 17× degradation. rs p50 grows only 1.4× over the same range.
+
+**Note on c=1 latency:** the ~265 ms full-sequence time includes Python MCP child
+cold-start (~200 ms); it does not represent steady-state gateway latency for
+long-lived connections.
 
 At c=10: **rs is 6× faster throughput** with **6× lower latency**.
 At c=20: **rs is 10.7× faster throughput** with **12× lower latency**.
@@ -126,6 +132,14 @@ rs handles all concurrency with native async tasks.
 
 For single-client sequential usage the two are equivalent. For any workload with
 multiple concurrent clients, rs is substantially superior across every metric.
+
+### How to reproduce
+
+The numbers above were captured with the gauntlet methodology. The comprehensive
+benchmark harness will live in `benches/comprehensive_bench.rs` (target of
+bd-104, Pillar B). Until that harness is wired up, the numbers are not yet
+one-command reproducible; refer to the gauntlet workspace artifacts in
+`supergateway-rs__gauntlet_workspace/` for the raw run data and methodology.
 
 ## Building
 
