@@ -198,6 +198,16 @@ struct RawArgs {
     protocol_version: String,
 }
 
+/// A flag-combination diagnostic: either a fatal error (exit 2) or a warning.
+#[derive(Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum FlagDiagnostic {
+    /// Fatal misconfiguration — caller should exit with code 2.
+    Error(String),
+    /// Non-fatal advisory — caller should print to stderr but continue.
+    Warning(String),
+}
+
 /// Validated, ready-to-use configuration.
 #[derive(Debug)]
 #[allow(dead_code)]
@@ -219,6 +229,44 @@ pub struct Config {
     pub protocol_version: String,
 }
 
+/// Check silently-ignored flag combinations.
+///
+/// Returns a list of diagnostics (errors or warnings). A single `Error` means
+/// the caller must exit with code 2; `Warning` entries should be printed to
+/// stderr but do not prevent startup.
+#[allow(dead_code)]
+pub fn check_flag_combos(
+    output_transport: OutputTransport,
+    stateful: bool,
+    has_session_timeout: bool,
+    base_url: &str,
+) -> Vec<FlagDiagnostic> {
+    let mut diags = Vec::new();
+
+    // --stateful only applies to stdio->streamableHttp.
+    if stateful && output_transport != OutputTransport::StreamableHttp {
+        diags.push(FlagDiagnostic::Error(
+            "--stateful only applies to stdio->streamableHttp".into(),
+        ));
+    }
+
+    // --sessionTimeout only applies when --stateful is active.
+    if has_session_timeout && !stateful {
+        diags.push(FlagDiagnostic::Error(
+            "--sessionTimeout only applies when --stateful is set".into(),
+        ));
+    }
+
+    // --baseUrl is only meaningful for SSE output; warn otherwise.
+    if !base_url.is_empty() && output_transport != OutputTransport::Sse {
+        diags.push(FlagDiagnostic::Warning(format!(
+            "--baseUrl has no effect for {output_transport} output; it is only used by SSE mode"
+        )));
+    }
+
+    diags
+}
+
 #[allow(dead_code)]
 impl Config {
     #[allow(dead_code)]
@@ -228,7 +276,9 @@ impl Config {
             Ok(config) => config,
             Err(msg) => {
                 eprintln!("error: {msg}");
-                process::exit(1);
+                // Flag-combination errors exit with code 2; all other errors exit with 1.
+                let code = if msg.starts_with("flag combination error:") { 2 } else { 1 };
+                process::exit(code);
             }
         }
     }
@@ -292,6 +342,7 @@ impl Config {
         validate_path("--streamableHttpPath", &raw.streamable_http_path)?;
 
         // Validate --sessionTimeout.
+        let has_session_timeout = raw.session_timeout.is_some();
         let session_timeout = match raw.session_timeout {
             Some(ms) if ms <= 0 => {
                 return Err(format!("--sessionTimeout must be positive, got {ms}"));
@@ -320,6 +371,23 @@ impl Config {
 
         // Parse CORS.
         let cors = parse_cors(raw.cors);
+
+        // Check silently-ignored flag combinations.
+        let flag_diags = check_flag_combos(
+            output_transport,
+            raw.stateful,
+            has_session_timeout,
+            &raw.base_url,
+        );
+        for diag in &flag_diags {
+            match diag {
+                FlagDiagnostic::Warning(msg) => eprintln!("warning: {msg}"),
+                FlagDiagnostic::Error(_) => {}
+            }
+        }
+        if let Some(FlagDiagnostic::Error(msg)) = flag_diags.into_iter().find(|d| matches!(d, FlagDiagnostic::Error(_))) {
+            return Err(format!("flag combination error: {msg}"));
+        }
 
         // Parse health endpoints and validate paths.
         let health_endpoints = match raw.health_endpoint {
