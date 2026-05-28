@@ -42,6 +42,11 @@ name = "compat"
 path = "tests/compat/main.rs"
 harness = true
 
+[[test]]
+name = "cli_validation"
+path = "tests/cli_validation.rs"
+harness = true
+
 [[bench]]
 name = "codec"
 harness = false
