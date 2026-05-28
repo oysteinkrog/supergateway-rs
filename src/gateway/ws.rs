@@ -252,6 +252,7 @@ pub struct WsGateway {
     logger: Arc<Logger>,
     log_level: LogLevel,
     health_endpoints: Arc<Vec<String>>,
+    message_path: Arc<String>,
 }
 
 #[allow(dead_code)]
@@ -268,6 +269,7 @@ impl Clone for WsGateway {
             logger: Arc::clone(&self.logger),
             log_level: self.log_level,
             health_endpoints: Arc::clone(&self.health_endpoints),
+            message_path: Arc::clone(&self.message_path),
         }
     }
 }
@@ -289,6 +291,7 @@ impl WsGateway {
         logger: Arc<Logger>,
         log_level: LogLevel,
         health_endpoints: Vec<String>,
+        message_path: String,
     ) -> Self {
         Self {
             child,
@@ -303,6 +306,7 @@ impl WsGateway {
             logger,
             log_level,
             health_endpoints: Arc::new(health_endpoints),
+            message_path: Arc::new(message_path),
         }
     }
 
@@ -869,6 +873,7 @@ pub async fn run(
         logger,
         config.log_level,
         config.health_endpoints,
+        config.message_path,
     );
 
     // Spawn async relay task
@@ -956,6 +961,14 @@ async fn handle_ws_connection_async(
     if req.method != H1Method::Get {
         let _ = stream
             .write_all(b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n")
+            .await;
+        return;
+    }
+
+    // Reject upgrades on paths that don't match --messagePath (TS parity)
+    if path != gw.message_path.as_str() {
+        let _ = stream
+            .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
             .await;
         return;
     }

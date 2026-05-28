@@ -80,11 +80,11 @@ fn wait_for_port(child: &mut Child, timeout: Duration) -> Option<u16> {
     None
 }
 
-fn ws_connect(addr: &str) -> Option<TcpStream> {
+fn ws_connect_path(addr: &str, path: &str) -> Option<TcpStream> {
     let mut stream = TcpStream::connect(addr).ok()?;
     stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
     let req = format!(
-        "GET / HTTP/1.1\r\nHost: {addr}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        "GET {path} HTTP/1.1\r\nHost: {addr}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
     );
     stream.write_all(req.as_bytes()).ok()?;
     stream.flush().ok()?;
@@ -95,6 +95,24 @@ fn ws_connect(addr: &str) -> Option<TcpStream> {
         return None;
     }
     Some(stream)
+}
+
+fn ws_connect(addr: &str) -> Option<TcpStream> {
+    ws_connect_path(addr, "/message")
+}
+
+/// Send a raw HTTP GET upgrade request on the given path, return the HTTP response line.
+fn ws_raw_response(addr: &str, path: &str) -> Option<String> {
+    let mut stream = TcpStream::connect(addr).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+    let req = format!(
+        "GET {path} HTTP/1.1\r\nHost: {addr}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
+    );
+    stream.write_all(req.as_bytes()).ok()?;
+    stream.flush().ok()?;
+    let mut buf = [0u8; 4096];
+    let n = stream.read(&mut buf).ok()?;
+    Some(String::from_utf8_lossy(&buf[..n]).to_string())
 }
 
 fn ws_send_text(stream: &mut TcpStream, text: &str) {
@@ -304,6 +322,45 @@ fn ws_send_burst_no_inbound_latency() {
         burst_received >= (burst_count * 4 / 5),
         "only received {burst_received}/{burst_count} burst messages"
     );
+
+    kill_and_wait(&mut gw);
+}
+
+/// bd-007: WS upgrade on a non-matching path must return 404 (TS parity).
+///
+/// The gateway defaults to --messagePath /message. A request to /wrongpath
+/// must be rejected with HTTP 404 before any WS handshake.
+#[test]
+fn ws_wrong_path_returns_404() {
+    let mut gw = spawn_gateway_ws();
+    let port = match wait_for_port(&mut gw, Duration::from_secs(5)) {
+        Some(p) => p,
+        None => {
+            eprintln!("[SKIP] ws_wrong_path_returns_404 — gateway not ready");
+            kill_and_wait(&mut gw);
+            return;
+        }
+    };
+
+    let addr = format!("127.0.0.1:{port}");
+
+    // Attempt WS upgrade on wrong path — must get 404, not 101.
+    let resp = match ws_raw_response(&addr, "/wrongpath") {
+        Some(r) => r,
+        None => {
+            eprintln!("[SKIP] ws_wrong_path_returns_404 — no response");
+            kill_and_wait(&mut gw);
+            return;
+        }
+    };
+    assert!(
+        resp.contains("404"),
+        "expected 404 for /wrongpath, got: {resp}"
+    );
+
+    // Verify the correct path still works.
+    let ws = ws_connect_path(&addr, "/message");
+    assert!(ws.is_some(), "WS upgrade on /message must succeed");
 
     kill_and_wait(&mut gw);
 }
