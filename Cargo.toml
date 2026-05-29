@@ -56,6 +56,17 @@ harness = false
 name = "gateway"
 harness = false
 
+# Profiling-friendly release build. Use with:
+#   RUSTFLAGS="-C force-frame-pointers=yes" cargo build --profile release-perf
+# The force-frame-pointers flag is required for perf/flamegraph to resolve stack frames.
+[profile.release-perf]
+inherits = "release"
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = "line-tables-only"
+strip = false
+
 [[bin]]
 name = "mock_stdio_server"
 path = "tests/mock_stdio_server.rs"
