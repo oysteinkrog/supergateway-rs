@@ -44,7 +44,7 @@ use asupersync::time::wall_now;
 use crate::cli::Header;
 use crate::client::sse::{resolve_endpoint_url, SseEvent};
 use crate::jsonrpc::{self, Parsed, RawMessage};
-use crate::observe::{Logger, Metrics};
+use crate::observe::{self, Logger, Metrics, Transport};
 
 // ─── Constants ─────────────────────────────────────────────────────
 
@@ -744,8 +744,10 @@ pub async fn run(_cx: &asupersync::Cx, config: crate::cli::Config, rt_handle: Ru
                     Ok(b) => b,
                     Err(_) => continue,
                 };
+                observe::record_request(&gw_stdin.metrics, Transport::SseToStdio);
                 if let Err(e) = client_stdin.post(&url, &body_bytes, "application/json").await {
                     gw_stdin.logger.error(&format!("POST to endpoint failed: {e}"));
+                    observe::record_error(&gw_stdin.metrics, Transport::SseToStdio);
                 }
             }
         }

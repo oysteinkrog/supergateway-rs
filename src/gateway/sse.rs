@@ -44,7 +44,7 @@ use crate::cors::{self, CorsHandler, CorsResult};
 use crate::error::GatewayError;
 use crate::health;
 use crate::jsonrpc::Parsed;
-use crate::observe::{Logger, Metrics};
+use crate::observe::{self, Logger, Metrics, Transport};
 use crate::session::SessionId;
 
 // ─── Constants ──────────────────────────────────────────────────────
@@ -570,8 +570,25 @@ impl SseGateway {
         body: &[u8],
         origin: Option<&str>,
     ) -> GatewayResponse {
+        let t0 = Instant::now();
         Metrics::inc(&self.metrics.total_requests);
+        observe::record_request(&self.metrics, Transport::Sse);
 
+        let resp = self.handle_message_inner(session_id_param, body, origin);
+        let elapsed_ms = t0.elapsed().as_millis() as u64;
+        if resp.status >= 400 {
+            observe::record_error(&self.metrics, Transport::Sse);
+        }
+        observe::record_latency(&self.metrics, Transport::Sse, elapsed_ms);
+        resp
+    }
+
+    fn handle_message_inner(
+        &self,
+        session_id_param: Option<&str>,
+        body: &[u8],
+        origin: Option<&str>,
+    ) -> GatewayResponse {
         let cors_headers = match self.cors.process("POST", origin, None) {
             CorsResult::Disabled => vec![],
             CorsResult::ResponseHeaders(h) => h,

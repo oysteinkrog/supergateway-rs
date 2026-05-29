@@ -4,6 +4,142 @@ use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
+// ─── Transport enum ──────────────────────────────────────────────────────
+
+/// Identifies which gateway transport is recording a metric.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum Transport {
+    Sse,
+    Ws,
+    StatefulHttp,
+    StatelessHttp,
+    SseToStdio,
+    HttpToStdio,
+}
+
+// ─── Per-transport counters ──────────────────────────────────────────────
+
+/// Latency histogram with bucket boundaries: 1,2,5,10,20,50,100,200,500,1000 ms.
+/// Each bucket counts requests with latency <= boundary (and > previous boundary).
+/// The last bucket ("overflow") counts requests > 1000 ms.
+#[allow(dead_code)]
+pub struct LatencyHistogram {
+    /// Bucket boundaries in ms: 1,2,5,10,20,50,100,200,500,1000
+    buckets: [AtomicU64; 10],
+    /// Overflow: latency > 1000 ms
+    overflow: AtomicU64,
+    /// Running sum for p50 estimation
+    total_ms: AtomicU64,
+    total_count: AtomicU64,
+}
+
+const BUCKET_BOUNDS: [u64; 10] = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000];
+
+#[allow(dead_code)]
+impl LatencyHistogram {
+    fn new() -> Self {
+        Self {
+            buckets: [
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+            ],
+            overflow: AtomicU64::new(0),
+            total_ms: AtomicU64::new(0),
+            total_count: AtomicU64::new(0),
+        }
+    }
+
+    pub fn record(&self, ms: u64) {
+        self.total_ms.fetch_add(ms, Ordering::Relaxed);
+        self.total_count.fetch_add(1, Ordering::Relaxed);
+        for (i, &bound) in BUCKET_BOUNDS.iter().enumerate() {
+            if ms <= bound {
+                self.buckets[i].fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        }
+        self.overflow.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Estimate p50 using the midpoint of the bucket containing the median.
+    pub fn p50_ms(&self) -> u64 {
+        let total = self.total_count.load(Ordering::Relaxed);
+        if total == 0 {
+            return 0;
+        }
+        let target = total.div_ceil(2);
+        let mut cumulative = 0u64;
+        for (i, &bound) in BUCKET_BOUNDS.iter().enumerate() {
+            cumulative += self.buckets[i].load(Ordering::Relaxed);
+            if cumulative >= target {
+                let lower = if i == 0 { 0 } else { BUCKET_BOUNDS[i - 1] };
+                return (lower + bound) / 2;
+            }
+        }
+        // Overflow bucket midpoint
+        1500
+    }
+}
+
+/// Per-transport request/error counters and latency histogram.
+#[allow(dead_code)]
+pub struct TransportCounters {
+    pub requests: AtomicU64,
+    pub errors: AtomicU64,
+    pub latency: LatencyHistogram,
+}
+
+#[allow(dead_code)]
+impl TransportCounters {
+    fn new() -> Self {
+        Self {
+            requests: AtomicU64::new(0),
+            errors: AtomicU64::new(0),
+            latency: LatencyHistogram::new(),
+        }
+    }
+
+    pub fn snapshot_json(&self) -> String {
+        format!(
+            "{{\"requests\":{},\"errors\":{},\"latency_p50_ms\":{}}}",
+            self.requests.load(Ordering::Relaxed),
+            self.errors.load(Ordering::Relaxed),
+            self.latency.p50_ms(),
+        )
+    }
+}
+
+// ─── Free functions for instrumentation sites ────────────────────────────
+
+/// Increment the request counter for a transport.
+#[allow(dead_code)]
+pub fn record_request(metrics: &Metrics, transport: Transport) {
+    metrics.transport_counters(transport).requests.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Increment the error counter for a transport.
+#[allow(dead_code)]
+pub fn record_error(metrics: &Metrics, transport: Transport) {
+    metrics.transport_counters(transport).errors.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Record a latency sample for a transport.
+#[allow(dead_code)]
+pub fn record_latency(metrics: &Metrics, transport: Transport, ms: u64) {
+    metrics.transport_counters(transport).latency.record(ms);
+}
+
+// ─── Metrics struct ──────────────────────────────────────────────────────
+
 /// Observability counters shared across all gateway tasks.
 #[allow(dead_code)]
 pub struct Metrics {
@@ -21,6 +157,13 @@ pub struct Metrics {
     pub decode_errors: AtomicU64,
     /// Readiness flag — set to true when child started + transport bound + relay active.
     pub ready: AtomicBool,
+    // Per-transport counters
+    pub sse: TransportCounters,
+    pub ws: TransportCounters,
+    pub stateful_http: TransportCounters,
+    pub stateless_http: TransportCounters,
+    pub sse_to_stdio: TransportCounters,
+    pub http_to_stdio: TransportCounters,
 }
 
 #[allow(dead_code)]
@@ -41,7 +184,26 @@ impl Metrics {
             queue_depth_max: AtomicU64::new(0),
             decode_errors: AtomicU64::new(0),
             ready: AtomicBool::new(false),
+            sse: TransportCounters::new(),
+            ws: TransportCounters::new(),
+            stateful_http: TransportCounters::new(),
+            stateless_http: TransportCounters::new(),
+            sse_to_stdio: TransportCounters::new(),
+            http_to_stdio: TransportCounters::new(),
         })
+    }
+
+    /// Return a reference to the [`TransportCounters`] for the given transport.
+    #[allow(dead_code)]
+    pub fn transport_counters(&self, transport: Transport) -> &TransportCounters {
+        match transport {
+            Transport::Sse => &self.sse,
+            Transport::Ws => &self.ws,
+            Transport::StatefulHttp => &self.stateful_http,
+            Transport::StatelessHttp => &self.stateless_http,
+            Transport::SseToStdio => &self.sse_to_stdio,
+            Transport::HttpToStdio => &self.http_to_stdio,
+        }
     }
 
     /// Mark the gateway as ready (child started + transport bound + relay active).
@@ -90,7 +252,7 @@ impl Metrics {
         counter.fetch_max(value, Ordering::Relaxed);
     }
 
-    /// Snapshot all counters as JSON.
+    /// Snapshot all counters as JSON (without per-transport detail).
     #[allow(dead_code)]
     pub fn snapshot_json(&self) -> String {
         format!(
@@ -126,6 +288,57 @@ impl Metrics {
             self.ready.load(Ordering::Acquire),
         )
     }
+
+    /// Snapshot including per-transport counters (used when `?detail=true`).
+    #[allow(dead_code)]
+    pub fn snapshot_json_detail(&self) -> String {
+        format!(
+            concat!(
+                "{{",
+                "\"active_sessions\":{},",
+                "\"active_children\":{},",
+                "\"active_clients\":{},",
+                "\"total_requests\":{},",
+                "\"total_spawns\":{},",
+                "\"spawn_failures\":{},",
+                "\"session_timeouts\":{},",
+                "\"forced_kills\":{},",
+                "\"client_disconnects\":{},",
+                "\"backpressure_events\":{},",
+                "\"queue_depth_max\":{},",
+                "\"decode_errors\":{},",
+                "\"ready\":{},",
+                "\"transports\":{{",
+                "\"sse\":{},",
+                "\"ws\":{},",
+                "\"stateful_http\":{},",
+                "\"stateless_http\":{},",
+                "\"sse_to_stdio\":{},",
+                "\"http_to_stdio\":{}",
+                "}}",
+                "}}"
+            ),
+            self.active_sessions.load(Ordering::Relaxed),
+            self.active_children.load(Ordering::Relaxed),
+            self.active_clients.load(Ordering::Relaxed),
+            self.total_requests.load(Ordering::Relaxed),
+            self.total_spawns.load(Ordering::Relaxed),
+            self.spawn_failures.load(Ordering::Relaxed),
+            self.session_timeouts.load(Ordering::Relaxed),
+            self.forced_kills.load(Ordering::Relaxed),
+            self.client_disconnects.load(Ordering::Relaxed),
+            self.backpressure_events.load(Ordering::Relaxed),
+            self.queue_depth_max.load(Ordering::Relaxed),
+            self.decode_errors.load(Ordering::Relaxed),
+            self.ready.load(Ordering::Acquire),
+            self.sse.snapshot_json(),
+            self.ws.snapshot_json(),
+            self.stateful_http.snapshot_json(),
+            self.stateless_http.snapshot_json(),
+            self.sse_to_stdio.snapshot_json(),
+            self.http_to_stdio.snapshot_json(),
+        )
+    }
 }
 
 #[allow(dead_code)]
@@ -147,6 +360,12 @@ impl Default for Metrics {
             queue_depth_max: AtomicU64::new(0),
             decode_errors: AtomicU64::new(0),
             ready: AtomicBool::new(false),
+            sse: TransportCounters::new(),
+            ws: TransportCounters::new(),
+            stateful_http: TransportCounters::new(),
+            stateless_http: TransportCounters::new(),
+            sse_to_stdio: TransportCounters::new(),
+            http_to_stdio: TransportCounters::new(),
         }
     }
 }
@@ -430,5 +649,81 @@ mod tests {
         Metrics::inc_and_log(&m.active_clients, "active_clients", &logger);
         let output = logger.get_output();
         assert!(output.contains("[supergateway] active_clients=1 (+1)"));
+    }
+
+    #[test]
+    fn test_per_transport_record_request_all_variants() {
+        use super::{record_error, record_latency, record_request, Transport};
+        use std::sync::atomic::Ordering;
+
+        let m = Metrics::new();
+
+        let variants = [
+            Transport::Sse,
+            Transport::Ws,
+            Transport::StatefulHttp,
+            Transport::StatelessHttp,
+            Transport::SseToStdio,
+            Transport::HttpToStdio,
+        ];
+
+        for &t in &variants {
+            record_request(&m, t);
+            record_latency(&m, t, 5);
+        }
+
+        // Each transport should have exactly 1 request, 0 errors, p50=5ms
+        for &t in &variants {
+            let counters = m.transport_counters(t);
+            assert_eq!(
+                counters.requests.load(Ordering::Relaxed),
+                1,
+                "transport {:?} requests should be 1",
+                t
+            );
+            assert_eq!(
+                counters.errors.load(Ordering::Relaxed),
+                0,
+                "transport {:?} errors should be 0",
+                t
+            );
+            assert_eq!(
+                counters.latency.p50_ms(),
+                3, // bucket [2,5] midpoint → (2+5)/2 = 3
+                "transport {:?} p50 should reflect latency=5ms bucket",
+                t
+            );
+        }
+
+        // Test error recording
+        record_error(&m, Transport::Sse);
+        record_error(&m, Transport::Ws);
+
+        assert_eq!(m.sse.errors.load(Ordering::Relaxed), 1);
+        assert_eq!(m.ws.errors.load(Ordering::Relaxed), 1);
+        assert_eq!(m.stateful_http.errors.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_snapshot_json_detail_contains_all_transports() {
+        let m = Metrics::new();
+        m.sse.requests.store(7, Ordering::Relaxed);
+        m.ws.errors.store(2, Ordering::Relaxed);
+        m.stateful_http.requests.store(3, Ordering::Relaxed);
+
+        let json = m.snapshot_json_detail();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        let transports = parsed.get("transports").expect("missing transports field");
+        for key in &["sse", "ws", "stateful_http", "stateless_http", "sse_to_stdio", "http_to_stdio"] {
+            let t = transports.get(key).unwrap_or_else(|| panic!("missing transport: {key}"));
+            assert!(t.get("requests").is_some(), "missing requests in {key}");
+            assert!(t.get("errors").is_some(), "missing errors in {key}");
+            assert!(t.get("latency_p50_ms").is_some(), "missing latency_p50_ms in {key}");
+        }
+
+        assert_eq!(transports["sse"]["requests"], 7);
+        assert_eq!(transports["ws"]["errors"], 2);
+        assert_eq!(transports["stateful_http"]["requests"], 3);
     }
 }

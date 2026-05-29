@@ -44,7 +44,7 @@ use crate::cors::{self, CorsHandler, CorsResult};
 use crate::error::{self, GatewayError};
 use crate::health;
 use crate::jsonrpc::{Parsed, RawMessage};
-use crate::observe::{Logger, Metrics};
+use crate::observe::{self, Logger, Metrics, Transport};
 
 use super::stateful_http::GatewayRequest;
 use super::sse_to_stdio::{build_fallback_init, build_initialized_notification, generate_init_id};
@@ -401,14 +401,22 @@ impl StatelessHttpGateway {
     /// documented divergence from the previous sync handler.
     #[allow(dead_code)]
     async fn handle_post(&self, cx: &Cx, req: &GatewayRequest) -> GatewayResponse {
-        match self.handle_post_inner(cx, req).await {
+        let t0 = std::time::Instant::now();
+        observe::record_request(&self.metrics, Transport::StatelessHttp);
+        let resp = match self.handle_post_inner(cx, req).await {
             Ok(resp) => resp,
             Err(e) => {
                 self.logger
                     .error(&format!("stateless POST error: {e}"));
                 response_from_error(&e)
             }
+        };
+        let elapsed_ms = t0.elapsed().as_millis() as u64;
+        if resp.status >= 400 {
+            observe::record_error(&self.metrics, Transport::StatelessHttp);
         }
+        observe::record_latency(&self.metrics, Transport::StatelessHttp, elapsed_ms);
+        resp
     }
 
     #[allow(dead_code)]

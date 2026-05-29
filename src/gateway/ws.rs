@@ -58,7 +58,7 @@ use crate::cli::{Header, LogLevel};
 use crate::cors::{self, CorsHandler, CorsResult};
 use crate::health;
 use crate::jsonrpc::{Parsed, RawMessage};
-use crate::observe::{Logger, Metrics};
+use crate::observe::{self, Logger, Metrics, Transport};
 use crate::session::SessionId;
 
 // ─── Constants ──────────────────────────────────────────────────────
@@ -698,8 +698,24 @@ impl WsGateway {
         client_id: &SessionId,
         text: &str,
     ) -> Result<(), (u16, String)> {
+        let t0 = std::time::Instant::now();
         Metrics::inc(&self.metrics.total_requests);
+        observe::record_request(&self.metrics, Transport::Ws);
 
+        let result = self.handle_ws_message_inner(client_id, text);
+        let elapsed_ms = t0.elapsed().as_millis() as u64;
+        if result.is_err() {
+            observe::record_error(&self.metrics, Transport::Ws);
+        }
+        observe::record_latency(&self.metrics, Transport::Ws, elapsed_ms);
+        result
+    }
+
+    fn handle_ws_message_inner(
+        &self,
+        client_id: &SessionId,
+        text: &str,
+    ) -> Result<(), (u16, String)> {
         // Validate frame size (D-101)
         if text.len() > MAX_FRAME_SIZE {
             return Err((WS_CLOSE_TOO_LARGE, "message too large".into()));

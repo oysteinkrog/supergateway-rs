@@ -45,20 +45,20 @@ impl HealthResponse {
 /// Handle a health endpoint request.
 ///
 /// - Returns 503 until `metrics.set_ready()` has been called.
-/// - Returns JSON detail when `detail=true` AND log level is Debug.
+/// - Returns JSON detail (including per-transport counters) when `detail=true`.
 /// - Otherwise returns plain text "ok".
 #[allow(dead_code)]
 pub fn check_health(
     metrics: &Arc<Metrics>,
     detail: bool,
-    log_level: LogLevel,
+    _log_level: LogLevel,
 ) -> HealthResponse {
     if !metrics.is_ready() {
         return HealthResponse::NotReady;
     }
 
-    if detail && log_level == LogLevel::Debug {
-        HealthResponse::OkDetail(metrics.snapshot_json())
+    if detail {
+        HealthResponse::OkDetail(metrics.snapshot_json_detail())
     } else {
         HealthResponse::Ok
     }
@@ -88,19 +88,13 @@ mod tests {
     }
 
     #[test]
-    fn test_health_detail_requires_debug() {
+    fn test_health_detail_returns_json() {
         let m = Metrics::new();
         m.set_ready();
         m.total_requests.store(5, std::sync::atomic::Ordering::Relaxed);
 
-        // detail=true but level=info → plain "ok"
+        // detail=true at any log level → JSON
         let resp = check_health(&m, true, LogLevel::Info);
-        assert_eq!(resp.status_code(), 200);
-        assert_eq!(resp.content_type(), "text/plain");
-        assert_eq!(resp.body(), "ok");
-
-        // detail=true and level=debug → JSON
-        let resp = check_health(&m, true, LogLevel::Debug);
         assert_eq!(resp.status_code(), 200);
         assert_eq!(resp.content_type(), "application/json");
 
@@ -121,7 +115,7 @@ mod tests {
     fn test_health_detail_all_fields_present() {
         let m = Metrics::new();
         m.set_ready();
-        let resp = check_health(&m, true, LogLevel::Debug);
+        let resp = check_health(&m, true, LogLevel::Info);
         let parsed: serde_json::Value = serde_json::from_str(resp.body()).unwrap();
 
         // Verify all expected counter fields exist.
@@ -146,5 +140,40 @@ mod tests {
                 "missing field in health detail: {field}"
             );
         }
+
+        // Verify transports sub-object is present with all 6 transports
+        let transports = parsed.get("transports").expect("missing transports field");
+        for transport in &["sse", "ws", "stateful_http", "stateless_http", "sse_to_stdio", "http_to_stdio"] {
+            let t = transports.get(transport).unwrap_or_else(|| panic!("missing transport: {transport}"));
+            assert!(t.get("requests").is_some(), "missing requests in {transport}");
+            assert!(t.get("errors").is_some(), "missing errors in {transport}");
+            assert!(t.get("latency_p50_ms").is_some(), "missing latency_p50_ms in {transport}");
+        }
+    }
+
+    #[test]
+    fn test_health_detail_transport_counters_reflected() {
+        use crate::observe::{record_error, record_latency, record_request, Transport};
+
+        let m = Metrics::new();
+        m.set_ready();
+
+        record_request(&m, Transport::Sse);
+        record_request(&m, Transport::Sse);
+        record_error(&m, Transport::Sse);
+        record_latency(&m, Transport::Sse, 5);
+
+        record_request(&m, Transport::Ws);
+
+        let resp = check_health(&m, true, LogLevel::Info);
+        let parsed: serde_json::Value = serde_json::from_str(resp.body()).unwrap();
+
+        let sse = &parsed["transports"]["sse"];
+        assert_eq!(sse["requests"], 2);
+        assert_eq!(sse["errors"], 1);
+
+        let ws = &parsed["transports"]["ws"];
+        assert_eq!(ws["requests"], 1);
+        assert_eq!(ws["errors"], 0);
     }
 }

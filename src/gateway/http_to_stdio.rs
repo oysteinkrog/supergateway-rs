@@ -37,7 +37,7 @@ use crate::gateway::sse_to_stdio::{
     intercept_protocol_version,
 };
 use crate::jsonrpc::{self, Parsed, RawMessage};
-use crate::observe::{Logger, Metrics};
+use crate::observe::{self, Logger, Metrics, Transport};
 
 pub use crate::gateway::sse_to_stdio::write_stdout;
 
@@ -474,6 +474,7 @@ pub async fn run(_cx: &asupersync::Cx, config: crate::cli::Config, rt_handle: Ru
                     Err(_) => continue,
                 };
 
+                observe::record_request(&gw_proc.metrics, Transport::HttpToStdio);
                 match client_proc.post(&url_proc, &body_bytes, "application/json").await {
                     Ok(resp) => {
                         let ct = resp.content_type().unwrap_or("").to_string();
@@ -560,6 +561,7 @@ pub async fn run(_cx: &asupersync::Cx, config: crate::cli::Config, rt_handle: Ru
                             &crate::client::http::HttpClientError::Io(e.to_string()),
                             &gw_proc.logger,
                         );
+                        observe::record_error(&gw_proc.metrics, Transport::HttpToStdio);
                     }
                 }
             }
