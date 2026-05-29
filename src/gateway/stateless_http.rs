@@ -1201,7 +1201,7 @@ mod tests {
     // ─── Integration: auto-init timeout ─────────────────────────────
 
     #[test]
-    fn auto_init_timeout_returns_502() {
+    fn auto_init_timeout_returns_504() {
         // Child never responds → auto-init times out after 5s
         let gw = Arc::new(StatelessHttpGateway::new(
             "sleep 999".into(),
@@ -1218,7 +1218,7 @@ mod tests {
         let req = make_gateway_request("POST", "/mcp", body, post_headers());
         let resp = run_handler(gw.clone(), req);
 
-        assert_eq!(resp.status, 502);
+        assert_eq!(resp.status, 504);
         let body_str = String::from_utf8_lossy(&resp.body);
         let parsed: serde_json::Value = serde_json::from_str(&body_str).unwrap();
         assert_eq!(parsed["error"]["code"], -32603);

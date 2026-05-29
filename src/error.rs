@@ -91,7 +91,7 @@ pub enum GatewayError {
     #[error("child process dead")]
     ChildDead,
 
-    /// Auto-init (stateless mode) timed out. HTTP 502 + JSON-RPC -32603.
+    /// Auto-init (stateless mode) timed out. HTTP 504 + JSON-RPC -32603.
     #[error("auto-init timeout")]
     AutoInitTimeout,
 
@@ -143,7 +143,8 @@ impl GatewayError {
             Self::HeaderTooLarge => 431,
             Self::InvalidRequest(_) => 200,
             Self::SessionClosing | Self::ServiceUnavailable(_) => 503,
-            Self::ChildDead | Self::AutoInitTimeout | Self::Child(_) => 502,
+            Self::AutoInitTimeout => 504,
+            Self::ChildDead | Self::Child(_) => 502,
             Self::Internal(_) | Self::Io(_) => 500,
         }
     }
@@ -360,9 +361,9 @@ mod tests {
     }
 
     #[test]
-    fn auto_init_timeout_502_json_rpc() {
+    fn auto_init_timeout_504_json_rpc() {
         let e = GatewayError::auto_init_timeout();
-        assert_eq!(e.status_code(), 502);
+        assert_eq!(e.status_code(), 504);
         assert_eq!(e.json_rpc_code(), Some(codes::INTERNAL_ERROR));
     }
 
