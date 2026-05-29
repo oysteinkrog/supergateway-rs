@@ -37,7 +37,7 @@ impl HealthResponse {
         match self {
             Self::Ok => "ok",
             Self::OkDetail(json) => json,
-            Self::NotReady => "Service Unavailable",
+            Self::NotReady => "Service starting",
         }
     }
 }
@@ -74,7 +74,7 @@ mod tests {
         let resp = check_health(&m, false, LogLevel::Info);
         assert_eq!(resp.status_code(), 503);
         assert_eq!(resp.content_type(), "text/plain");
-        assert_eq!(resp.body(), "Service Unavailable");
+        assert_eq!(resp.body(), "Service starting");
     }
 
     #[test]
