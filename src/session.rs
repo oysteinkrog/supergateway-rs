@@ -393,8 +393,8 @@ impl<S: Send + Sync + 'static> SessionManager<S> {
                 }
                 SessionState::Closing | SessionState::Closed => Ok(false),
             },
-            // Session already fully removed — idempotent success.
-            None => Ok(false),
+            // Session never existed or already fully removed — not found.
+            None => Err(SessionError::NotFound),
         }
     }
 
@@ -674,13 +674,15 @@ mod tests {
         let mgr = make_mgr(10);
         let id = mgr.create(()).unwrap();
 
-        // First DELETE: transitions
+        // First DELETE: transitions Active → Closing
         assert_eq!(mgr.begin_delete(&id), Ok(true));
-        // Second DELETE: idempotent
+        // Second DELETE while still in Closing: idempotent success
         assert_eq!(mgr.begin_delete(&id), Ok(false));
-        // After removal: idempotent
+        // After session fully removed from map: treated as not found
+        // (indistinguishable from a never-created session; gateway-level
+        // idempotency is handled by pinning the session in Closing state).
         mgr.complete_close(&id);
-        assert_eq!(mgr.begin_delete(&id), Ok(false));
+        assert_eq!(mgr.begin_delete(&id), Err(SessionError::NotFound));
     }
 
     // ─── Access counting with RAII guard ────────────────────────────

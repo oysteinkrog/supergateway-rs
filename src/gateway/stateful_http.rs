@@ -40,7 +40,7 @@ use crate::cors::{self, CorsHandler, CorsResult};
 use crate::error::GatewayError;
 use crate::health;
 use crate::jsonrpc::{Parsed, RawMessage};
-use crate::observe::{Logger, Metrics};
+use crate::observe::{self, Logger, Metrics, Transport};
 use crate::session::{
     SessionAccessGuard, SessionError, SessionId, SessionManager, SessionManagerConfig,
     WeakSessionManager,
@@ -632,7 +632,9 @@ impl StatefulHttpGateway {
         // MCP endpoint dispatch
         if req.path == self.mcp_path {
             Metrics::inc(&self.metrics.total_requests);
-            return match req.method.as_str() {
+            observe::record_request(&self.metrics, Transport::StatefulHttp);
+            let t0 = std::time::Instant::now();
+            let result = match req.method.as_str() {
                 "POST" => self
                     .apply_cors(self.handle_post(cx, req).await, &cors_result)
                     .into(),
@@ -647,6 +649,15 @@ impl StatefulHttpGateway {
                     )
                     .into(),
             };
+            let elapsed_ms = t0.elapsed().as_millis() as u64;
+            // Record error/latency on the Response variant (SseStream doesn't have a final status here)
+            if let RequestResult::Response(ref resp) = result {
+                if resp.status >= 400 {
+                    observe::record_error(&self.metrics, Transport::StatefulHttp);
+                }
+            }
+            observe::record_latency(&self.metrics, Transport::StatefulHttp, elapsed_ms);
+            return result;
         }
 
         // Not found
@@ -2119,6 +2130,13 @@ mod tests {
         let gw = make_test_gateway();
         let sid = create_test_session(&gw);
 
+        // Hold an access guard so the drain task's try_drain_close can't
+        // succeed (access_count > 0). This pins the session in Closing state
+        // for the duration of the second DELETE below — otherwise the drain
+        // races ahead and the second DELETE sees 404 (never-existed) instead
+        // of the expected 200 (already-closing, idempotent).
+        let _pin = gw.sessions.acquire(&sid).expect("acquire fresh session");
+
         // First DELETE
         let req = make_gateway_request(
             "DELETE",
@@ -2129,7 +2147,7 @@ mod tests {
         let resp1 = expect_response(run_handler(gw.clone(), req.clone()));
         assert_eq!(resp1.status, 200);
 
-        // Second DELETE (idempotent)
+        // Second DELETE (idempotent — session still in Closing state)
         let resp2 = expect_response(run_handler(gw.clone(), req));
         assert_eq!(resp2.status, 200);
     }
