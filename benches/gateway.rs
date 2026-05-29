@@ -48,6 +48,8 @@ fn bench_encode_decode_roundtrip(c: &mut Criterion) {
     )
     .unwrap();
 
+    let metrics = make_metrics();
+    let logger = make_logger();
     c.bench_function("encode_decode_roundtrip", |b| {
         b.iter(|| {
             // Encode: serialize message to newline-delimited bytes
@@ -55,8 +57,6 @@ fn bench_encode_decode_roundtrip(c: &mut Criterion) {
             write_message(&mut buf, black_box(&msg)).unwrap();
 
             // Decode: parse the bytes back through StdoutCodec
-            let metrics = make_metrics();
-            let logger = make_logger();
             let mut codec =
                 StdoutCodec::new(Cursor::new(buf.as_slice()), DEFAULT_PARTIAL_BUFFER);
             let result = codec.read_message(&metrics, &logger).unwrap();
@@ -83,12 +83,12 @@ fn bench_sustained_throughput(c: &mut Criterion) {
         write_message(&mut encoded, &msg).unwrap();
     }
 
+    let metrics = make_metrics();
+    let logger = make_logger();
     let mut group = c.benchmark_group("gateway_throughput");
     group.throughput(Throughput::Elements(N));
     group.bench_function("10k_msg_decode", |b| {
         b.iter(|| {
-            let metrics = make_metrics();
-            let logger = make_logger();
             let mut codec =
                 StdoutCodec::new(Cursor::new(encoded.as_slice()), DEFAULT_PARTIAL_BUFFER);
             let mut count = 0u64;
@@ -111,13 +111,17 @@ fn bench_sustained_throughput(c: &mut Criterion) {
 fn bench_fd_leak_1000_cycles(c: &mut Criterion) {
     let msg_line = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n";
 
+    // Hoist Arc construction outside b.iter to avoid contaminating FD-count
+    // measurement with allocator noise from Arc<Metrics> / Logger creation.
+    // The FD leak under test is StdoutCodec's, not Metrics/Logger's.
+    let metrics = make_metrics();
+    let logger = make_logger();
+
     c.bench_function("fd_leak_1000_cycles", |b| {
         b.iter(|| {
             let fds_before = count_fds();
 
             for _ in 0..1_000 {
-                let metrics = make_metrics();
-                let logger = make_logger();
                 let mut codec = StdoutCodec::new(
                     Cursor::new(msg_line.as_slice()),
                     DEFAULT_PARTIAL_BUFFER,
@@ -125,8 +129,6 @@ fn bench_fd_leak_1000_cycles(c: &mut Criterion) {
                 let _ = codec.read_message(&metrics, &logger);
                 // Explicit drop to ensure deterministic cleanup within each cycle
                 drop(codec);
-                drop(metrics);
-                drop(logger);
             }
 
             let fds_after = count_fds();
@@ -157,13 +159,13 @@ fn bench_broadcast_fanout(c: &mut Criterion) {
     let mut child_line: Vec<u8> = Vec::with_capacity(128);
     write_message(&mut child_line, &notification).unwrap();
 
+    let metrics = make_metrics();
+    let logger = make_logger();
     let mut group = c.benchmark_group("broadcast_fanout");
     group.throughput(Throughput::Elements(CLIENTS));
     group.bench_function("100_clients", |b| {
         b.iter(|| {
             // Decode child stdout (once)
-            let metrics = make_metrics();
-            let logger = make_logger();
             let mut codec = StdoutCodec::new(
                 Cursor::new(child_line.as_slice()),
                 DEFAULT_PARTIAL_BUFFER,

@@ -26,10 +26,10 @@ fn bench_parse_10k_messages(c: &mut Criterion) {
     }
     let bytes = data.into_bytes();
 
+    let metrics = make_metrics();
+    let logger = make_logger();
     c.bench_function("parse_10k_messages", |b| {
         b.iter(|| {
-            let metrics = make_metrics();
-            let logger = make_logger();
             let mut codec =
                 StdoutCodec::new(Cursor::new(bytes.as_slice()), DEFAULT_PARTIAL_BUFFER);
             let mut count = 0u64;
@@ -88,10 +88,10 @@ fn bench_parse_single_latency(c: &mut Criterion) {
     let line = format!("{msg_str}\n");
     let bytes = line.into_bytes();
 
+    let metrics = make_metrics();
+    let logger = make_logger();
     c.bench_function("parse_single_message_latency", |b| {
         b.iter(|| {
-            let metrics = make_metrics();
-            let logger = make_logger();
             let mut codec =
                 StdoutCodec::new(Cursor::new(bytes.as_slice()), DEFAULT_PARTIAL_BUFFER);
             let result = codec.read_message(&metrics, &logger);
@@ -121,14 +121,14 @@ fn bench_large_message_handling(c: &mut Criterion) {
         let line = format!("{msg_json}\n");
         let bytes = line.into_bytes();
 
+        let metrics = make_metrics();
+        let logger = make_logger();
         group.throughput(Throughput::Bytes(bytes.len() as u64));
         group.bench_with_input(
             BenchmarkId::new("accepted", format!("{}mb", size_bytes / 1_000_000)),
             &bytes,
             |b, data| {
                 b.iter(|| {
-                    let metrics = make_metrics();
-                    let logger = make_logger();
                     let mut codec = StdoutCodec::new(
                         Cursor::new(data.as_slice()),
                         DEFAULT_PARTIAL_BUFFER,
@@ -147,11 +147,11 @@ fn bench_large_message_handling(c: &mut Criterion) {
     let over_msg = format!("{}\n", "y".repeat(over_limit_bytes));
     let over_bytes = over_msg.into_bytes();
 
+    let metrics = make_metrics();
+    let logger = make_logger();
     group.throughput(Throughput::Bytes(over_bytes.len() as u64));
     group.bench_function("rejected_over_16mb", |b| {
         b.iter(|| {
-            let metrics = make_metrics();
-            let logger = make_logger();
             let mut codec = StdoutCodec::new(
                 Cursor::new(over_bytes.as_slice()),
                 DEFAULT_PARTIAL_BUFFER,
@@ -179,12 +179,12 @@ fn bench_throughput(c: &mut Criterion) {
         write_message(&mut encoded, &msg).unwrap();
     }
 
+    let metrics = make_metrics();
+    let logger = make_logger();
     let mut group = c.benchmark_group("throughput");
     group.throughput(Throughput::Elements(N));
     group.bench_function("10k_messages_decode", |b| {
         b.iter(|| {
-            let metrics = make_metrics();
-            let logger = make_logger();
             let mut codec =
                 StdoutCodec::new(Cursor::new(encoded.as_slice()), DEFAULT_PARTIAL_BUFFER);
             let mut count = 0u64;

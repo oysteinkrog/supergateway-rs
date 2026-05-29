@@ -1,0 +1,80 @@
+{
+  "broadcast_fanout/100_clients": {
+    "mean_point_ns": 19787.82056509272,
+    "mean_lower_ns": null,
+    "mean_upper_ns": null,
+    "std_dev_ns": 901.4159911543779
+  },
+  "encode_decode_roundtrip": {
+    "mean_point_ns": 2818.9354411780782,
+    "mean_lower_ns": null,
+    "mean_upper_ns": null,
+    "std_dev_ns": 457.409934059482
+  },
+  "fd_leak_1000_cycles": {
+    "mean_point_ns": 1606009.9545454544,
+    "mean_lower_ns": null,
+    "mean_upper_ns": null,
+    "std_dev_ns": 273699.8413461186
+  },
+  "gateway_throughput/10k_msg_decode": {
+    "mean_point_ns": 25087949.5,
+    "mean_lower_ns": null,
+    "mean_upper_ns": null,
+    "std_dev_ns": 2692979.5300217024
+  },
+  "large_message/accepted/10mb": {
+    "mean_point_ns": 111430072.0,
+    "mean_lower_ns": null,
+    "mean_upper_ns": null,
+    "std_dev_ns": 19212012.812300958
+  },
+  "large_message/accepted/16mb": {
+    "mean_point_ns": 149661137.0,
+    "mean_lower_ns": null,
+    "mean_upper_ns": null,
+    "std_dev_ns": 27959670.921419505
+  },
+  "large_message/accepted/1mb": {
+    "mean_point_ns": 9846298.000000002,
+    "mean_lower_ns": null,
+    "mean_upper_ns": null,
+    "std_dev_ns": 2647710.281933325
+  },
+  "large_message/rejected_over_16mb": {
+    "mean_point_ns": 16181835.999999993,
+    "mean_lower_ns": null,
+    "mean_upper_ns": null,
+    "std_dev_ns": 1368603.7837665314
+  },
+  "parse_10k_messages": {
+    "mean_point_ns": 19030644.000000007,
+    "mean_lower_ns": null,
+    "mean_upper_ns": null,
+    "std_dev_ns": 3984882.083487722
+  },
+  "parse_single_message_latency": {
+    "mean_point_ns": 3254.3675367984756,
+    "mean_lower_ns": null,
+    "mean_upper_ns": null,
+    "std_dev_ns": 1429.278259019287
+  },
+  "rawvalue_roundtrip_10k": {
+    "mean_point_ns": 37702129.0,
+    "mean_lower_ns": null,
+    "mean_upper_ns": null,
+    "std_dev_ns": 12686618.249874122
+  },
+  "throughput/10k_messages_decode": {
+    "mean_point_ns": 22819923.5,
+    "mean_lower_ns": null,
+    "mean_upper_ns": null,
+    "std_dev_ns": 1021153.8435241734
+  },
+  "write_message_10k": {
+    "mean_point_ns": 1574746.714285715,
+    "mean_lower_ns": null,
+    "mean_upper_ns": null,
+    "std_dev_ns": 226165.83030781857
+  }
+}
