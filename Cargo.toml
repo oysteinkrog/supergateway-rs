@@ -56,6 +56,10 @@ harness = false
 name = "gateway"
 harness = false
 
+[[bench]]
+name = "comprehensive_bench"
+harness = false
+
 # Profiling-friendly release build. Use with:
 #   RUSTFLAGS="-C force-frame-pointers=yes" cargo build --profile release-perf
 # The force-frame-pointers flag is required for perf/flamegraph to resolve stack frames.

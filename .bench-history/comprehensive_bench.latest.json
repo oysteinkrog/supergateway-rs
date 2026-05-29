@@ -1,0 +1,123 @@
+{
+  "schema_version": "v3",
+  "bench_name": "comprehensive_bench",
+  "git_sha": "674d834",
+  "engine_identity": {
+    "rust_toolchain": "nightly-2026-01-22",
+    "supergateway_version": "0.1.0",
+    "profile": "release"
+  },
+  "host_id": "DESKTOP-KROG",
+  "profile_name": "release",
+  "timestamp_unix": 1780044084,
+  "results": [
+    {
+      "family": "codec",
+      "workload": "parse_single",
+      "concurrency": 1,
+      "mean_ns": 2300.3793647931466,
+      "std_dev_ns": 560.4479533688083,
+      "cv_pct": 24.363283810764166,
+      "samples": 100
+    },
+    {
+      "family": "codec",
+      "workload": "emit_single",
+      "concurrency": 1,
+      "mean_ns": 221.9691628423416,
+      "std_dev_ns": 36.271213983953366,
+      "cv_pct": 16.34065449429828,
+      "samples": 100
+    },
+    {
+      "family": "codec",
+      "workload": "roundtrip",
+      "concurrency": 1,
+      "mean_ns": 3462.2365949578166,
+      "std_dev_ns": 913.2789539149408,
+      "cv_pct": 26.378294171027562,
+      "samples": 100
+    },
+    {
+      "family": "gateway",
+      "workload": "decode_10k",
+      "concurrency": 1,
+      "mean_ns": 18853843.0,
+      "std_dev_ns": 2329216.9721896593,
+      "cv_pct": 12.354070054522355,
+      "samples": 100
+    },
+    {
+      "family": "gateway",
+      "workload": "broadcast_fanout",
+      "concurrency": 1,
+      "mean_ns": 1516.7862905787767,
+      "std_dev_ns": 288.18122961781836,
+      "cv_pct": 18.999461651769934,
+      "samples": 100
+    },
+    {
+      "family": "gateway",
+      "workload": "broadcast_fanout",
+      "concurrency": 5,
+      "mean_ns": 2311.9669045936143,
+      "std_dev_ns": 353.55269554664426,
+      "cv_pct": 15.292290510049058,
+      "samples": 100
+    },
+    {
+      "family": "gateway",
+      "workload": "broadcast_fanout",
+      "concurrency": 10,
+      "mean_ns": 2360.824019947093,
+      "std_dev_ns": 897.9225872676691,
+      "cv_pct": 38.034287167570916,
+      "samples": 100
+    },
+    {
+      "family": "gateway",
+      "workload": "broadcast_fanout",
+      "concurrency": 20,
+      "mean_ns": 8891.148448312852,
+      "std_dev_ns": 5781.492637403141,
+      "cv_pct": 65.02526272070301,
+      "samples": 100
+    },
+    {
+      "family": "e2e",
+      "workload": "roundtrip",
+      "concurrency": 1,
+      "mean_ns": 8653.738585628826,
+      "std_dev_ns": 5347.170164761509,
+      "cv_pct": 61.79028996371001,
+      "samples": 100
+    },
+    {
+      "family": "e2e",
+      "workload": "roundtrip",
+      "concurrency": 5,
+      "mean_ns": 21107.675903574614,
+      "std_dev_ns": 4289.255762613873,
+      "cv_pct": 20.32083390994023,
+      "samples": 100
+    },
+    {
+      "family": "e2e",
+      "workload": "roundtrip",
+      "concurrency": 10,
+      "mean_ns": 48401.264276097616,
+      "std_dev_ns": 19753.207396431215,
+      "cv_pct": 40.811345926321394,
+      "samples": 100
+    },
+    {
+      "family": "e2e",
+      "workload": "roundtrip",
+      "concurrency": 20,
+      "mean_ns": 108578.53794506248,
+      "std_dev_ns": 64655.70506479544,
+      "cv_pct": 59.54740806835077,
+      "samples": 100
+    }
+  ]
+}
