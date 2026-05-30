@@ -696,6 +696,7 @@ impl StatefulHttpGateway {
         if let CorsResult::ResponseHeaders(headers) = cors_result {
             resp.headers.extend(headers.iter().cloned());
         }
+        cors::apply_custom_headers(&mut resp.headers, &self.custom_headers);
         resp
     }
 
@@ -2659,6 +2660,69 @@ mod tests {
             .find(|(k, _)| k == "Access-Control-Expose-Headers");
         assert!(expose.is_some());
         assert!(expose.unwrap().1.contains("Mcp-Session-Id"));
+    }
+
+    // ─── Gateway: custom headers ───────────────────────────────────
+
+    fn make_test_gateway_with_custom_headers() -> Arc<StatefulHttpGateway> {
+        Arc::new(StatefulHttpGateway::new(
+            "cat".into(),
+            "/mcp".into(),
+            vec!["/healthz".into()],
+            CorsConfig::Disabled,
+            vec![Header {
+                name: "X-Custom".to_string(),
+                value: "test".to_string(),
+            }],
+            None,
+            1024,
+            test_metrics(),
+            test_logger(),
+            test_rt_handle(),
+        ))
+    }
+
+    #[test]
+    fn custom_header_appears_in_post_response() {
+        let gw = make_test_gateway_with_custom_headers();
+        // A POST that fails validation (missing session) returns a 404 via apply_cors.
+        let body = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
+        let req = make_gateway_request(
+            "POST",
+            "/mcp",
+            body,
+            vec![
+                ("content-type", "application/json"),
+                ("accept", "application/json, text/event-stream"),
+                // No mcp-session-id — yields 404 from session lookup
+            ],
+        );
+        let resp = expect_response(run_handler(gw.clone(), req));
+        let custom = resp.headers.iter().find(|(k, _)| k == "X-Custom");
+        assert!(
+            custom.is_some(),
+            "POST response must include X-Custom header"
+        );
+        assert_eq!(custom.unwrap().1, "test");
+    }
+
+    #[test]
+    fn custom_header_appears_in_delete_response() {
+        let gw = make_test_gateway_with_custom_headers();
+        // A DELETE with a bogus session-id returns 404 via handle_delete -> apply_cors.
+        let req = make_gateway_request(
+            "DELETE",
+            "/mcp",
+            "",
+            vec![("mcp-session-id", "nonexistent-session-id")],
+        );
+        let resp = expect_response(run_handler(gw.clone(), req));
+        let custom = resp.headers.iter().find(|(k, _)| k == "X-Custom");
+        assert!(
+            custom.is_some(),
+            "DELETE response must include X-Custom header"
+        );
+        assert_eq!(custom.unwrap().1, "test");
     }
 
     // ─── Gateway: not found path ───────────────────────────────────
