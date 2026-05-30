@@ -262,7 +262,7 @@ impl SessionData {
 async fn relay_task(
     session_id: SessionId,
     data: Arc<SessionData>,
-    _weak_mgr: WeakSessionManager<SessionData>,
+    weak_mgr: WeakSessionManager<SessionData>,
     mut rx: async_mpsc::Receiver<Result<Parsed, crate::codec::CodecError>>,
 ) {
     let cx = match asupersync::Cx::current() {
@@ -275,6 +275,9 @@ async fn relay_task(
                 crate::error::codes::INTERNAL_ERROR,
                 "Internal: relay context unavailable",
             );
+            if let Some(mgr) = weak_mgr.upgrade() {
+                mgr.complete_close(&session_id);
+            }
             return;
         }
     };
@@ -291,6 +294,9 @@ async fn relay_task(
                     crate::error::codes::INTERNAL_ERROR,
                     "Child process dead",
                 );
+                if let Some(mgr) = weak_mgr.upgrade() {
+                    mgr.complete_close(&session_id);
+                }
                 return;
             }
             Err(_) => {
@@ -301,6 +307,9 @@ async fn relay_task(
                     crate::error::codes::INTERNAL_ERROR,
                     "Child process dead",
                 );
+                if let Some(mgr) = weak_mgr.upgrade() {
+                    mgr.complete_close(&session_id);
+                }
                 return;
             }
         };
@@ -551,12 +560,13 @@ impl StatefulHttpGateway {
         cors_config: CorsConfig,
         custom_headers: Vec<Header>,
         session_timeout: Option<Duration>,
+        max_sessions: usize,
         metrics: Arc<Metrics>,
         logger: Arc<Logger>,
         rt: RuntimeHandle,
     ) -> Self {
         let session_config = SessionManagerConfig {
-            max_sessions: 1024,
+            max_sessions,
             drain_timeout: Duration::from_secs(5),
             session_timeout,
         };
@@ -1303,6 +1313,7 @@ pub async fn run(_cx: &asupersync::Cx, config: Config, rt_handle: RuntimeHandle)
         config.cors,
         config.headers,
         session_timeout,
+        config.max_sessions,
         metrics,
         logger,
         rt_handle2,
@@ -2185,6 +2196,71 @@ mod tests {
         assert_eq!(resp.status, 503);
     }
 
+    // ─── Relay task: session removed after child dies ──────────────
+
+    /// Verify that when the relay task exits because the child's stdout channel
+    /// closes, `complete_close` is called and the session is removed from the
+    /// session manager (subsequent requests return 404 / session not found).
+    #[test]
+    fn relay_removes_session_on_channel_close() {
+        use std::sync::mpsc as sync_mpsc;
+
+        let rt = test_rt_handle();
+        let logger = test_logger();
+        let metrics = test_metrics();
+
+        let session_config = SessionManagerConfig {
+            max_sessions: 16,
+            drain_timeout: Duration::from_secs(5),
+            session_timeout: None,
+        };
+        let mgr: SessionManager<SessionData> =
+            SessionManager::new(session_config, metrics.clone(), None);
+
+        // Create a session with a real child (cat) so ChildBridge is happy,
+        // but we will drive the relay via a synthetic channel below.
+        let child = ChildBridge::spawn("cat", metrics.clone(), logger.clone()).unwrap();
+        let data = SessionData::new(child, logger.clone(), metrics.clone());
+
+        // Wrap data in Arc so we can pass it to relay_task.
+        // We need to insert it into the session manager AND hand an Arc<SessionData>
+        // to the relay task. Use get_inner_arc after insertion.
+        let sid = mgr.create(data).expect("session create");
+
+        let data_arc = mgr.get_inner_arc(&sid).expect("get arc");
+
+        // Build a synthetic channel that we will close immediately to simulate
+        // child stdout closing.
+        let (_tx, rx) =
+            async_mpsc::channel::<Result<Parsed, crate::codec::CodecError>>(8);
+        // Drop the sender so the relay sees a closed channel on first recv.
+        drop(_tx);
+
+        let weak = mgr.downgrade();
+        let sid2 = sid.clone();
+        let (done_tx, done_rx) = sync_mpsc::channel::<()>();
+
+        rt.spawn(async move {
+            relay_task(sid2, data_arc, weak, rx).await;
+            let _ = done_tx.send(());
+        });
+
+        // Wait for the relay to finish (up to 5 seconds)
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("relay_task should have exited");
+
+        // Give the async task a moment to flush (it's already sent done_tx,
+        // so complete_close has been called — but allow a brief yield just in case)
+        std::thread::sleep(Duration::from_millis(50));
+
+        // Session should now be gone from the manager
+        assert!(
+            mgr.state(&sid).is_none(),
+            "session should be removed after relay exits on channel close"
+        );
+    }
+
     // ─── Gateway: max sessions ─────────────────────────────────────
 
     #[test]
@@ -2208,6 +2284,35 @@ mod tests {
         );
         let resp = expect_response(run_handler(gw.clone(), req));
         assert_eq!(resp.status, 503);
+        let body = String::from_utf8_lossy(&resp.body);
+        assert!(
+            body.contains("max sessions"),
+            "503 body should contain 'max sessions', got: {body}"
+        );
+    }
+
+    #[test]
+    fn max_sessions_configurable_via_constructor() {
+        // Verify that max_sessions=1 allows exactly 1 session
+        let gw = make_test_gateway_max_sessions(1);
+
+        let _s1 = create_test_session(&gw);
+
+        // Second should fail immediately
+        let init_body = r#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{}}"#;
+        let req = make_gateway_request(
+            "POST",
+            "/mcp",
+            init_body,
+            vec![
+                ("content-type", "application/json"),
+                ("accept", "application/json, text/event-stream"),
+            ],
+        );
+        let resp = expect_response(run_handler(gw.clone(), req));
+        assert_eq!(resp.status, 503);
+        let body = String::from_utf8_lossy(&resp.body);
+        assert!(body.contains("max sessions"));
     }
 
     // ─── Test helpers ──────────────────────────────────────────────
@@ -2221,6 +2326,7 @@ mod tests {
             CorsConfig::Disabled,
             vec![],
             None,
+            1024,
             test_metrics(),
             test_logger(),
             test_rt_handle(),
@@ -2236,6 +2342,7 @@ mod tests {
             CorsConfig::Wildcard,
             vec![],
             None,
+            1024,
             test_metrics(),
             test_logger(),
             test_rt_handle(),
@@ -2244,26 +2351,18 @@ mod tests {
 
     #[allow(dead_code)]
     fn make_test_gateway_max_sessions(max: usize) -> Arc<StatefulHttpGateway> {
-        let metrics = test_metrics();
-        let logger = test_logger();
-        let session_config = SessionManagerConfig {
-            max_sessions: max,
-            drain_timeout: Duration::from_secs(5),
-            session_timeout: None,
-        };
-        let sessions = SessionManager::new(session_config, metrics.clone(), None);
-
-        Arc::new(StatefulHttpGateway {
-            sessions,
-            cmd: "cat".into(),
-            cors: CorsHandler::new(CorsConfig::Disabled, true),
-            custom_headers: vec![],
-            mcp_path: "/mcp".into(),
-            health_endpoints: vec!["/healthz".into()],
-            metrics,
-            logger,
-            rt: test_rt_handle(),
-        })
+        Arc::new(StatefulHttpGateway::new(
+            "cat".into(),
+            "/mcp".into(),
+            vec!["/healthz".into()],
+            CorsConfig::Disabled,
+            vec![],
+            None,
+            max,
+            test_metrics(),
+            test_logger(),
+            test_rt_handle(),
+        ))
     }
 
     /// Create a test session by directly using the session manager,

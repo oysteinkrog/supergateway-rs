@@ -193,6 +193,10 @@ struct RawArgs {
     #[arg(long = "sessionTimeout")]
     session_timeout: Option<i64>,
 
+    /// Maximum number of simultaneous sessions (stateful HTTP only)
+    #[arg(long = "maxSessions")]
+    max_sessions: Option<usize>,
+
     /// MCP protocol version for stateless HTTP initialization
     #[arg(long = "protocolVersion", default_value = "2024-11-05")]
     protocol_version: String,
@@ -226,6 +230,7 @@ pub struct Config {
     pub headers: Vec<Header>,
     pub stateful: bool,
     pub session_timeout: Option<u64>,
+    pub max_sessions: usize,
     pub protocol_version: String,
 }
 
@@ -415,6 +420,7 @@ impl Config {
             headers: all_headers,
             stateful: raw.stateful,
             session_timeout,
+            max_sessions: raw.max_sessions.unwrap_or(1024),
             protocol_version: raw.protocol_version,
         })
     }
@@ -570,6 +576,7 @@ mod tests {
             oauth2_bearer: None,
             stateful: false,
             session_timeout: None,
+            max_sessions: None,
             protocol_version: "2024-11-05".into(),
         }
     }
@@ -702,5 +709,20 @@ mod tests {
         let mut raw = make_raw(Some("echo hi"), None, None);
         raw.sse_path = "no-slash".into();
         assert!(Config::validate(raw).is_err());
+    }
+
+    #[test]
+    fn test_max_sessions_default() {
+        let raw = make_raw(Some("echo hi"), None, None);
+        let config = Config::validate(raw).unwrap();
+        assert_eq!(config.max_sessions, 1024);
+    }
+
+    #[test]
+    fn test_max_sessions_custom() {
+        let mut raw = make_raw(Some("echo hi"), None, None);
+        raw.max_sessions = Some(5);
+        let config = Config::validate(raw).unwrap();
+        assert_eq!(config.max_sessions, 5);
     }
 }
