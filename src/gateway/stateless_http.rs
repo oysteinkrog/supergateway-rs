@@ -166,6 +166,38 @@ fn format_sse_event(msg: &RawMessage) -> String {
     format!("event: message\ndata: {json}\n\n")
 }
 
+/// Format a JSON string as an SSE event (used for batch array events).
+#[allow(dead_code)]
+fn format_sse_event_raw(json: &str) -> String {
+    format!("event: message\ndata: {json}\n\n")
+}
+
+// ─── Accept header helpers ───────────────────────────────────────────
+
+/// Returns `true` when the client wants only `application/json` (no SSE).
+///
+/// The rule: if `accept` contains `application/json` but neither
+/// `text/event-stream` nor `*/*`, the client is a plain-JSON consumer and we
+/// must NOT SSE-wrap the response.  Presence of `text/event-stream` or `*/*`
+/// — or an explicit `text/event-stream` — means the client supports SSE, so
+/// we keep the existing SSE-wrapped path.
+#[allow(dead_code)]
+fn prefers_json_only(accept: &str) -> bool {
+    accept.contains("application/json")
+        && !accept.contains("text/event-stream")
+        && !accept.contains("*/*")
+}
+
+/// HTTP 200 response with `Content-Type: application/json`.
+#[allow(dead_code)]
+fn response_json(body: &str) -> GatewayResponse {
+    GatewayResponse {
+        status: 200,
+        headers: vec![("content-type".into(), "application/json".into())],
+        body: body.as_bytes().to_vec(),
+    }
+}
+
 /// Wait for the initialize response from child, buffering notifications (D-005).
 ///
 /// Returns `Ok(())` when the init response is received. Buffered notifications
@@ -491,9 +523,9 @@ impl StatelessHttpGateway {
         // 8. Determine path: direct initialize (Case 1) or auto-init (Case 2)
         let has_initialize = messages.iter().any(|m| m.is_initialize_request());
         let result = if has_initialize {
-            self.forward_direct(cx, &child, &mut rx, messages).await
+            self.forward_direct(cx, &child, &mut rx, messages, accept).await
         } else {
-            self.auto_init_and_forward(cx, &child, &mut rx, messages).await
+            self.auto_init_and_forward(cx, &child, &mut rx, messages, accept).await
         };
 
         // 9. Kill child (always, regardless of success/failure)
@@ -526,6 +558,7 @@ impl StatelessHttpGateway {
         child: &ChildBridge,
         rx: &mut async_mpsc::Receiver<Result<Parsed, CodecError>>,
         messages: Vec<RawMessage>,
+        accept: &str,
     ) -> Result<GatewayResponse, GatewayError> {
         let expected_responses = messages.iter().filter(|m| m.is_request()).count();
 
@@ -550,13 +583,32 @@ impl StatelessHttpGateway {
             return Err(GatewayError::Internal("response timeout".into()));
         }
 
-        // Build SSE response
-        let mut sse_body = String::new();
-        for msg in &collected {
-            sse_body.push_str(&format_sse_event(msg));
+        // Dispatch: plain JSON when client only wants application/json; SSE otherwise.
+        if prefers_json_only(accept) {
+            if collected.len() == 1 {
+                // Single response: bare JSON object
+                let json = serde_json::to_string(&collected[0])
+                    .expect("JSON-RPC message serialization");
+                Ok(response_json(&json))
+            } else {
+                // Batch response: JSON array
+                let json =
+                    serde_json::to_string(&collected).expect("JSON-RPC batch serialization");
+                Ok(response_json(&json))
+            }
+        } else {
+            // SSE path: single SSE event for batches, one event for single.
+            if collected.len() == 1 {
+                let sse_body = format_sse_event(&collected[0]);
+                Ok(response_sse(200, &sse_body))
+            } else {
+                // Batch: wrap entire array in a single SSE event.
+                let json =
+                    serde_json::to_string(&collected).expect("JSON-RPC batch serialization");
+                let sse_body = format_sse_event_raw(&json);
+                Ok(response_sse(200, &sse_body))
+            }
         }
-
-        Ok(response_sse(200, &sse_body))
     }
 
     // ─── Case 2: Auto-init + forward ──────────────────────────────
@@ -568,6 +620,7 @@ impl StatelessHttpGateway {
         child: &ChildBridge,
         rx: &mut async_mpsc::Receiver<Result<Parsed, CodecError>>,
         messages: Vec<RawMessage>,
+        accept: &str,
     ) -> Result<GatewayResponse, GatewayError> {
         // 1. Generate and send synthetic initialize request
         let init_id = generate_init_id();
@@ -613,16 +666,40 @@ impl StatelessHttpGateway {
             return Err(GatewayError::Internal("response timeout".into()));
         }
 
-        // 8. Build SSE response — buffered notifications then collected messages
-        let mut sse_body = String::new();
-        for msg in &buffered_notifications {
-            sse_body.push_str(&format_sse_event(msg));
+        // 8. Build response — buffered notifications then collected messages.
+        //    Dispatch: plain JSON when client only wants application/json; SSE otherwise.
+        //    Buffered notifications (pre-init) are always prepended on the SSE path;
+        //    on the JSON path they are silently dropped (no-id notifications have no
+        //    JSON-RPC response counterpart that a plain-JSON client would expect).
+        if prefers_json_only(accept) {
+            if collected.len() == 1 {
+                // Single response: bare JSON object
+                let json = serde_json::to_string(&collected[0])
+                    .expect("JSON-RPC message serialization");
+                Ok(response_json(&json))
+            } else {
+                // Batch response: JSON array
+                let json =
+                    serde_json::to_string(&collected).expect("JSON-RPC batch serialization");
+                Ok(response_json(&json))
+            }
+        } else {
+            // SSE path: emit buffered notifications individually, then responses.
+            // For a batch of responses (len > 1), wrap them in a single SSE event.
+            let mut sse_body = String::new();
+            for msg in &buffered_notifications {
+                sse_body.push_str(&format_sse_event(msg));
+            }
+            if collected.len() == 1 {
+                sse_body.push_str(&format_sse_event(&collected[0]));
+            } else {
+                // Batch: wrap entire array in a single SSE event.
+                let json =
+                    serde_json::to_string(&collected).expect("JSON-RPC batch serialization");
+                sse_body.push_str(&format_sse_event_raw(&json));
+            }
+            Ok(response_sse(200, &sse_body))
         }
-        for msg in &collected {
-            sse_body.push_str(&format_sse_event(msg));
-        }
-
-        Ok(response_sse(200, &sse_body))
     }
 }
 
@@ -1227,7 +1304,9 @@ mod tests {
     // ─── Integration: batch request ─────────────────────────────────
 
     #[test]
-    fn post_batch_request() {
+    fn post_batch_request_sse() {
+        // With Accept: text/event-stream, a batch returns a SINGLE SSE event
+        // whose data is the JSON array of responses.
         let gw = Arc::new(StatelessHttpGateway::new(
             MOCK_MCP_SERVER.into(),
             "/mcp".into(),
@@ -1240,14 +1319,151 @@ mod tests {
         ));
 
         let body = r#"[{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{}},{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{}}]"#;
-        let req = make_gateway_request("POST", "/mcp", body, post_headers());
+        let req = make_gateway_request(
+            "POST",
+            "/mcp",
+            body,
+            vec![
+                ("content-type", "application/json"),
+                ("accept", "text/event-stream"),
+            ],
+        );
         let resp = run_handler(gw.clone(), req);
 
         assert_eq!(resp.status, 200);
+        let ct = resp.headers.iter().find(|(k, _)| k == "content-type");
+        assert_eq!(ct.unwrap().1, "text/event-stream");
         let body_str = String::from_utf8_lossy(&resp.body);
-        // Should contain two SSE events (one per request)
+        // Batch: single SSE event wrapping the JSON array
         let event_count = body_str.matches("event: message").count();
-        assert_eq!(event_count, 2, "expected 2 SSE events, body: {body_str}");
+        assert_eq!(event_count, 1, "expected 1 SSE event for batch, body: {body_str}");
+        // The data line must be a valid JSON array
+        let data_line = body_str
+            .lines()
+            .find(|l| l.starts_with("data: "))
+            .expect("SSE data line");
+        let arr: serde_json::Value =
+            serde_json::from_str(data_line.trim_start_matches("data: ")).unwrap();
+        assert!(arr.is_array(), "batch SSE data must be a JSON array");
+        assert_eq!(arr.as_array().unwrap().len(), 2);
+    }
+
+    // ─── Accept-header dispatch ─────────────────────────────────────
+
+    #[test]
+    fn post_json_accept_returns_bare_json_single() {
+        // `Accept: application/json` → bare JSON object, no SSE wrapping.
+        let gw = Arc::new(StatelessHttpGateway::new(
+            MOCK_MCP_SERVER.into(),
+            "/mcp".into(),
+            vec![],
+            CorsConfig::Disabled,
+            vec![],
+            "2024-11-05".into(),
+            test_metrics(),
+            test_logger(),
+        ));
+
+        let body =
+            r#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"capabilities":{}}}"#;
+        let req = make_gateway_request(
+            "POST",
+            "/mcp",
+            body,
+            vec![
+                ("content-type", "application/json"),
+                ("accept", "application/json"),
+            ],
+        );
+        let resp = run_handler(gw.clone(), req);
+
+        assert_eq!(resp.status, 200);
+        let ct = resp.headers.iter().find(|(k, _)| k == "content-type");
+        assert_eq!(
+            ct.unwrap().1,
+            "application/json",
+            "Accept: application/json must yield Content-Type: application/json"
+        );
+        // Body must be a bare JSON object (not SSE)
+        let body_str = String::from_utf8_lossy(&resp.body);
+        assert!(
+            !body_str.contains("event: message"),
+            "bare JSON response must not contain SSE event markers"
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&body_str).unwrap();
+        assert!(parsed.is_object(), "single request must yield a JSON object");
+    }
+
+    #[test]
+    fn post_json_accept_returns_json_array_for_batch() {
+        // `Accept: application/json` + batch body → JSON array, no SSE wrapping.
+        let gw = Arc::new(StatelessHttpGateway::new(
+            MOCK_MCP_SERVER.into(),
+            "/mcp".into(),
+            vec![],
+            CorsConfig::Disabled,
+            vec![],
+            "2024-11-05".into(),
+            test_metrics(),
+            test_logger(),
+        ));
+
+        let body = r#"[{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{}},{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{}}]"#;
+        let req = make_gateway_request(
+            "POST",
+            "/mcp",
+            body,
+            vec![
+                ("content-type", "application/json"),
+                ("accept", "application/json"),
+            ],
+        );
+        let resp = run_handler(gw.clone(), req);
+
+        assert_eq!(resp.status, 200);
+        let ct = resp.headers.iter().find(|(k, _)| k == "content-type");
+        assert_eq!(ct.unwrap().1, "application/json");
+        let body_str = String::from_utf8_lossy(&resp.body);
+        assert!(
+            !body_str.contains("event: message"),
+            "bare JSON batch must not contain SSE event markers"
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&body_str).unwrap();
+        assert!(parsed.is_array(), "batch must yield a JSON array");
+        assert_eq!(parsed.as_array().unwrap().len(), 2);
+    }
+
+    // ─── prefers_json_only helper ───────────────────────────────────
+
+    #[test]
+    fn prefers_json_only_json_only() {
+        assert!(prefers_json_only("application/json"));
+    }
+
+    #[test]
+    fn prefers_json_only_json_with_quality() {
+        assert!(prefers_json_only("application/json;q=0.9"));
+    }
+
+    #[test]
+    fn prefers_json_only_rejects_sse() {
+        assert!(!prefers_json_only("application/json, text/event-stream"));
+    }
+
+    #[test]
+    fn prefers_json_only_rejects_wildcard() {
+        assert!(!prefers_json_only("*/*"));
+        assert!(!prefers_json_only("application/json, */*"));
+    }
+
+    #[test]
+    fn prefers_json_only_rejects_sse_only() {
+        assert!(!prefers_json_only("text/event-stream"));
+    }
+
+    #[test]
+    fn prefers_json_only_rejects_empty() {
+        assert!(!prefers_json_only(""));
     }
 
     // ─── Integration: child death during request ────────────────────
