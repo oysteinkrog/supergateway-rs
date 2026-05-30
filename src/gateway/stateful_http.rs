@@ -1069,11 +1069,15 @@ impl StatefulHttpGateway {
                 GatewayResponse::json(200, &json)
             }
         } else {
-            // SSE path: one `event: message` per response, in order.
-            let mut sse_body = String::new();
-            for msg in &ordered {
-                sse_body.push_str(&format_sse_event(msg));
-            }
+            // SSE path: batch requests get a single array event; single requests
+            // get a single object event.  Emitting one event per item for a batch
+            // violates the MCP spec (§ Batching) which requires the entire batch
+            // response to arrive as one SSE message.
+            let sse_body = if ordered.len() > 1 {
+                format_sse_batch_event(&ordered)
+            } else {
+                format_sse_event(&ordered[0])
+            };
             GatewayResponse::sse(200, &sse_body)
         }
     }
@@ -2264,6 +2268,192 @@ mod tests {
             body_str.contains("event: message"),
             "SSE response must contain 'event: message'"
         );
+    }
+
+    /// Batch POST with `Accept: text/event-stream` must produce a single SSE
+    /// event whose data is a JSON array — not two separate events.
+    #[test]
+    fn forward_and_respond_batch_sse_single_event() {
+        let rt = test_rt_handle();
+
+        let gw = make_test_gateway();
+        let sid = create_test_session(&gw);
+
+        // Two requests in a batch
+        let body = r#"[{"jsonrpc":"2.0","id":10,"method":"tools/list"},{"jsonrpc":"2.0","id":11,"method":"resources/list"}]"#;
+        let req = make_gateway_request(
+            "POST",
+            "/mcp",
+            body,
+            vec![
+                ("content-type", "application/json"),
+                ("accept", "text/event-stream"),
+                ("mcp-session-id", sid.as_str()),
+            ],
+        );
+
+        // Inject synthetic responses for both ids once their slots appear.
+        let gw_inject = gw.clone();
+        let sid_inject = sid.clone();
+        rt.spawn(async move {
+            let cx = asupersync::Cx::current().expect("cx");
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let slots = gw_inject.with_session(&sid_inject, |data| {
+                    let p = data.pending_requests.read().unwrap();
+                    p.contains_key("10") && p.contains_key("11")
+                });
+                if slots == Some(true) {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    panic!("pending slots for ids '10' and '11' never appeared");
+                }
+                async_sleep(asupersync::time::wall_now(), Duration::from_millis(5)).await;
+            }
+            for id in ["10", "11"] {
+                let result =
+                    serde_json::value::to_raw_value(&serde_json::json!({"ok": true})).unwrap();
+                let resp = RawMessage {
+                    jsonrpc: "2.0".into(),
+                    id: Some(serde_json::value::RawValue::from_string(id.to_string()).unwrap()),
+                    result: Some(result),
+                    ..Default::default()
+                };
+                gw_inject.with_session(&sid_inject, |data| {
+                    data.route_response(&resp);
+                });
+            }
+            drop(cx);
+        });
+
+        let (tx2, rx2) = std::sync::mpsc::channel();
+        let gw2 = gw.clone();
+        rt.spawn(async move {
+            let cx = asupersync::Cx::current().expect("cx");
+            let result = gw2.handle_request(&cx, &req).await;
+            let _ = tx2.send(result);
+        });
+
+        let result = rx2
+            .recv_timeout(Duration::from_secs(10))
+            .expect("handler completed");
+        let resp = expect_response(result);
+
+        assert_eq!(resp.status, 200);
+        let ct = resp
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("content-type"));
+        assert_eq!(ct.map(|(_, v)| v.as_str()), Some("text/event-stream"));
+
+        let body_str = String::from_utf8_lossy(&resp.body);
+
+        // Must be exactly ONE SSE event (only one "event: message\n" prefix).
+        let event_count = body_str.matches("event: message\n").count();
+        assert_eq!(
+            event_count, 1,
+            "batch SSE response must have exactly one event: message, got {event_count}: {body_str}"
+        );
+
+        // The data line must be a JSON array (starts with "[").
+        let data_line = body_str
+            .lines()
+            .find(|l| l.starts_with("data: "))
+            .expect("SSE event must have a data: line");
+        let json_part = &data_line["data: ".len()..];
+        assert!(
+            json_part.trim_start().starts_with('['),
+            "batch SSE data must be a JSON array, got: {json_part}"
+        );
+        let arr: serde_json::Value =
+            serde_json::from_str(json_part).expect("batch SSE data must be valid JSON");
+        assert!(arr.is_array(), "batch SSE data must be a JSON array");
+        assert_eq!(arr.as_array().unwrap().len(), 2);
+    }
+
+    /// Batch POST with `Accept: application/json` must produce a JSON array body.
+    #[test]
+    fn forward_and_respond_batch_json_accept_produces_json_array() {
+        let rt = test_rt_handle();
+
+        let gw = make_test_gateway();
+        let sid = create_test_session(&gw);
+
+        let body = r#"[{"jsonrpc":"2.0","id":20,"method":"tools/list"},{"jsonrpc":"2.0","id":21,"method":"resources/list"}]"#;
+        let req = make_gateway_request(
+            "POST",
+            "/mcp",
+            body,
+            vec![
+                ("content-type", "application/json"),
+                ("accept", "application/json"),
+                ("mcp-session-id", sid.as_str()),
+            ],
+        );
+
+        let gw_inject = gw.clone();
+        let sid_inject = sid.clone();
+        rt.spawn(async move {
+            let cx = asupersync::Cx::current().expect("cx");
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let slots = gw_inject.with_session(&sid_inject, |data| {
+                    let p = data.pending_requests.read().unwrap();
+                    p.contains_key("20") && p.contains_key("21")
+                });
+                if slots == Some(true) {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    panic!("pending slots for ids '20' and '21' never appeared");
+                }
+                async_sleep(asupersync::time::wall_now(), Duration::from_millis(5)).await;
+            }
+            for id in ["20", "21"] {
+                let result =
+                    serde_json::value::to_raw_value(&serde_json::json!({"ok": true})).unwrap();
+                let resp = RawMessage {
+                    jsonrpc: "2.0".into(),
+                    id: Some(serde_json::value::RawValue::from_string(id.to_string()).unwrap()),
+                    result: Some(result),
+                    ..Default::default()
+                };
+                gw_inject.with_session(&sid_inject, |data| {
+                    data.route_response(&resp);
+                });
+            }
+            drop(cx);
+        });
+
+        let (tx2, rx2) = std::sync::mpsc::channel();
+        let gw2 = gw.clone();
+        rt.spawn(async move {
+            let cx = asupersync::Cx::current().expect("cx");
+            let result = gw2.handle_request(&cx, &req).await;
+            let _ = tx2.send(result);
+        });
+
+        let result = rx2
+            .recv_timeout(Duration::from_secs(10))
+            .expect("handler completed");
+        let resp = expect_response(result);
+
+        assert_eq!(resp.status, 200);
+        let ct = resp
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("content-type"));
+        assert_eq!(ct.map(|(_, v)| v.as_str()), Some("application/json"));
+
+        let body_str = String::from_utf8_lossy(&resp.body);
+        let arr: serde_json::Value =
+            serde_json::from_str(&body_str).expect("response must be valid JSON");
+        assert!(
+            arr.is_array(),
+            "batch JSON response must be an array, got: {body_str}"
+        );
+        assert_eq!(arr.as_array().unwrap().len(), 2);
     }
 
     #[test]
