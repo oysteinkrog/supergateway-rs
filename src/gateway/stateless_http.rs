@@ -47,7 +47,7 @@ use crate::jsonrpc::{Parsed, RawMessage};
 use crate::observe::{self, Logger, Metrics, Transport};
 
 use super::stateful_http::GatewayRequest;
-use super::sse_to_stdio::{build_fallback_init, build_initialized_notification, generate_init_id};
+use super::sse_to_stdio::{build_fallback_init, build_initialized_notification, generate_init_id, raw_id_matches_str};
 
 // ─── Constants ────────────────────────────────────────────────────────
 
@@ -238,9 +238,7 @@ async fn wait_for_init_response(
         for msg in msgs {
             if msg.is_response() {
                 if let Some(ref id) = msg.id {
-                    // id.get() is the raw JSON value, e.g. "\"init_12345_abc\""
-                    let trimmed = id.get().trim_matches('"');
-                    if trimmed == init_id {
+                    if raw_id_matches_str(id, init_id) {
                         // Init response received — suppress (don't forward)
                         return Ok(());
                     }
@@ -387,7 +385,7 @@ impl StatelessHttpGateway {
                     .unwrap_or(false);
                 let health_resp =
                     health::check_health(&self.metrics, detail, self.logger.level());
-                let mut resp = GatewayResponse {
+                let resp = GatewayResponse {
                     status: health_resp.status_code(),
                     headers: vec![(
                         "content-type".into(),
@@ -395,9 +393,6 @@ impl StatelessHttpGateway {
                     )],
                     body: health_resp.body().as_bytes().to_vec(),
                 };
-                let mut h = Vec::new();
-                cors::apply_custom_headers(&mut h, &self.custom_headers);
-                resp.headers.extend(h);
                 return self.apply_cors(resp, &cors_result);
             }
         }
@@ -422,6 +417,7 @@ impl StatelessHttpGateway {
         if let CorsResult::ResponseHeaders(headers) = cors_result {
             resp.headers.extend(headers.iter().cloned());
         }
+        cors::apply_custom_headers(&mut resp.headers, &self.custom_headers);
         resp
     }
 
@@ -1059,6 +1055,59 @@ mod tests {
         assert_ne!(id1, id2);
     }
 
+    // ─── raw_id_matches_str ─────────────────────────────────────────
+
+    fn raw(s: &str) -> Box<RawValue> {
+        RawValue::from_string(s.into()).unwrap()
+    }
+
+    /// The common path: string ID from `generate_init_id()` matches a JSON
+    /// string response ID.
+    #[test]
+    fn raw_id_matches_str_string_id_matches() {
+        let init_id = generate_init_id();
+        // build_fallback_init wraps init_id as a JSON string.
+        let json_id = raw(&format!("\"{init_id}\""));
+        assert!(
+            raw_id_matches_str(&json_id, &init_id),
+            "string-typed ID must match its decoded value"
+        );
+    }
+
+    /// Non-matching string ID must return false.
+    #[test]
+    fn raw_id_matches_str_string_id_no_match() {
+        let json_id = raw(r#""init_123_aaa""#);
+        assert!(!raw_id_matches_str(&json_id, "init_999_zzz"));
+    }
+
+    /// Numeric IDs fall back to raw-text comparison. This covers the case
+    /// where a client sends a numeric initialize request ID (e.g. `"id":42`).
+    #[test]
+    fn raw_id_matches_str_numeric_id_matches() {
+        // Numeric 42 in raw JSON is just the text "42".
+        let json_id = raw("42");
+        assert!(
+            raw_id_matches_str(&json_id, "42"),
+            "numeric ID must match its raw text representation"
+        );
+    }
+
+    /// Numeric ID must not match a different number.
+    #[test]
+    fn raw_id_matches_str_numeric_id_no_match() {
+        let json_id = raw("42");
+        assert!(!raw_id_matches_str(&json_id, "43"));
+    }
+
+    /// Zero numeric ID (boundary case).
+    #[test]
+    fn raw_id_matches_str_zero_numeric_id() {
+        let json_id = raw("0");
+        assert!(raw_id_matches_str(&json_id, "0"));
+        assert!(!raw_id_matches_str(&json_id, "1"));
+    }
+
     #[test]
     fn synthetic_init_has_correct_shape() {
         let msg = build_fallback_init("init_123_abc", "2024-11-05");
@@ -1125,6 +1174,173 @@ mod tests {
         let resp = run_handler(gw.clone(), req);
         assert_eq!(resp.status, 200);
         assert_eq!(String::from_utf8_lossy(&resp.body), "ok");
+    }
+
+    // ─── Custom headers ─────────────────────────────────────────────
+
+    /// Helper: create a gateway with one custom header.
+    fn make_gateway_with_custom_header(name: &str, value: &str) -> Arc<StatelessHttpGateway> {
+        Arc::new(StatelessHttpGateway::new(
+            "cat".into(),
+            "/mcp".into(),
+            vec!["/healthz".into()],
+            CorsConfig::Disabled,
+            vec![Header {
+                name: name.into(),
+                value: value.into(),
+            }],
+            "2024-11-05".into(),
+            test_metrics(),
+            test_logger(),
+        ))
+    }
+
+    #[test]
+    fn custom_header_appears_in_405_response() {
+        // 405 is returned for GET /mcp — it goes through apply_cors so custom headers apply
+        let gw = make_gateway_with_custom_header("X-Custom", "test");
+        let req = make_gateway_request("GET", "/mcp", "", vec![]);
+        let resp = run_handler(gw.clone(), req);
+        assert_eq!(resp.status, 405);
+        let found = resp
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("X-Custom"));
+        assert!(found.is_some(), "X-Custom header missing from 405 response; headers: {:?}", resp.headers);
+        assert_eq!(found.unwrap().1, "test");
+    }
+
+    #[test]
+    fn custom_header_appears_in_post_415_error() {
+        // Wrong Content-Type → 415. POST errors go through apply_cors in handle_request.
+        let gw = make_gateway_with_custom_header("X-Custom", "test");
+        let req = make_gateway_request(
+            "POST",
+            "/mcp",
+            "{}",
+            vec![
+                ("content-type", "text/plain"),
+                ("accept", "application/json, text/event-stream"),
+            ],
+        );
+        let resp = run_handler(gw.clone(), req);
+        assert_eq!(resp.status, 415);
+        let found = resp
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("X-Custom"));
+        assert!(found.is_some(), "X-Custom header missing from 415 POST response; headers: {:?}", resp.headers);
+        assert_eq!(found.unwrap().1, "test");
+    }
+
+    #[test]
+    fn custom_header_appears_in_post_406_error() {
+        // Missing Accept → 406. POST errors go through apply_cors.
+        let gw = make_gateway_with_custom_header("X-Custom", "test");
+        let req = make_gateway_request(
+            "POST",
+            "/mcp",
+            "{}",
+            vec![("content-type", "application/json")],
+        );
+        let resp = run_handler(gw.clone(), req);
+        assert_eq!(resp.status, 406);
+        let found = resp
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("X-Custom"));
+        assert!(found.is_some(), "X-Custom header missing from 406 POST response; headers: {:?}", resp.headers);
+        assert_eq!(found.unwrap().1, "test");
+    }
+
+    #[test]
+    fn custom_header_appears_in_health_response() {
+        // Health responses also go through apply_cors (custom headers applied there now).
+        let gw = make_gateway_with_custom_header("X-Custom", "test");
+        gw.metrics.set_ready();
+        let req = make_gateway_request("GET", "/healthz", "", vec![]);
+        let resp = run_handler(gw.clone(), req);
+        assert_eq!(resp.status, 200);
+        let found = resp
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("X-Custom"));
+        assert!(found.is_some(), "X-Custom header missing from health response; headers: {:?}", resp.headers);
+        assert_eq!(found.unwrap().1, "test");
+    }
+
+    #[test]
+    fn custom_header_appears_in_post_202_notification() {
+        // Pure notification → 202 short-circuit. Goes through apply_cors.
+        let gw = Arc::new(StatelessHttpGateway::new(
+            MOCK_MCP_SERVER.into(),
+            "/mcp".into(),
+            vec![],
+            CorsConfig::Disabled,
+            vec![Header {
+                name: "X-Custom".into(),
+                value: "test".into(),
+            }],
+            "2024-11-05".into(),
+            test_metrics(),
+            test_logger(),
+        ));
+        let body = r#"{"jsonrpc":"2.0","method":"notifications/progress","params":{"token":"x"}}"#;
+        let req = make_gateway_request("POST", "/mcp", body, post_headers());
+        let resp = run_handler(gw.clone(), req);
+        assert_eq!(resp.status, 202);
+        let found = resp
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("X-Custom"));
+        assert!(found.is_some(), "X-Custom header missing from 202 response; headers: {:?}", resp.headers);
+        assert_eq!(found.unwrap().1, "test");
+    }
+
+    #[test]
+    fn custom_header_appears_in_post_200_response() {
+        // POST with initialize → 200 SSE response. Goes through apply_cors.
+        let gw = Arc::new(StatelessHttpGateway::new(
+            MOCK_MCP_SERVER.into(),
+            "/mcp".into(),
+            vec![],
+            CorsConfig::Disabled,
+            vec![Header {
+                name: "X-Custom".into(),
+                value: "test".into(),
+            }],
+            "2024-11-05".into(),
+            test_metrics(),
+            test_logger(),
+        ));
+        let body =
+            r#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"capabilities":{}}}"#;
+        let req = make_gateway_request("POST", "/mcp", body, post_headers());
+        let resp = run_handler(gw.clone(), req);
+        assert_eq!(resp.status, 200);
+        let found = resp
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("X-Custom"));
+        assert!(found.is_some(), "X-Custom header missing from 200 POST response; headers: {:?}", resp.headers);
+        assert_eq!(found.unwrap().1, "test");
+    }
+
+    #[test]
+    fn custom_header_not_duplicated_in_health_response() {
+        // Verify that custom header appears exactly once (not doubled) — since we removed
+        // the manual apply_custom_headers call from health path and centralized in apply_cors.
+        let gw = make_gateway_with_custom_header("X-Custom", "test");
+        gw.metrics.set_ready();
+        let req = make_gateway_request("GET", "/healthz", "", vec![]);
+        let resp = run_handler(gw.clone(), req);
+        assert_eq!(resp.status, 200);
+        let count = resp
+            .headers
+            .iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case("X-Custom"))
+            .count();
+        assert_eq!(count, 1, "X-Custom must appear exactly once, found {count}; headers: {:?}", resp.headers);
     }
 
     // ─── CORS ───────────────────────────────────────────────────────
