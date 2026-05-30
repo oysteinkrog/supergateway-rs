@@ -735,11 +735,7 @@ impl StatefulHttpGateway {
                 if messages.len() == 1 && messages[0].is_initialize_request() {
                     self.handle_post_initialize(cx, req, messages).await
                 } else {
-                    GatewayResponse::from_error(
-                        &GatewayError::bad_request(
-                            "missing Mcp-Session-Id header (non-initialize request)",
-                        ),
-                    )
+                    GatewayResponse::from_error(&GatewayError::SessionNotFound)
                 }
             }
             Some(sid_str) => {
@@ -1873,7 +1869,7 @@ mod tests {
     }
 
     #[test]
-    fn post_non_init_without_session_id_returns_400() {
+    fn post_non_init_without_session_id_returns_404() {
         let gw = make_test_gateway();
         let body = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
         let req = make_gateway_request(
@@ -1886,7 +1882,8 @@ mod tests {
             ],
         );
         let resp = expect_response(run_handler(gw.clone(), req));
-        assert_eq!(resp.status, 400);
+        assert_eq!(resp.status, 404);
+        assert_eq!(String::from_utf8_lossy(&resp.body), "Invalid or missing session ID");
     }
 
     #[test]
