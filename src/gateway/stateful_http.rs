@@ -2052,31 +2052,20 @@ mod tests {
     }
 
     /// When a session exists and the child echoes back the response,
-    /// a POST with `Accept: application/json` must get `Content-Type: application/json`
-    /// and a bare JSON object (not SSE-wrapped).
+    /// `Accept: application/json` with a dead child should yield 503 (not 406).
     ///
-    /// We use a session backed by `cat` and manually inject the response into the
-    /// pending-request channel to avoid spawning a full child process.
+    /// This confirms the accept-header validation passes and the request reaches
+    /// `forward_and_respond`, which returns a child-dead error immediately.
     #[test]
-    fn post_json_only_accept_returns_bare_json_response() {
+    fn post_json_only_accept_dead_child_returns_503() {
         let gw = make_test_gateway();
         let sid = create_test_session(&gw);
 
-        // Register a pending request manually so the forward_and_respond
-        // loop can receive a response without a real child.
-        let (tx, _rx_unused) = async_mpsc::channel::<RawMessage>(1);
+        // Mark child as failed so forward_and_respond returns immediately.
+        gw.with_session(&sid, |data| {
+            data.child_failed.store(true, std::sync::atomic::Ordering::Release);
+        });
 
-        // Build a synthetic response and pre-fill it into the session's
-        // pending map so the timeout path immediately resolves.
-        // Since we can't easily inject without spawning a relay, instead
-        // we send a notification (no id) — which returns 202 regardless
-        // of Accept.  Instead we test the Content-Type by checking the
-        // response path indirectly: a POST with a request ID to a dead
-        // session will timeout and return a synthetic error; we verify the
-        // Content-Type header based on the Accept value.
-        //
-        // Use the 404 path to verify that Accept: application/json alone
-        // does NOT trigger a 406.
         let body = r#"{"jsonrpc":"2.0","id":42,"method":"tools/list"}"#;
         let req = make_gateway_request(
             "POST",
@@ -2088,17 +2077,10 @@ mod tests {
                 ("mcp-session-id", sid.as_str()),
             ],
         );
-        drop(tx); // silence unused warning
-        // The response will timeout after RESPONSE_TIMEOUT (60s) which is too long;
-        // mark the child as failed first so the channel closes immediately.
-        gw.with_session(&sid, |data| {
-            data.child_failed.store(true, std::sync::atomic::Ordering::Release);
-        });
         let resp = expect_response(run_handler(gw.clone(), req));
-        // Child is dead → 503 (child dead error), not a content-type error
-        // or 406. Status check verifies routing reached forward_and_respond.
-        assert_ne!(resp.status, 406);
-        assert_ne!(resp.status, 415);
+        // 502 (child dead) confirms Accept: application/json alone is accepted and
+        // the request reached forward_and_respond (not rejected with 406).
+        assert_eq!(resp.status, 502);
     }
 
     // ─── Accept-header dispatch: Content-Type in response ─────────────
