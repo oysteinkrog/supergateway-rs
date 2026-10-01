@@ -18,7 +18,7 @@ Idle sessions now cost ~0 CPU instead of ~1000 wakeups/sec per session.
 
 ## Original /sysperf Session
 
-❯ /sysperf                                                                      
+❯ /sysperf
 
 ● Bash(echo "=== Load ===" && uptime && echo "=== Cores ===" && nproc && echo
       "=== Memory ===" && free -h && echo "=== Swap ===" && (swapon --show
@@ -69,8 +69,8 @@ Idle sessions now cost ~0 CPU instead of ~1000 wakeups/sec per session.
        - `grep` is slower and worse-defaulted than `rg`.
        - `grep` is slower and worse-defaulted than `rg`.
 
-     Prefer the fff MCP tools (frecency-ranked, git-aware) — `mcp__fff__ffgrep` 
-     for content search, `mcp__fff__fffind` for paths. Fall back to `rg 
+     Prefer the fff MCP tools (frecency-ranked, git-aware) — `mcp__fff__ffgrep`
+     for content search, `mcp__fff__fffind` for paths. Fall back to `rg
      <pattern> [path]` / `fd <pattern>` when fff doesn't fit.
 
      … +1 line (ctrl+o to expand)
@@ -118,7 +118,7 @@ Idle sessions now cost ~0 CPU instead of ~1000 wakeups/sec per session.
 
   What I found
 
-  This isn't a stuck-process problem. The machine is busy with legitimate 
+  This isn't a stuck-process problem. The machine is busy with legitimate
   concurrent agent work and there's nothing safe to harvest. Inventory:
 
   ┌───────────────────────────────────────┬───────┬────────┬────────────────┐
@@ -180,8 +180,8 @@ Idle sessions now cost ~0 CPU instead of ~1000 wakeups/sec per session.
 
 ✻ Cooked for 3m 15s
 
-❯ is fff "thread-safe"? can we have a single instance user supergateway? check  
-  source code (clone into /c/work/)                                             
+❯ is fff "thread-safe"? can we have a single instance user supergateway? check
+  source code (clone into /c/work/)
 
 ● Bash(file ~/.local/bin/fff-mcp 2>/dev/null && ~/.local/bin/fff-mcp --version
       2>&1 | head -5; echo "---"; ~/.local/bin/fff-mcp --help 2>&1 | head -40)
@@ -207,11 +207,11 @@ Idle sessions now cost ~0 CPU instead of ~1000 wakeups/sec per session.
   ⎿  Error: Search tool steering:
        - `find -name/-path/-regex` is slower than `fd`.
 
-     Prefer the fff MCP tools (frecency-ranked, git-aware) — `mcp__fff__ffgrep` 
-     for content search, `mcp__fff__fffind` for paths. Fall back to `rg 
+     Prefer the fff MCP tools (frecency-ranked, git-aware) — `mcp__fff__ffgrep`
+     for content search, `mcp__fff__fffind` for paths. Fall back to `rg
      <pattern> [path]` / `fd <pattern>` when fff doesn't fit.
 
-     Re-run with the suggested tool. (See ~/.claude/hooks/rewrite-search.py for 
+     Re-run with the suggested tool. (See ~/.claude/hooks/rewrite-search.py for
      the exact rules.)
 
 ● Bash(cd /c/work/fff.nvim && ls && echo "---" && fd -t d mcp | head)
@@ -225,23 +225,23 @@ Idle sessions now cost ~0 CPU instead of ~1000 wakeups/sec per session.
 
 ● Answer
 
-  Thread-safe: yes. Single shared instance across all sessions: no, not without 
+  Thread-safe: yes. Single shared instance across all sessions: no, not without
   a code change.
 
   Thread safety — confirmed by source
 
   crates/fff-core/src/lib.rs:23 documents it directly:
 
-  ▎ SharedFilePicker, SharedFrecency, and SharedQueryTracker are newtype 
+  ▎ SharedFilePicker, SharedFrecency, and SharedQueryTracker are newtype
   ▎ wrappers around Arc<RwLock<Option<T>>> for thread-safe shared access.
 
   In fff-mcp/src/server.rs:
-  - FffServer { picker: SharedFilePicker, frecency: SharedFrecency, 
+  - FffServer { picker: SharedFilePicker, frecency: SharedFrecency,
   cursor_store: Arc<Mutex<CursorStore>>, … } (server.rs:181)
   - Every tool acquires self.picker.read() (read-only lock) before searching
   (server.rs:253)
   - Runtime is #[tokio::main] with tokio = full — multi-threaded
-  - grep/find_files/multi_grep all take the shared read lock — concurrent calls 
+  - grep/find_files/multi_grep all take the shared read lock — concurrent calls
   run in parallel since the picker is never write-locked during a query (writes
   only happen from the background scanner/watcher)
 
@@ -307,7 +307,7 @@ Idle sessions now cost ~0 CPU instead of ~1000 wakeups/sec per session.
 
 ※ recap: You asked whether fff-mcp is thread-safe and whether a single shared instance could replace the 16 per-session processes. Answer: thread-safe yes, single shared instance no without code changes; next action is deciding between one-per-repo via supergateway or patching upstream. (disable recaps in /config)
 
-❯ I see supergateway-rs using quite a lot of cpu... investigate why             
+❯ I see supergateway-rs using quite a lot of cpu... investigate why
 
 ● Bash(echo "=== Current supergateway-rs state ===" && ps -eo
       pid,ppid,%cpu,%mem,rss,vsz,nlwp,etime,stat,args | rg 'supergateway' | rg
@@ -413,7 +413,7 @@ Idle sessions now cost ~0 CPU instead of ~1000 wakeups/sec per session.
 
   fn relay_loop(...) {
       loop {
-          let parsed = match data.child.recv_message() { ... };   // ← uses 
+          let parsed = match data.child.recv_message() { ... };   // ← uses
   spin-poll variant
           ...
       }
